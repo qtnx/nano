@@ -56,6 +56,7 @@ type Options struct {
 	TSLKey             string
 	UnregisterCallback func(Member)
 	RemoteServiceRoute CustomerRemoteServiceRoute
+	ForceHostname      bool
 }
 
 // Node represents a node in nano cluster, which will contains a group of services.
@@ -133,7 +134,20 @@ func (n *Node) initNode() error {
 		return nil
 	}
 
-	listener, err := net.Listen("tcp", n.ServiceAddr)
+	port := strings.Split(n.ServiceAddr, ":")[1]
+	if port == "" {
+		return errors.New("invalid service address")
+	}
+
+	var listenAddr string
+	if !n.ForceHostname {
+		// This is a hack for docker container and kubernetes
+		listenAddr = fmt.Sprintf("0.0.0.0:%s", port)
+	} else {
+		listenAddr = n.ServiceAddr
+	}
+
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
 	}
@@ -251,7 +265,7 @@ func (n *Node) listenAndServe() {
 }
 
 func (n *Node) listenAndServeWS() {
-	var upgrader = websocket.Upgrader{
+	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin:     env.CheckOrigin,
@@ -273,7 +287,7 @@ func (n *Node) listenAndServeWS() {
 }
 
 func (n *Node) listenAndServeWSTLS() {
-	var upgrader = websocket.Upgrader{
+	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin:     env.CheckOrigin,
