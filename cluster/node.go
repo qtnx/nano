@@ -146,6 +146,7 @@ func (n *Node) initNode() error {
 	} else {
 		listenAddr = n.ServiceAddr
 	}
+	fmt.Println("Listen on address:", listenAddr)
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
