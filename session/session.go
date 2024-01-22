@@ -431,16 +431,19 @@ func (s *Session) UnmarshalAny[T any](key string) (*T, error) {
 	defer s.RUnlock()
 	v, ok := s.data[key]
 	if !ok {
-		return nil, ErrNoKeyFound
+		return nil, errors.New("no key found")
 	}
 
 	bytes, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
 
-    out := new(T)
-    if err := json.Unmarshal(bytes, out); err != nil {
-        return nil, err
-    }
-    return out, nil
+	out := new(T)
+	if err = json.Unmarshal(bytes, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // State returns all session state
