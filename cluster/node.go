@@ -22,6 +22,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -322,7 +323,7 @@ func (n *Node) findSession(sid int64) *session.Session {
 	return s
 }
 
-func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string) (*session.Session, error) {
+func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, clientUserData []byte) (*session.Session, error) {
 	n.mu.RLock()
 	s, found := n.sessions[sid]
 	n.mu.RUnlock()
@@ -339,6 +340,13 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string) (*sess
 		}
 		s = session.New(ac)
 		s.SetClientUid(clientUid)
+
+		var userData map[string]interface{}
+		if err := json.Unmarshal(clientUserData, &userData); err != nil {
+			return nil, err
+		}
+		s.Restore(userData)
+
 		ac.session = s
 		n.mu.Lock()
 		n.sessions[sid] = s
@@ -354,7 +362,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +385,7 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
 	if err != nil {
 		return nil, err
 	}

@@ -385,26 +385,29 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 		gateAddr = v.gateAddr
 		sessionId = v.sid
 	}
+	sessionUserData, _ := json.Marshal(session.State())
 
 	client := clusterpb.NewMemberClient(pool.Get())
 	switch msg.Type {
 	case message.Request:
 		request := &clusterpb.RequestMessage{
-			GateAddr:  gateAddr,
-			SessionId: sessionId,
-			ClientUid: session.ClientUid(),
-			Id:        msg.ID,
-			Route:     msg.Route,
-			Data:      data,
+			GateAddr:       gateAddr,
+			SessionId:      sessionId,
+			ClientUid:      session.ClientUid(),
+			ClientUserData: sessionUserData,
+			Id:             msg.ID,
+			Route:          msg.Route,
+			Data:           data,
 		}
 		_, err = client.HandleRequest(context.Background(), request)
 	case message.Notify:
 		request := &clusterpb.NotifyMessage{
-			GateAddr:  gateAddr,
-			SessionId: sessionId,
-			ClientUid: session.ClientUid(),
-			Route:     msg.Route,
-			Data:      data,
+			GateAddr:       gateAddr,
+			SessionId:      sessionId,
+			ClientUid:      session.ClientUid(),
+			ClientUserData: sessionUserData,
+			Route:          msg.Route,
+			Data:           data,
 		}
 		_, err = client.HandleNotify(context.Background(), request)
 	}
