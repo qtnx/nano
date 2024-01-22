@@ -431,7 +431,7 @@ func UnmarshalAny[T any](key string) (*T, error) {
 	defer s.RUnlock()
 	v, ok := s.data[key]
 	if !ok {
-		return nil, errors.New("no key found")
+		return nil, ErrNoKeyFound
 	}
 
 	bytes, err := json.Marshal(v)
