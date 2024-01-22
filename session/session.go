@@ -426,7 +426,7 @@ func (s *Session) Byte(key string) []byte {
 
 
 // Unmashel anything
-func UnmarshalAny[T any](key string) (*T, error) {
+func (s *Session) UnmarshalAny[T any](key string) (*T, error) {
 	s.RLock()
 	defer s.RUnlock()
 	v, ok := s.data[key]
