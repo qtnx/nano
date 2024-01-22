@@ -39,12 +39,11 @@ type NetworkEntity interface {
 	ResponseMid(mid uint64, v interface{}) error
 	Close() error
 	RemoteAddr() net.Addr
+	OriginalSid() int64
 }
 
-var (
-	//ErrIllegalUID represents a invalid uid
-	ErrIllegalUID = errors.New("illegal uid")
-)
+// ErrIllegalUID represents a invalid uid
+var ErrIllegalUID = errors.New("illegal uid")
 
 // Session represents a client session which could storage temp data during low-level
 // keep connected, all data will be released when the low-level connection was broken.
@@ -52,6 +51,7 @@ var (
 // parameter.
 type Session struct {
 	sync.RWMutex                        // protect data
+	clientUid    int64                  // client uid
 	id           int64                  // session global unique id
 	uid          int64                  // binding user id
 	lastTime     int64                  // last heartbeat time
@@ -116,6 +116,16 @@ func (s *Session) UID() int64 {
 // LastMid returns the last message id
 func (s *Session) LastMid() uint64 {
 	return s.entity.LastMid()
+}
+
+// get client uid
+func (s *Session) ClientUid() int64 {
+	return s.clientUid
+}
+
+// Set client uid
+func (s *Session) SetClientUid(uid int64) {
+	s.clientUid = uid
 }
 
 // Bind bind UID to current session

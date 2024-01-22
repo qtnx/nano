@@ -322,7 +322,7 @@ func (n *Node) findSession(sid int64) *session.Session {
 	return s
 }
 
-func (n *Node) findOrCreateSession(sid int64, gateAddr string) (*session.Session, error) {
+func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string) (*session.Session, error) {
 	n.mu.RLock()
 	s, found := n.sessions[sid]
 	n.mu.RUnlock()
@@ -338,6 +338,7 @@ func (n *Node) findOrCreateSession(sid int64, gateAddr string) (*session.Session
 			gateAddr:   gateAddr,
 		}
 		s = session.New(ac)
+		s.SetClientUid(clientUid)
 		ac.session = s
 		n.mu.Lock()
 		n.sessions[sid] = s
@@ -347,13 +348,18 @@ func (n *Node) findOrCreateSession(sid int64, gateAddr string) (*session.Session
 }
 
 func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
+	fmt.Println("[Node] Start handle HandleRequest", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
+
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr)
 	if err != nil {
 		return nil, err
+	}
+	if env.Debug {
+		log.Println("HandleRequest old: ", req.Route, req.Id, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
 	}
 	msg := &message.Message{
 		Type:  message.Request,
@@ -366,14 +372,17 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 }
 
 func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
+	fmt.Println("[Node] Start handle HandleNotify", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr)
 	if err != nil {
 		return nil, err
 	}
+	log.Println("[Node] HandleRequest old: ", req.Route, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
+
 	msg := &message.Message{
 		Type:  message.Notify,
 		Route: req.Route,

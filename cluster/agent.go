@@ -255,7 +255,9 @@ func (a *agent) write() {
 		case <-ticker.C:
 			deadline := time.Now().Add(-2 * env.Heartbeat).Unix()
 			if atomic.LoadInt64(&a.lastAt) < deadline {
-				log.Println(fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline))
+				log.Println(
+					fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline),
+				)
 				return
 			}
 			chWrite <- hbd
@@ -317,4 +319,9 @@ func (a *agent) write() {
 			return
 		}
 	}
+}
+
+// OriginalSid get original session id
+func (a *agent) OriginalSid() int64 {
+	return 0
 }

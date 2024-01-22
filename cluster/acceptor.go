@@ -77,6 +77,11 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 	return err
 }
 
+// OriginalSid get original session id
+func (a *acceptor) OriginalSid() int64 {
+	return a.sid
+}
+
 // Close implements the session.NetworkEntity interface
 func (a *acceptor) Close() error {
 	// TODO: buffer

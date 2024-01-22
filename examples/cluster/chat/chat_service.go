@@ -23,6 +23,7 @@ func newRoomService() *RoomService {
 }
 
 func (rs *RoomService) JoinRoom(s *session.Session, msg *protocol.JoinRoomRequest) error {
+	fmt.Println("JoinRoom", msg, s.ID(), s.ClientUid())
 	if err := s.Bind(msg.MasterUid); err != nil {
 		return errors.Trace(err)
 	}
@@ -42,6 +43,7 @@ type SyncMessage struct {
 }
 
 func (rs *RoomService) SyncMessage(s *session.Session, msg *SyncMessage) error {
+	fmt.Println("SyncMessage", msg, s.ID())
 	// Send an RPC to master server to stats
 	if err := s.RPC("TopicService.Stats", &protocol.MasterStats{Uid: s.UID()}); err != nil {
 		return errors.Trace(err)

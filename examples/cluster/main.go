@@ -12,6 +12,7 @@ import (
 	"github.com/lonng/nano/examples/cluster/chat"
 	"github.com/lonng/nano/examples/cluster/gate"
 	"github.com/lonng/nano/examples/cluster/master"
+	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/pingcap/errors"
@@ -140,11 +141,20 @@ func runGate(args *cli.Context) error {
 	log.Println("Current gate server address", gateAddr)
 	log.Println("Remote master server address", masterAddr)
 
+	pip := pipeline.New()
+
+	pip.Inbound().PushBack(func(s *session.Session, msg *pipeline.Message) error {
+		log.Println("Inbound", string(s.UID()))
+		s.SetClientUid(9999)
+		return nil
+	})
+
 	// Startup Nano server with the specified listen address
 	nano.Listen(listen,
 		nano.WithAdvertiseAddr(masterAddr),
 		nano.WithClientAddr(gateAddr),
 		nano.WithComponents(gate.Services),
+		nano.WithPipeline(pip),
 		nano.WithSerializer(json.NewSerializer()),
 		nano.WithIsWebsocket(true),
 		nano.WithWSPath("/nano"),

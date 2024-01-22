@@ -238,7 +238,9 @@ func (h *LocalHandler) handle(conn net.Conn) {
 
 		agent.Close()
 		if env.Debug {
-			log.Println(fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", agent.session.ID(), agent.session.UID()))
+			log.Println(
+				fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", agent.session.ID(), agent.session.UID()),
+			)
 		}
 	}()
 
@@ -325,6 +327,7 @@ func (h *LocalHandler) findMembers(service string) []*clusterpb.MemberInfo {
 }
 
 func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Message, noCopy bool) {
+	fmt.Println("[RemoteProcess] request process remoteProcess with", msg, session.ID())
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {
 		log.Println(fmt.Sprintf("nano/handler: invalid route %s", msg.Route))
@@ -368,7 +371,7 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 		log.Println(err)
 		return
 	}
-	var data = msg.Data
+	data := msg.Data
 	if !noCopy && len(msg.Data) > 0 {
 		data = make([]byte, len(msg.Data))
 		copy(data, msg.Data)
@@ -389,6 +392,7 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 		request := &clusterpb.RequestMessage{
 			GateAddr:  gateAddr,
 			SessionId: sessionId,
+			ClientUid: session.ClientUid(),
 			Id:        msg.ID,
 			Route:     msg.Route,
 			Data:      data,
@@ -398,6 +402,7 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 		request := &clusterpb.NotifyMessage{
 			GateAddr:  gateAddr,
 			SessionId: sessionId,
+			ClientUid: session.ClientUid(),
 			Route:     msg.Route,
 			Data:      data,
 		}
@@ -437,7 +442,12 @@ func (h *LocalHandler) handleWS(conn *websocket.Conn) {
 	go h.handle(c)
 }
 
-func (h *LocalHandler) localProcess(handler *component.Handler, lastMid uint64, session *session.Session, msg *message.Message) {
+func (h *LocalHandler) localProcess(
+	handler *component.Handler,
+	lastMid uint64,
+	session *session.Session,
+	msg *message.Message,
+) {
 	if pipe := h.pipeline; pipe != nil {
 		err := pipe.Inbound().Process(session, msg)
 		if err != nil {
@@ -446,7 +456,7 @@ func (h *LocalHandler) localProcess(handler *component.Handler, lastMid uint64, 
 		}
 	}
 
-	var payload = msg.Data
+	payload := msg.Data
 	var data interface{}
 	if handler.IsRawArg {
 		data = payload
@@ -460,7 +470,7 @@ func (h *LocalHandler) localProcess(handler *component.Handler, lastMid uint64, 
 	}
 
 	if env.Debug {
-		log.Println(fmt.Sprintf("UID=%d, Message={%s}, Data=%+v", session.UID(), msg.String(), data))
+		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v", session.ID(), session.UID(), msg.String(), data))
 	}
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
