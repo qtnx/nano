@@ -46,6 +46,8 @@ type NetworkEntity interface {
 // ErrIllegalUID represents a invalid uid
 var ErrIllegalUID = errors.New("illegal uid")
 
+var ErrNoKeyFound = errors.New("no key in session store found")
+
 // Session represents a client session which could storage temp data during low-level
 // keep connected, all data will be released when the low-level connection was broken.
 // Session instance related to the client will be passed to Handler method as the first
@@ -420,6 +422,25 @@ func (s *Session) Byte(key string) []byte {
 	}
 	return byteData
 
+}
+
+
+// Unmashel anything
+func UnmarshalAny[T any](key string) (*T, error) {
+	s.RLock()
+	defer s.RUnlock()
+	v, ok := s.data[key]
+	if !ok {
+		return nil, errors.New("no key found")
+	}
+
+	bytes, err := json.Marshal(v)
+
+    out := new(T)
+    if err := json.Unmarshal(bytes, out); err != nil {
+        return nil, err
+    }
+    return out, nil
 }
 
 // State returns all session state
