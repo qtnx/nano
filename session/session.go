@@ -426,17 +426,14 @@ func (s *Session) Byte(key string) []byte {
 
 
 // Unmashel anything
-func (s *Session) UnmarshalAny[T any](key string) (*T, error) {
-	s.RLock()
-	defer s.RUnlock()
-	v, ok := s.data[key]
-	if !ok {
-		return nil, errors.New("no key found")
-	}
+func UnmarshalAny[T any](session *Session, key string) (*T, error) {
+	
 
-	bytes, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
+	
+	bytes = session.Byte(key)
+
+	if string(bytes) == "" {
+		return nil, ErrNoKeyFound
 	}
 
 	out := new(T)
