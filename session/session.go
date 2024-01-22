@@ -21,6 +21,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"sync"
@@ -401,6 +402,24 @@ func (s *Session) Value(key string) interface{} {
 	defer s.RUnlock()
 
 	return s.data[key]
+}
+
+// Byte the value return associated with []byte
+func (s *Session) Byte(key string) []byte {
+	s.RLock()
+	defer s.RUnlock()
+	v, ok := s.data[key]
+	if !ok {
+		return []byte("")
+	}
+
+	byteData, err := json.Marshal(v)
+
+	if err != nil {
+		return []byte("")
+	}
+	return byteData
+
 }
 
 // State returns all session state
