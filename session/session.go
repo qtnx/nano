@@ -428,16 +428,14 @@ func (s *Session) Byte(key string) []byte {
 // Unmashel anything
 func UnmarshalAny[T any](session *Session, key string) (*T, error) {
 	
-
-	
-	bytes = session.Byte(key)
+	bytes := session.Byte(key)
 
 	if string(bytes) == "" {
 		return nil, ErrNoKeyFound
 	}
 
 	out := new(T)
-	if err = json.Unmarshal(bytes, out); err != nil {
+	if err := json.Unmarshal(bytes, out); err != nil {
 		return nil, err
 	}
 	return out, nil
