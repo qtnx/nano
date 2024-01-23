@@ -86,6 +86,19 @@ func (c *Group) Member(uid int64) (*session.Session, error) {
 	return nil, ErrMemberNotFound
 }
 
+// Member by session id
+func (c *Group) MemberBySessionID(id int64) (*session.Session, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	s, ok := c.sessions[id]
+	if !ok {
+		return nil, ErrMemberNotFound
+	}
+
+	return s, nil
+}
+
 // Members returns all member's UID in current group
 func (c *Group) Members() []int64 {
 	c.mu.RLock()
