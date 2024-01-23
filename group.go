@@ -142,6 +142,32 @@ func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) err
 	return nil
 }
 
+// Singlecast push the message to the specified client decided by session id
+func (c *Group) Singlecast(route string, v interface{}, id int64) error {
+	if c.isClosed() {
+		return ErrClosedGroup
+	}
+	data, err := message.Serialize(v)
+	if err != nil {
+		return err
+	}
+
+	if env.Debug {
+		log.Println(fmt.Sprintf("Singlecast %s, Data=%+v", route, v))
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	s, ok := c.sessions[id]
+	if !ok {
+		return ErrMemberNotFound
+	}
+
+	if err = s.Push(route, data); err != nil {
+		log.Println(err.Error())
+	}
+	return nil
+}
+
 // Broadcast push  the message(s) to  all members
 func (c *Group) Broadcast(route string, v interface{}) error {
 	if c.isClosed() {
