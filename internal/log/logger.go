@@ -34,6 +34,7 @@ type Logger interface {
 	Error(v ...interface{})
 	Fatal(v ...interface{})
 	Fatalf(format string, v ...interface{})
+	Warn(v ...interface{})
 }
 
 type ZerologWrapper struct {
@@ -66,6 +67,10 @@ func (z *ZerologWrapper) Error(v ...interface{}) {
 	z.logger.Error().Msgf("%v", v)
 }
 
+func (z *ZerologWrapper) Warn(v ...interface{}) {
+	z.logger.Warn().Msgf("%v", v)
+}
+
 func init() {
 	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
 	// Initializes the zerolog instance for application-wide logging
@@ -86,6 +91,7 @@ var (
 	Fatal   func(v ...interface{})
 	Fatalf  func(format string, v ...interface{})
 	Error   func(v ...interface{})
+	Warn    func(v ...interface{})
 )
 
 // SetLogger rewrites the default logger
@@ -98,4 +104,5 @@ func SetLogger(logger Logger) {
 	Fatalf = logger.Fatalf
 	Debug = logger.Debug
 	Error = logger.Error
+	Warn = logger.Warn
 }

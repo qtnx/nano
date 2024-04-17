@@ -249,7 +249,9 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Error(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
+			}
 			return
 		}
 
