@@ -31,6 +31,7 @@ import (
 type Logger interface {
 	Debug(v ...interface{})
 	Println(v ...interface{})
+	Infof(format string, v ...interface{})
 	Error(v ...interface{})
 	Fatal(v ...interface{})
 	Fatalf(format string, v ...interface{})
@@ -71,6 +72,10 @@ func (z *ZerologWrapper) Warn(v ...interface{}) {
 	z.logger.Warn().Msgf("%v", v)
 }
 
+func (z *ZerologWrapper) Infof(format string, v ...interface{}) {
+	z.logger.Info().Msgf(format, v...)
+}
+
 func init() {
 	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
 	// Initializes the zerolog instance for application-wide logging
@@ -88,6 +93,7 @@ func init() {
 var (
 	Debug   func(v ...interface{})
 	Println func(v ...interface{})
+	Infof   func(format string, v ...interface{})
 	Fatal   func(v ...interface{})
 	Fatalf  func(format string, v ...interface{})
 	Error   func(v ...interface{})
@@ -105,4 +111,5 @@ func SetLogger(logger Logger) {
 	Debug = logger.Debug
 	Error = logger.Error
 	Warn = logger.Warn
+	Infof = logger.Infof
 }

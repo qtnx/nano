@@ -143,7 +143,17 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	log.Println("Exists peer unregister to cluster", req.ServiceAddr)
 
 	if c.currentNode.UnregisterCallback != nil {
-		c.currentNode.UnregisterCallback(*c.members[index])
+		c.currentNode.UnregisterCallback(*c.members[index], func() {
+			log.Println("UnregisterCallback")
+			res, err := c.Register(context.Background(), &clusterpb.RegisterRequest{
+				MemberInfo: c.members[index].MemberInfo(),
+			})
+			if err != nil {
+				log.Error("UnregisterCallback register error", err)
+			} else {
+				log.Infof("UnregisterCallback register success with response: %v", res)
+			}
+		})
 	}
 
 	// Register services to current node
@@ -162,6 +172,7 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) (*clusterpb.HeartbeatResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	log.Println("Receive Heartbeat from: ", req.MemberInfo.Label)
 
 	isHit := false
 	for i, m := range c.members {
@@ -190,12 +201,14 @@ func (c *cluster) checkMemberHeartbeat() {
 		unregisterMembers := make([]*Member, 0)
 		// check heartbeat time
 		for _, m := range c.members {
+			log.Infof("Check heartbeat for %s, last heartbeat: %v, deadline: %v", m.MemberInfo().ServiceAddr, m.lastHeartbeatAt, 4*env.Heartbeat)
 			if time.Now().Sub(m.lastHeartbeatAt) > 4*env.Heartbeat && !m.isMaster {
 				unregisterMembers = append(unregisterMembers, m)
 			}
 		}
 
 		for _, m := range unregisterMembers {
+			log.Println("Heartbeat timeout, unregister: ", m.MemberInfo().Label, m.MemberInfo().ServiceAddr)
 			if _, err := c.Unregister(context.Background(), &clusterpb.UnregisterRequest{
 				ServiceAddr: m.MemberInfo().ServiceAddr,
 			}); err != nil {
