@@ -113,7 +113,7 @@ func runMaster(args *cli.Context) error {
 		nano.WithComponents(master.Services),
 		nano.WithSerializer(json.NewSerializer()),
 		nano.WithDebugMode(),
-		nano.WithUnregisterCallback(func(m cluster.Member) {
+		nano.WithUnregisterCallback(func(m cluster.Member, _ func()) {
 			log.Println("Todo alarm unregister:", m.String())
 		}),
 	)

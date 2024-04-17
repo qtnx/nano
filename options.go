@@ -169,7 +169,7 @@ func WithNodeId(nodeId uint64) Option {
 }
 
 // WithUnregisterCallback master unregister member event call fn
-func WithUnregisterCallback(fn func(member cluster.Member)) Option {
+func WithUnregisterCallback(fn func(member cluster.Member, resgiterCb func())) Option {
 	return func(opt *cluster.Options) {
 		opt.UnregisterCallback = fn
 	}

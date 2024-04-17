@@ -55,7 +55,7 @@ type Options struct {
 	IsWebsocket        bool
 	TSLCertificate     string
 	TSLKey             string
-	UnregisterCallback func(Member)
+	UnregisterCallback func(Member, func())
 	RemoteServiceRoute CustomerRemoteServiceRoute
 	ForceHostname      bool
 }
