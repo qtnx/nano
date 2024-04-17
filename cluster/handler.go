@@ -208,7 +208,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	go agent.write()
 
 	if env.Debug {
-		log.Println(fmt.Sprintf("New session established: %s", agent.String()))
+		log.Debug(fmt.Sprintf("New session established: %s", agent.String()))
 	}
 
 	// guarantee agent related resource be destroyed
@@ -219,7 +219,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 
 		members := h.currentNode.cluster.remoteAddrs()
 		for _, remote := range members {
-			log.Println("Notify remote server", remote)
+			log.Debug("Notify remote server", remote)
 			pool, err := h.currentNode.rpcClient.getConnPool(remote)
 			if err != nil {
 				log.Println("Cannot retrieve connection pool for address", remote, err)
@@ -228,11 +228,11 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			client := clusterpb.NewMemberClient(pool.Get())
 			_, err = client.SessionClosed(context.Background(), request)
 			if err != nil {
-				log.Println("Cannot closed session in remote address", remote, err)
+				log.Error("Cannot closed session in remote address", remote, err)
 				continue
 			}
 			if env.Debug {
-				log.Println("Notify remote server success", remote)
+				log.Debug("Notify remote server success", remote)
 			}
 		}
 
@@ -249,7 +249,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Println(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
+			log.Error(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
 			return
 		}
 
@@ -327,7 +327,7 @@ func (h *LocalHandler) findMembers(service string) []*clusterpb.MemberInfo {
 }
 
 func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Message, noCopy bool) {
-	fmt.Println("[RemoteProcess] request process remoteProcess with", msg, session.ID())
+	log.Debug("[RemoteProcess] request process remoteProcess with", msg, session.ID())
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {
 		log.Println(fmt.Sprintf("nano/handler: invalid route %s", msg.Route))

@@ -355,7 +355,7 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 }
 
 func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
-	fmt.Println("[Node] Start handle HandleRequest", req.String())
+	log.Debug("[Node] Start handle HandleRequest", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
 
 	if !found {
@@ -379,7 +379,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 }
 
 func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
-	fmt.Println("[Node] Start handle HandleNotify", req.String())
+	log.Debug("[Node] Start handle HandleNotify", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)

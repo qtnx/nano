@@ -180,10 +180,10 @@ func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 	if env.Debug {
 		switch d := v.(type) {
 		case []byte:
-			log.Println(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%dbytes",
+			log.Debug(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%dbytes",
 				a.session.ID(), a.session.UID(), mid, len(d)))
 		default:
-			log.Println(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%+v",
+			log.Debug(fmt.Sprintf("Type=Response, ID=%d, UID=%d, MID=%d, Data=%+v",
 				a.session.ID(), a.session.UID(), mid, v))
 		}
 	}

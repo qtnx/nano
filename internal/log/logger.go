@@ -21,25 +21,71 @@
 package log
 
 import (
-	"log"
 	"os"
+
+	"github.com/lonng/nano/internal/env"
+	"github.com/rs/zerolog"
 )
 
 // Logger represents  the log interface
 type Logger interface {
+	Debug(v ...interface{})
 	Println(v ...interface{})
+	Error(v ...interface{})
 	Fatal(v ...interface{})
 	Fatalf(format string, v ...interface{})
 }
 
+type ZerologWrapper struct {
+	logger zerolog.Logger
+}
+
+// New creates a new Logger instance using zerolog
+func New(logger zerolog.Logger) Logger {
+	return &ZerologWrapper{logger: logger}
+}
+
+func (z *ZerologWrapper) Debug(v ...interface{}) {
+	z.logger.Debug().Msgf("%v", v)
+}
+
+func (z *ZerologWrapper) Println(v ...interface{}) {
+	// Mimic Println using Print by leveraging the Sprintf method
+	z.logger.Info().Msgf("%v", v)
+}
+
+func (z *ZerologWrapper) Fatal(v ...interface{}) {
+	z.logger.Fatal().Msgf("%v", v)
+}
+
+func (z *ZerologWrapper) Fatalf(format string, v ...interface{}) {
+	z.logger.Fatal().Msgf(format, v...)
+}
+
+func (z *ZerologWrapper) Error(v ...interface{}) {
+	z.logger.Error().Msgf("%v", v)
+}
+
 func init() {
-	SetLogger(log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile))
+	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
+	// Initializes the zerolog instance for application-wide logging
+	log := zerolog.New(consoleWriter).With().Timestamp().Logger()
+
+	if env.Debug {
+		log = log.Level(zerolog.DebugLevel)
+	} else {
+		log = log.Level(zerolog.InfoLevel)
+	}
+
+	SetLogger(New(log))
 }
 
 var (
+	Debug   func(v ...interface{})
 	Println func(v ...interface{})
 	Fatal   func(v ...interface{})
 	Fatalf  func(format string, v ...interface{})
+	Error   func(v ...interface{})
 )
 
 // SetLogger rewrites the default logger
@@ -50,4 +96,6 @@ func SetLogger(logger Logger) {
 	Println = logger.Println
 	Fatal = logger.Fatal
 	Fatalf = logger.Fatalf
+	Debug = logger.Debug
+	Error = logger.Error
 }
