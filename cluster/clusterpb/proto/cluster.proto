@@ -20,6 +20,10 @@ message HeartbeatRequest { MemberInfo memberInfo = 1; }
 
 message HeartbeatResponse {}
 
+message PingRequest {}
+
+message PingResponse { string msg = 1; }
+
 service Master {
   rpc Register(RegisterRequest) returns (RegisterResponse) {}
   rpc Unregister(UnregisterRequest) returns (UnregisterResponse) {}
@@ -85,4 +89,6 @@ service Member {
   rpc DelMember(DelMemberRequest) returns (DelMemberResponse) {}
   rpc SessionClosed(SessionClosedRequest) returns (SessionClosedResponse) {}
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse) {}
+
+  rpc Ping(PingRequest) returns (PingResponse) {}
 }

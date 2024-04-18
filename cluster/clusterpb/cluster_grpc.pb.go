@@ -186,6 +186,7 @@ type MemberClient interface {
 	DelMember(ctx context.Context, in *DelMemberRequest, opts ...grpc.CallOption) (*DelMemberResponse, error)
 	SessionClosed(ctx context.Context, in *SessionClosedRequest, opts ...grpc.CallOption) (*SessionClosedResponse, error)
 	CloseSession(ctx context.Context, in *CloseSessionRequest, opts ...grpc.CallOption) (*CloseSessionResponse, error)
+	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 }
 
 type memberClient struct {
@@ -268,6 +269,15 @@ func (c *memberClient) CloseSession(ctx context.Context, in *CloseSessionRequest
 	return out, nil
 }
 
+func (c *memberClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
+	out := new(PingResponse)
+	err := c.cc.Invoke(ctx, "/clusterpb.Member/Ping", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MemberServer is the server API for Member service.
 // All implementations should embed UnimplementedMemberServer
 // for forward compatibility
@@ -280,6 +290,7 @@ type MemberServer interface {
 	DelMember(context.Context, *DelMemberRequest) (*DelMemberResponse, error)
 	SessionClosed(context.Context, *SessionClosedRequest) (*SessionClosedResponse, error)
 	CloseSession(context.Context, *CloseSessionRequest) (*CloseSessionResponse, error)
+	Ping(context.Context, *PingRequest) (*PingResponse, error)
 }
 
 // UnimplementedMemberServer should be embedded to have forward compatible implementations.
@@ -309,6 +320,9 @@ func (UnimplementedMemberServer) SessionClosed(context.Context, *SessionClosedRe
 }
 func (UnimplementedMemberServer) CloseSession(context.Context, *CloseSessionRequest) (*CloseSessionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CloseSession not implemented")
+}
+func (UnimplementedMemberServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
 }
 
 // UnsafeMemberServer may be embedded to opt out of forward compatibility for this service.
@@ -466,6 +480,24 @@ func _Member_CloseSession_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Member_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MemberServer).Ping(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/clusterpb.Member/Ping",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MemberServer).Ping(ctx, req.(*PingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Member_ServiceDesc is the grpc.ServiceDesc for Member service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -504,6 +536,10 @@ var Member_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CloseSession",
 			Handler:    _Member_CloseSession_Handler,
+		},
+		{
+			MethodName: "Ping",
+			Handler:    _Member_Ping_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

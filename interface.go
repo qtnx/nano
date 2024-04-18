@@ -130,3 +130,12 @@ func Listen(addr string, opts ...Option) {
 func Shutdown() {
 	close(env.Die)
 }
+
+// Ping nodes in the cluster
+func PingNodes(nodeLabels []string) (lives []string, dies []string, err error) {
+	node := runtime.CurrentNode
+	if node == nil {
+		return nil, nil, fmt.Errorf("Node is not initialized")
+	}
+	return node.PingNodes(nodeLabels)
+}

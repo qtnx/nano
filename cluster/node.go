@@ -165,6 +165,7 @@ func (n *Node) initNode() error {
 		}
 	}()
 
+	n.cluster.setRpcClient(n.rpcClient)
 	if n.IsMaster {
 		clusterpb.RegisterMasterServer(n.server, n.cluster)
 		member := &Member{
@@ -176,7 +177,6 @@ func (n *Node) initNode() error {
 			},
 		}
 		n.cluster.members = append(n.cluster.members, member)
-		n.cluster.setRpcClient(n.rpcClient)
 	} else {
 		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
 		if err != nil {
@@ -354,6 +354,12 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 	return s, nil
 }
 
+func (n *Node) Ping(_ context.Context, _ *clusterpb.PingRequest) (*clusterpb.PingResponse, error) {
+	return &clusterpb.PingResponse{
+		Msg: "pong",
+	}, nil
+}
+
 func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
 	log.Debug("[Node] Start handle HandleRequest", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
@@ -450,6 +456,15 @@ func (n *Node) CloseSession(_ context.Context, req *clusterpb.CloseSessionReques
 		s.Close()
 	}
 	return &clusterpb.CloseSessionResponse{}, nil
+}
+
+// PingNodes ping other nodes in the cluster
+func (n *Node) PingNodes(nodeLabels []string) (lives []string, dies []string, err error) {
+	if n.cluster == nil {
+		return nil, nil, fmt.Errorf("Node is not initialized")
+	}
+
+	return n.cluster.pingNodes(nodeLabels)
 }
 
 // ticker send heartbeat register info to master

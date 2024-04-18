@@ -201,7 +201,7 @@ func (c *cluster) checkMemberHeartbeat() {
 		unregisterMembers := make([]*Member, 0)
 		// check heartbeat time
 		for _, m := range c.members {
-			log.Infof("Check heartbeat for %s, last heartbeat: %v, deadline: %v", m.MemberInfo().ServiceAddr, m.lastHeartbeatAt, 4*env.Heartbeat)
+			log.Infof("Check heartbeat for %s, last heartbeat: %v, diff %v, deadline: %v", m.MemberInfo().ServiceAddr, m.lastHeartbeatAt, time.Now().Sub(m.lastHeartbeatAt), 4*env.Heartbeat)
 			if time.Now().Sub(m.lastHeartbeatAt) > 4*env.Heartbeat && !m.isMaster {
 				unregisterMembers = append(unregisterMembers, m)
 			}
@@ -229,6 +229,57 @@ func (c *cluster) checkMemberHeartbeat() {
 			}
 		}
 	}()
+}
+
+// pingNodes sends ping request to all nodes in the cluster
+// withLabels is the labels of nodes that should be pinged
+// returns the labels of nodes that are alive and dead
+func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string, err error) {
+	for _, m := range c.members {
+		if m.isMaster {
+			continue
+		}
+		if c.rpcClient == nil {
+			return nil, nil, fmt.Errorf("rpc client is nil")
+		}
+		log.Println("Ping node: ", m.memberInfo.Label)
+		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
+		if pool == nil {
+			log.Error("Get connection pool error", err)
+			continue
+		}
+		if err != nil {
+			log.Error("Get connection pool error", err)
+			continue
+		}
+		client := clusterpb.NewMemberClient(pool.Get())
+		// log.Println("Get client: ", client)
+		if resp, err := client.Ping(context.Background(), &clusterpb.PingRequest{}); err != nil {
+			log.Error("Ping node error", m.memberInfo.Label, err)
+			dies = append(dies, m.memberInfo.Label)
+		} else {
+			log.Println("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
+			if resp.Msg == "pong" {
+				lives = append(lives, m.memberInfo.Label)
+			} else {
+				dies = append(dies, m.memberInfo.Label)
+			}
+		}
+	}
+
+	for _, label := range withLabels {
+		var found bool
+		for _, m := range c.members {
+			if m.memberInfo.Label == label {
+				found = true
+			}
+		}
+		if !found {
+			dies = append(dies, label)
+		}
+	}
+
+	return lives, dies, nil
 }
 
 func (c *cluster) setRpcClient(client *rpcClient) {

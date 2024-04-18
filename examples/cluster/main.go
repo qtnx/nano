@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/lonng/nano"
 	"github.com/lonng/nano/cluster"
@@ -113,6 +114,7 @@ func runMaster(args *cli.Context) error {
 		nano.WithComponents(master.Services),
 		nano.WithSerializer(json.NewSerializer()),
 		nano.WithDebugMode(),
+		nano.WithLabel("master"),
 		nano.WithUnregisterCallback(func(m cluster.Member, _ func()) {
 			log.Println("Todo alarm unregister:", m.String())
 		}),
@@ -149,6 +151,18 @@ func runGate(args *cli.Context) error {
 		return nil
 	})
 
+	go func() {
+		for {
+			time.Sleep(time.Second * 2)
+			labels := []string{"chat"}
+			lives, dies, err := nano.PingNodes(labels)
+			if err != nil {
+				log.Println("PingNodes error", err)
+			}
+			log.Println("PingNodes", lives, dies)
+		}
+	}()
+
 	// Startup Nano server with the specified listen address
 	nano.Listen(listen,
 		nano.WithAdvertiseAddr(masterAddr),
@@ -160,6 +174,7 @@ func runGate(args *cli.Context) error {
 		nano.WithWSPath("/nano"),
 		nano.WithCheckOriginFunc(func(_ *http.Request) bool { return true }),
 		nano.WithDebugMode(),
+		nano.WithLabel("gate"),
 		nano.WithNodeId(2), // if you deploy multi gate, option set nodeId, default nodeId = os.Getpid()
 	)
 	return nil
@@ -187,6 +202,7 @@ func runChat(args *cli.Context) error {
 		nano.WithAdvertiseAddr(masterAddr),
 		nano.WithComponents(chat.Services),
 		nano.WithSerializer(json.NewSerializer()),
+		nano.WithLabel("chat"),
 		nano.WithDebugMode(),
 	)
 
