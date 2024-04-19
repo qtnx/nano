@@ -282,6 +282,10 @@ func (n *Node) listenAndServeWS() {
 		n.handler.handleWS(conn)
 	})
 
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
 	if err := http.ListenAndServe(n.ClientAddr, nil); err != nil {
 		log.Fatal(err.Error())
 	}
@@ -293,6 +297,10 @@ func (n *Node) listenAndServeWSTLS() {
 		WriteBufferSize: 1024,
 		CheckOrigin:     env.CheckOrigin,
 	}
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
