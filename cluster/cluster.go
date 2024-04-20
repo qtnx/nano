@@ -242,7 +242,7 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 		if c.rpcClient == nil {
 			return nil, nil, fmt.Errorf("rpc client is nil")
 		}
-		log.Println("Ping node: ", m.memberInfo.Label)
+		log.Debug("Ping node: ", m.memberInfo.Label)
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if pool == nil {
 			log.Error("Get connection pool error", err)
@@ -258,7 +258,7 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 			log.Error("Ping node error", m.memberInfo.Label, err)
 			dies = append(dies, m.memberInfo.Label)
 		} else {
-			log.Println("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
+			log.Debug("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
 			if resp.Msg == "pong" {
 				lives = append(lives, m.memberInfo.Label)
 			} else {

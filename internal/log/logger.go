@@ -108,7 +108,14 @@ func SetLogger(logger Logger) {
 	Println = logger.Println
 	Fatal = logger.Fatal
 	Fatalf = logger.Fatalf
-	Debug = logger.Debug
+	Debug = func(v ...interface{}) {
+		if env.Debug {
+			logger.Infof(
+				"[DEBUG] %v",
+				v,
+			)
+		}
+	}
 	Error = logger.Error
 	Warn = logger.Warn
 	Infof = logger.Infof
