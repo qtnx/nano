@@ -100,6 +100,7 @@ func newAgent(conn net.Conn, pipeline pipeline.Pipeline, rpcHandler rpcHandler) 
 func (a *agent) send(m pendingMessage) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
+			log.Error(fmt.Sprintf("[SessionClosed] Agent send message error: %v", e))
 			err = ErrBrokenPipe
 		}
 	}()
@@ -115,6 +116,7 @@ func (a *agent) LastMid() uint64 {
 // Push, implementation for session.NetworkEntity interface
 func (a *agent) Push(route string, v interface{}) error {
 	if a.status() == statusClosed {
+		log.Error("[SessionClosed] Push message to closed session")
 		return ErrBrokenPipe
 	}
 
@@ -139,6 +141,7 @@ func (a *agent) Push(route string, v interface{}) error {
 // RPC, implementation for session.NetworkEntity interface
 func (a *agent) RPC(route string, v interface{}) error {
 	if a.status() == statusClosed {
+		log.Error("[SessionClosed] RPC message to closed session")
 		return ErrBrokenPipe
 	}
 
@@ -166,6 +169,7 @@ func (a *agent) Response(v interface{}) error {
 // Response message to session
 func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 	if a.status() == statusClosed {
+		log.Error("[SessionClosed] Response message to closed session")
 		return ErrBrokenPipe
 	}
 

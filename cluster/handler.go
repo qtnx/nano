@@ -96,6 +96,24 @@ func cache() {
 	}
 }
 
+func encodeSessionId(sessionId int64) []byte {
+	msg := map[string]interface{}{
+		"sid": sessionId,
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Error("Encode session id error", err)
+		return nil
+	}
+	dat, err := codec.Encode(packet.Data, data)
+	if err != nil {
+		log.Error("Encode session id error", err)
+		return nil
+	}
+	return dat
+}
+
 type LocalHandler struct {
 	localServices map[string]*component.Service // all registered service
 	localHandlers map[string]*component.Handler // all handler method
@@ -301,6 +319,12 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) error {
 		if env.Debug {
 			log.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
 		}
+		go func() {
+			// notify session id
+			if _, err := agent.conn.Write(encodeSessionId(agent.session.ID())); err != nil {
+				log.Println(err)
+			}
+		}()
 
 	case packet.Data:
 		if agent.status() < statusWorking {
