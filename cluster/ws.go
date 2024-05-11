@@ -21,11 +21,11 @@
 package cluster
 
 import (
+	"github.com/gorilla/websocket"
 	"io"
 	"net"
+	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 // wsConn is an adapter to t.Conn, which implements all t.Conn
@@ -34,6 +34,7 @@ type wsConn struct {
 	conn   *websocket.Conn
 	typ    int // message type
 	reader io.Reader
+	mu     sync.Mutex //
 }
 
 // newWSConn return an initialized *wsConn
@@ -73,6 +74,8 @@ func (c *wsConn) Read(b []byte) (int, error) {
 // Write can be made to time out and return an Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (c *wsConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
 	if err != nil {
 		return 0, err
