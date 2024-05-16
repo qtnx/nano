@@ -235,8 +235,16 @@ func (a *agent) RemoteAddrStr() string {
 
 // RemoteAddrWithoutPortStr return remote address without port string
 func (a *agent) RemoteAddrWithoutPortStr() string {
-	address := strings.Trim(a.conn.RemoteAddr().String(), "[]")
-	ip := net.ParseIP(address)
+
+	address := a.conn.RemoteAddr().String()
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+
+	host = strings.Trim(host, "[]")
+
+	ip := net.ParseIP(host)
 	if ip == nil {
 		return ""
 	}
