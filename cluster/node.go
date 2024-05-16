@@ -58,6 +58,7 @@ type Options struct {
 	UnregisterCallback func(Member, func())
 	RemoteServiceRoute CustomerRemoteServiceRoute
 	ForceHostname      bool
+	LimitConnectPerIp  uint
 }
 
 // Node represents a node in nano cluster, which will contains a group of services.
@@ -75,6 +76,8 @@ type Node struct {
 	mu       sync.RWMutex
 	sessions map[int64]*session.Session
 
+	connectionCount map[string]uint
+
 	once          sync.Once
 	keepaliveExit chan struct{}
 }
@@ -84,6 +87,7 @@ func (n *Node) Startup() error {
 		return errors.New("service address cannot be empty in master node")
 	}
 	n.sessions = map[int64]*session.Session{}
+	n.connectionCount = map[string]uint{}
 	n.cluster = newCluster(n)
 	n.handler = NewHandler(n, n.Pipeline)
 	components := n.Components.List()
@@ -280,6 +284,7 @@ func (n *Node) listenAndServeWS() {
 		}
 
 		n.handler.handleWS(conn)
+		n.countConnection(conn)
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +315,8 @@ func (n *Node) listenAndServeWSTLS() {
 		}
 
 		n.handler.handleWS(conn)
+
+		n.countConnection(conn)
 	})
 
 	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
@@ -360,6 +367,42 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		n.mu.Unlock()
 	}
 	return s, nil
+}
+
+// / countConnection prevent too many connections from the same ip
+// / maybe cheat or ddos
+func (n *Node) countConnection(conn *websocket.Conn) {
+	if n.LimitConnectPerIp > 0 {
+		ip := conn.RemoteAddr().String()
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if _, ok := n.connectionCount[ip]; !ok {
+			n.connectionCount[ip] = 0
+		}
+		n.connectionCount[ip]++
+		log.Println(fmt.Sprintf("increaseConnection of ip %s the connect remain  %v", ip, n.connectionCount[ip]))
+
+		if n.connectionCount[ip] > n.LimitConnectPerIp {
+			conn.Close()
+			log.Println("Close connection from ", ip)
+			return
+		}
+	}
+}
+
+func (n *Node) decreaseConnection(ipAddress string) {
+
+	if n.LimitConnectPerIp > 0 {
+		if _, ok := n.connectionCount[ipAddress]; ok {
+			if n.connectionCount[ipAddress] > 0 {
+				n.mu.Lock()
+				defer n.mu.Unlock()
+				n.connectionCount[ipAddress]--
+				log.Println(fmt.Sprintf("decreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
+
+			}
+		}
+	}
 }
 
 func (n *Node) Ping(_ context.Context, _ *clusterpb.PingRequest) (*clusterpb.PingResponse, error) {

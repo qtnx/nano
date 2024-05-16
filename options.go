@@ -174,3 +174,9 @@ func WithUnregisterCallback(fn func(member cluster.Member, resgiterCb func())) O
 		opt.UnregisterCallback = fn
 	}
 }
+
+func WithLimitConnectionsPerIp(limit uint) Option {
+	return func(opt *cluster.Options) {
+		opt.LimitConnectPerIp = limit
+	}
+}

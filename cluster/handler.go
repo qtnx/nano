@@ -254,6 +254,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			}
 		}
 
+		h.currentNode.decreaseConnection(conn.RemoteAddr().String())
 		agent.Close()
 		if env.Debug {
 			log.Println(

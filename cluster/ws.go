@@ -52,6 +52,11 @@ func newWSConn(conn *websocket.Conn) (*wsConn, error) {
 	return c, nil
 }
 
+// RemoveIpAddress the address of the client that connected to the server
+func (c *wsConn) RemoveIpAddress() string {
+	return c.conn.RemoteAddr().String()
+}
+
 // Read reads data from the connection.
 // Read can be made to time out and return an Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
