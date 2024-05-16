@@ -382,10 +382,11 @@ func (n *Node) increaseConnection(ipAddress string) error {
 			n.connectionCount[ipAddress] = 0
 		}
 		n.connectionCount[ipAddress]++
-		log.Println(fmt.Sprintf("increaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
+		log.Println(fmt.Sprintf("IncreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
 
 		if n.connectionCount[ipAddress] > n.LimitConnectPerIp {
-			log.Warn("Close connection from ", ipAddress)
+			log.Warn(fmt.Sprintf("The connection of ip %s is reach the limit %v", ipAddress, n.LimitConnectPerIp))
+			n.connectionCount[ipAddress]--
 			return ErrLimitConnection
 		}
 	}
@@ -401,7 +402,7 @@ func (n *Node) decreaseConnection(ipAddress string) {
 				n.mu.Lock()
 				defer n.mu.Unlock()
 				n.connectionCount[ipAddress]--
-				log.Println(fmt.Sprintf("decreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
+				log.Println(fmt.Sprintf("DecreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
 
 			}
 		}

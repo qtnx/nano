@@ -238,6 +238,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		request := &clusterpb.SessionClosedRequest{
 			SessionId: agent.session.ID(),
 		}
+		h.currentNode.decreaseConnection(agent.RemoteAddrWithoutPortStr())
 
 		members := h.currentNode.cluster.remoteAddrs()
 		for _, remote := range members {
@@ -258,7 +259,6 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			}
 		}
 
-		h.currentNode.decreaseConnection(agent.RemoteAddrWithoutPortStr())
 		agent.Close()
 		if env.Debug {
 			log.Println(
