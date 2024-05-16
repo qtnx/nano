@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -221,10 +222,26 @@ func (a *agent) Close() error {
 	return a.conn.Close()
 }
 
-// RemoteAddr, implementation for session.NetworkEntity interface
+// RemoteAddr implementation for session.NetworkEntity interface
 // returns the remote network address.
 func (a *agent) RemoteAddr() net.Addr {
 	return a.conn.RemoteAddr()
+}
+
+// RemoteAddrStr return remote address string
+func (a *agent) RemoteAddrStr() string {
+	return a.conn.RemoteAddr().String()
+}
+
+// RemoteAddrWithoutPortStr return remote address without port string
+func (a *agent) RemoteAddrWithoutPortStr() string {
+	address := strings.Trim(a.conn.RemoteAddr().String(), "[]")
+	ip := net.ParseIP(address)
+	if ip == nil {
+		return ""
+	}
+
+	return ip.String()
 }
 
 // String, implementation for Stringer interface

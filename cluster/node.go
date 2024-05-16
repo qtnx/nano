@@ -43,6 +43,12 @@ import (
 	"google.golang.org/grpc"
 )
 
+var (
+
+	// ErrLimitConnection the connection of the ip is reach the limit
+	ErrLimitConnection = errors.New("reach the limit of connection")
+)
+
 // Options contains some configurations for current node
 type Options struct {
 	Pipeline           pipeline.Pipeline
@@ -284,7 +290,6 @@ func (n *Node) listenAndServeWS() {
 		}
 
 		n.handler.handleWS(conn)
-		n.countConnection(conn)
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -315,8 +320,6 @@ func (n *Node) listenAndServeWSTLS() {
 		}
 
 		n.handler.handleWS(conn)
-
-		n.countConnection(conn)
 	})
 
 	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
@@ -369,25 +372,25 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 	return s, nil
 }
 
-// / countConnection prevent too many connections from the same ip
+// / increaseConnection prevent too many connections from the same ip
 // / maybe cheat or ddos
-func (n *Node) countConnection(conn *websocket.Conn) {
+func (n *Node) increaseConnection(ipAddress string) error {
 	if n.LimitConnectPerIp > 0 {
-		ip := conn.RemoteAddr().String()
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if _, ok := n.connectionCount[ip]; !ok {
-			n.connectionCount[ip] = 0
+		if _, ok := n.connectionCount[ipAddress]; !ok {
+			n.connectionCount[ipAddress] = 0
 		}
-		n.connectionCount[ip]++
-		log.Println(fmt.Sprintf("increaseConnection of ip %s the connect remain  %v", ip, n.connectionCount[ip]))
+		n.connectionCount[ipAddress]++
+		log.Println(fmt.Sprintf("increaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
 
-		if n.connectionCount[ip] > n.LimitConnectPerIp {
-			conn.Close()
-			log.Println("Close connection from ", ip)
-			return
+		if n.connectionCount[ipAddress] > n.LimitConnectPerIp {
+			log.Warn("Close connection from ", ipAddress)
+			return ErrLimitConnection
 		}
 	}
+
+	return nil
 }
 
 func (n *Node) decreaseConnection(ipAddress string) {

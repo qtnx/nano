@@ -222,6 +222,10 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	agent := newAgent(conn, h.pipeline, h.remoteProcess)
 	h.currentNode.storeSession(agent.session)
 
+	err := h.currentNode.increaseConnection(agent.RemoteAddrWithoutPortStr())
+	if err != nil {
+		return
+	}
 	// startup write goroutine
 	go agent.write()
 
@@ -254,7 +258,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			}
 		}
 
-		h.currentNode.decreaseConnection(conn.RemoteAddr().String())
+		h.currentNode.decreaseConnection(agent.RemoteAddrWithoutPortStr())
 		agent.Close()
 		if env.Debug {
 			log.Println(
