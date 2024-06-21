@@ -47,7 +47,7 @@ type Hook func()
 var (
 	chDie   = make(chan struct{})
 	chExit  = make(chan struct{})
-	chTasks = make(chan Task, 1<<8)
+	chTasks = make(chan Task, 1<<10)
 	started int32
 	closed  int32
 )
@@ -99,4 +99,8 @@ func Close() {
 
 func PushTask(task Task) {
 	chTasks <- task
+	if env.Debug {
+		log.Println("Scheduler push task channel size %d", len(chTasks))
+	}
+
 }
