@@ -532,6 +532,7 @@ func (h *LocalHandler) localProcess(
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
 			}
 		}
+		log.Debugf("Local process completed, session id: %d, message: %v", session.ID(), msg)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")
@@ -549,6 +550,8 @@ func (h *LocalHandler) localProcess(
 			return
 		}
 
+		log.Debugf("Dispatch message to local scheduler %s service %v", s.SchedName, service)
+
 		local, ok := sched.(scheduler.LocalScheduler)
 		if !ok {
 			log.Println(fmt.Sprintf("nanl/handler: Type %T does not implement the `schedular.LocalScheduler` interface",
@@ -557,6 +560,7 @@ func (h *LocalHandler) localProcess(
 		}
 		local.Schedule(task)
 	} else {
+		log.Debugf("Dispatch message to global scheduler service %v", service)
 		scheduler.PushTask(task)
 	}
 }

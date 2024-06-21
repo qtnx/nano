@@ -427,7 +427,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		return nil, err
 	}
 	if env.Debug {
-		log.Println("HandleRequest old: ", req.Route, req.Id, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
+		log.Println("HandleRequest: ", req.Route, req.Id, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
 	}
 	msg := &message.Message{
 		Type:  message.Request,
@@ -436,6 +436,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Data:  req.Data,
 	}
 	n.handler.localProcess(handler, req.Id, s, msg)
+	log.Debug("[Node] End handle HandleRequest", req.String())
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
