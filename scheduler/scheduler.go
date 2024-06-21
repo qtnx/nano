@@ -23,7 +23,6 @@ package scheduler
 import (
 	"fmt"
 	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,27 +72,17 @@ func Sched() {
 		ticker.Stop()
 		close(chExit)
 	}()
-	var wg sync.WaitGroup
 
 	for {
 		select {
 		case <-ticker.C:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				cron()
-			}()
+			cron()
 
 		case f := <-chTasks:
-			wg.Add(1)
-			go func(t Task) {
-				defer wg.Done()
-				try(t)
-			}(f)
+			try(f)
 
 		case <-chDie:
 			log.Println("[Nano] Scheduler stopped")
-			wg.Wait()
 			return
 		}
 	}
