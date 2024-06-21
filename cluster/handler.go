@@ -358,7 +358,7 @@ func (h *LocalHandler) findMembers(service string) []*clusterpb.MemberInfo {
 }
 
 func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Message, noCopy bool) {
-	log.Debug("[RemoteProcess] request process remoteProcess with", msg, session.ID())
+	log.Debugf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d", session.ID(), msg, session.ID())
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {
 		log.Println(fmt.Sprintf("nano/handler: invalid route %s", msg.Route))
@@ -430,7 +430,13 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 			Route:          msg.Route,
 			Data:           data,
 		}
+		log.Debugf("[RemoteProcess] start request remoteProcess ssid: %v msg: %v msgId: %d, request %v", session.ID(), msg, session.ID(), request)
 		_, err = client.HandleRequest(context.Background(), request)
+		log.Debugf("[RemoteProcess] request process msg %v completed", msg)
+		if err != nil {
+			log.Errorf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d Error: %v", session.ID(), msg, session.ID(), err)
+		}
+
 	case message.Notify:
 		request := &clusterpb.NotifyMessage{
 			GateAddr:       gateAddr,
@@ -441,10 +447,14 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 			Data:           data,
 		}
 		_, err = client.HandleNotify(context.Background(), request)
+		if err != nil {
+			log.Errorf("[RemoteProcess] request process (notify) remoteProcess ssid: %v msg: %v msgId: %d Error: %v", session.ID(), msg, session.ID(), err)
+		}
 	}
 	if err != nil {
-		log.Println(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
+		log.Error(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
 	}
+	log.Debugf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d COMPLETED", session.ID(), msg, session.ID())
 }
 
 func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {

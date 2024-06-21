@@ -33,6 +33,7 @@ type Logger interface {
 	Println(v ...interface{})
 	Infof(format string, v ...interface{})
 	Error(v ...interface{})
+	Errorf(format string, v ...interface{})
 	Fatal(v ...interface{})
 	Fatalf(format string, v ...interface{})
 	Warn(v ...interface{})
@@ -40,6 +41,11 @@ type Logger interface {
 
 type ZerologWrapper struct {
 	logger zerolog.Logger
+}
+
+// Errorf implements Logger.
+func (z *ZerologWrapper) Errorf(format string, v ...interface{}) {
+	z.logger.Error().Msgf(format, v...)
 }
 
 // New creates a new Logger instance using zerolog
@@ -92,11 +98,13 @@ func init() {
 
 var (
 	Debug   func(v ...interface{})
+	Debugf  func(format string, v ...interface{})
 	Println func(v ...interface{})
 	Infof   func(format string, v ...interface{})
 	Fatal   func(v ...interface{})
 	Fatalf  func(format string, v ...interface{})
 	Error   func(v ...interface{})
+	Errorf  func(format string, v ...interface{})
 	Warn    func(v ...interface{})
 )
 
@@ -116,7 +124,16 @@ func SetLogger(logger Logger) {
 			)
 		}
 	}
+	Debugf = func(format string, v ...interface{}) {
+		if env.Debug {
+			logger.Infof(
+				"[DEBUG] "+format,
+				v,
+			)
+		}
+	}
 	Error = logger.Error
+	Errorf = logger.Errorf
 	Warn = logger.Warn
 	Infof = logger.Infof
 }
