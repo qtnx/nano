@@ -519,6 +519,7 @@ func (h *LocalHandler) localProcess(
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
 	task := func() {
+		log.Debugf("Local process start, session id: %d, message: %v, func name: %v , args: %v", session.ID(), msg, handler.Method.Name, args)
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
 			v.lastMid = lastMid
@@ -560,7 +561,7 @@ func (h *LocalHandler) localProcess(
 		}
 		local.Schedule(task)
 	} else {
-		log.Debugf("Dispatch message to global scheduler service %v", service)
+		log.Debugf("Dispatch message to global scheduler service %v handler %v", service, handler)
 		scheduler.PushTask(task)
 	}
 }

@@ -62,6 +62,7 @@ func try(f func()) {
 }
 
 func Sched() {
+	log.Debug("[Nano] Scheduler started")
 	if atomic.AddInt32(&started, 1) != 1 {
 		return
 	}
@@ -81,6 +82,7 @@ func Sched() {
 			try(f)
 
 		case <-chDie:
+			log.Println("[Nano] Scheduler stopped")
 			return
 		}
 	}
