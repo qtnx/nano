@@ -519,7 +519,7 @@ func (h *LocalHandler) localProcess(
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
 	task := func() {
-		log.Debugf("Local process start, session id: %d, message: %v, func name: %v , args: %v", session.ID(), msg, handler.Method.Name, args)
+		//log.Debugf("Local process start, session id: %d, message: %v, func name: %v , args: %v", session.ID(), msg, handler.Method.Name, args)
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
 			v.lastMid = lastMid
@@ -533,7 +533,7 @@ func (h *LocalHandler) localProcess(
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
 			}
 		}
-		log.Debugf("Local process completed, session id: %d, message: %v", session.ID(), msg)
+		//log.Debugf("Local process completed, session id: %d, message: %v", session.ID(), msg)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")
@@ -551,7 +551,7 @@ func (h *LocalHandler) localProcess(
 			return
 		}
 
-		log.Debugf("Dispatch message to local scheduler %s service %v", s.SchedName, service)
+		//log.Debugf("Dispatch message to local scheduler %s service %v", s.SchedName, service)
 
 		local, ok := sched.(scheduler.LocalScheduler)
 		if !ok {
@@ -561,7 +561,7 @@ func (h *LocalHandler) localProcess(
 		}
 		local.Schedule(task)
 	} else {
-		log.Debugf("Dispatch message to global scheduler service %v handler %v", service, handler)
+		//log.Debugf("Dispatch message to global scheduler service %v handler %v", service, handler)
 		scheduler.PushTask(task)
 	}
 }
