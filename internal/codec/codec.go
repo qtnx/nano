@@ -22,8 +22,10 @@ package codec
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 
+	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/packet"
 )
 
@@ -54,6 +56,7 @@ func NewDecoder() *Decoder {
 func (c *Decoder) forward() error {
 	header := c.buf.Next(HeadLength)
 	c.typ = header[0]
+	log.Debug("forward header: %v, type=%v, size=%v", header, c.typ, c.size)
 	if c.typ < packet.Handshake || c.typ > packet.Kick {
 		return packet.ErrWrongPacketType
 	}
@@ -67,8 +70,8 @@ func (c *Decoder) forward() error {
 }
 
 // Decode decode the network bytes slice to packet.Packet(s)
-// TODO(Warning): shared slice
 func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
+	log.Debug("decode data: %v, str= %v, base64=%v", data, string(data), base64.StdEncoding.EncodeToString(data))
 	c.buf.Write(data)
 
 	var (
@@ -87,12 +90,22 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		}
 	}
 
-	for c.size <= c.buf.Len() {
-		p := &packet.Packet{Type: packet.Type(c.typ), Length: c.size, Data: c.buf.Next(c.size)}
+	// Create a shared slice to avoid allocations
+	sharedSlice := c.buf.Bytes()
+
+	for c.size <= len(sharedSlice) {
+		p := &packet.Packet{
+			Type:   packet.Type(c.typ),
+			Length: c.size,
+			Data:   sharedSlice[:c.size],
+		}
 		packets = append(packets, p)
 
+		// Move the slice forward
+		sharedSlice = sharedSlice[c.size:]
+
 		// more packet
-		if c.buf.Len() < HeadLength {
+		if len(sharedSlice) < HeadLength {
 			c.size = -1
 			break
 		}
@@ -101,6 +114,9 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 			return packets, err
 		}
 	}
+
+	// Update the buffer to remove processed data
+	c.buf.Next(len(data) - len(sharedSlice))
 
 	return packets, nil
 }
