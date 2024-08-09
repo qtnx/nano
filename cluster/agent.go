@@ -324,8 +324,8 @@ func (a *agent) write() {
 				ID:    data.mid,
 			}
 
-			log.Debug(fmt.Sprintf("Send message, Type=%d, ID=%d, Route=%s, Data=%+v",
-				m.Type, m.ID, m.Route, m.Data))
+			//log.Debug(fmt.Sprintf("Send message, Type=%d, ID=%d, Route=%s, Data=%+v",
+			//	m.Type, m.ID, m.Route, m.Data))
 
 			if pipe := a.pipeline; pipe != nil {
 				err := pipe.Outbound().Process(a.session, m)

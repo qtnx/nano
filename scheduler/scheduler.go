@@ -99,4 +99,7 @@ func Close() {
 
 func PushTask(task Task) {
 	chTasks <- task
+	if env.Debug {
+		log.Println("Scheduler push task channel size %d", len(chTasks))
+	}
 }
