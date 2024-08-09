@@ -5,7 +5,7 @@ go 1.19
 require (
 	github.com/bwmarrin/snowflake v0.3.0
 	github.com/google/uuid v1.2.0
-	github.com/gorilla/websocket v1.5.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/pingcap/check v0.0.0-20200212061837-5e12011dc712
 	github.com/pingcap/errors v0.11.4
 	github.com/rs/zerolog v1.32.0
