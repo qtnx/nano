@@ -514,7 +514,7 @@ func (h *LocalHandler) localProcess(
 	}
 
 	if env.Debug {
-		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v", session.ID(), session.UID(), msg.String(), data))
+		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v ClienUid=%d", session.ID(), session.UID(), msg.String(), data, session.ClientUid()))
 	}
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
