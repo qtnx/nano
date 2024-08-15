@@ -441,7 +441,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		return nil, err
 	}
 	if env.Debug {
-		log.Println("HandleRequest: ", req.Route, req.Id, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()), fmt.Sprintf("ClientUid: %v", s.ClientUid()), fmt.Sprintf("ClientUs: %v", s.State()))
+		log.Println("HandleRequest: ", req.Route, req.Id, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()), fmt.Sprintf("ClientUid: %v", s.ClientUid()), fmt.Sprintf("ClientUserData: %v", s.State()))
 	}
 	msg := &message.Message{
 		Type:  message.Request,
@@ -465,7 +465,6 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 		return nil, err
 	}
 	log.Println("[Node] HandleRequest old: ", req.Route, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
-
 	msg := &message.Message{
 		Type:  message.Notify,
 		Route: req.Route,
