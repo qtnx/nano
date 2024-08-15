@@ -302,8 +302,6 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	//	}
 	//}
 
-	defer conn.Close()
-
 	packetChan := make(chan *packet.Packet, 100) // Buffered channel để xử lý gói tin
 	errChan := make(chan error, 1)
 
