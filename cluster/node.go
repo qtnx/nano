@@ -345,6 +345,9 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 	s, found := n.sessions[sid]
 	n.mu.RUnlock()
 	if !found {
+		if env.Debug {
+			log.Println("Not found session ")
+		}
 		conns, err := n.rpcClient.getConnPool(gateAddr)
 		if err != nil {
 			return nil, err
@@ -368,6 +371,17 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		n.mu.Lock()
 		n.sessions[sid] = s
 		n.mu.Unlock()
+	} else {
+		if env.Debug {
+			log.Println("Found session ")
+		}
+		s.SetClientUid(clientUid)
+
+		var userData map[string]interface{}
+		if err := json.Unmarshal(clientUserData, &userData); err != nil {
+			return nil, err
+		}
+		s.Restore(userData)
 	}
 	return s, nil
 }

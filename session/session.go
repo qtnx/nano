@@ -128,6 +128,8 @@ func (s *Session) ClientUid() int64 {
 
 // Set client uid
 func (s *Session) SetClientUid(uid int64) {
+	s.Lock()
+	defer s.Unlock()
 	s.clientUid = uid
 }
 
@@ -424,10 +426,9 @@ func (s *Session) Byte(key string) []byte {
 
 }
 
-
 // Unmashel anything
 func UnmarshalAny[T any](session *Session, key string) (*T, error) {
-	
+
 	bytes := session.Byte(key)
 
 	if string(bytes) == "" {
