@@ -268,37 +268,87 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	}()
 
 	// read loop
-	buf := make([]byte, 2048)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
-			}
-			return
-		}
+	//buf := make([]byte, 2048)
+	//for {
+	//	n, err := conn.Read(buf)
+	//	if err != nil {
+	//		if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+	//			log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
+	//		}
+	//		return
+	//	}
+	//
+	//	// TODO(warning): decoder use slice for performance, packet data should be copy before next Decode
+	//	packets, err := agent.decoder.Decode(buf[:n])
+	//	if err != nil {
+	//		log.Println(err.Error())
+	//
+	//		// process packets decoded
+	//		for _, p := range packets {
+	//			if err := h.processPacket(agent, p); err != nil {
+	//				log.Println(err.Error())
+	//				return
+	//			}
+	//		}
+	//		return
+	//	}
+	//
+	//	// process all packets
+	//	for _, p := range packets {
+	//		if err := h.processPacket(agent, p); err != nil {
+	//			log.Println(err.Error())
+	//			return
+	//		}
+	//	}
+	//}
 
-		// TODO(warning): decoder use slice for performance, packet data should be copy before next Decode
-		packets, err := agent.decoder.Decode(buf[:n])
-		if err != nil {
-			log.Println(err.Error())
+	defer conn.Close()
 
-			// process packets decoded
-			for _, p := range packets {
-				if err := h.processPacket(agent, p); err != nil {
-					log.Println(err.Error())
-					return
+	packetChan := make(chan *packet.Packet, 100) // Buffered channel để xử lý gói tin
+	errChan := make(chan error, 1)
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
 				}
-			}
-			return
-		}
-
-		// process all packets
-		for _, p := range packets {
-			if err := h.processPacket(agent, p); err != nil {
-				log.Println(err.Error())
+				errChan <- err
 				return
 			}
+
+			if n > len(buf) {
+				log.Warn("Read more data than buffer size, truncating")
+				n = len(buf)
+			}
+
+			dataCopy := make([]byte, n)
+			copy(dataCopy, buf[:n])
+
+			packets, err := agent.decoder.Decode(dataCopy)
+			if err != nil {
+				log.Println("Decode error:", err.Error())
+				continue
+			}
+
+			for _, p := range packets {
+				packetChan <- p
+			}
+		}
+	}()
+
+	for {
+		select {
+		case p := <-packetChan:
+			if err := h.processPacket(agent, p); err != nil {
+				log.Println("Process packet error:", err.Error())
+				return
+			}
+		case err := <-errChan:
+			log.Println("Connection error:", err.Error())
+			return
 		}
 	}
 }
