@@ -1,6 +1,8 @@
 package codec
 
 import (
+	"fmt"
+	"github.com/rs/zerolog/log"
 	"reflect"
 	"testing"
 
@@ -60,9 +62,12 @@ func TestPack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
+
+	fmt.Println("********** D3 **************")
 	d3 := NewDecoder()
 	upp5, err := d3.Decode(append(pp5, []byte{0x01, 0x00, 0x00, 0x00}...))
 	if err != nil {
+		log.Err(err)
 		t.Fatal(err.Error())
 	}
 	if len(upp5) < 1 {

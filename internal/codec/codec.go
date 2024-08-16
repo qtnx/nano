@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/packet"
 )
@@ -105,7 +104,7 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		sharedSlice = sharedSlice[c.size:]
 
 		// more packet
-		if len(sharedSlice) < HeadLength {
+		if len(sharedSlice) <= HeadLength {
 			c.size = -1
 			break
 		}
@@ -128,10 +127,10 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		if nextBytes > 0 {
 			c.buf.Next(nextBytes)
 		}
-	} else if nextBytes < 0 {
+	} else { //  nextBytes <= 0
 		log.Error("Negative nextBytes value: %d", nextBytes)
 		c.buf.Reset()
-	} else {
+		c.size = -1
 	}
 	return packets, nil
 }
