@@ -116,8 +116,23 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 	}
 
 	// Update the buffer to remove processed data
-	c.buf.Next(len(data) - len(sharedSlice))
+	//c.buf.Next(len(data) - len(sharedSlice))
 
+	nextBytes := len(data) - len(sharedSlice)
+	if nextBytes > 0 {
+		currentLen := c.buf.Len()
+		if nextBytes > currentLen {
+			log.Warn("nextBytes (%d) larger than buffer length (%d), adjusting", nextBytes, currentLen)
+			nextBytes = currentLen
+		}
+		if nextBytes > 0 {
+			c.buf.Next(nextBytes)
+		}
+	} else if nextBytes < 0 {
+		log.Error("Negative nextBytes value: %d", nextBytes)
+		c.buf.Reset()
+	} else {
+	}
 	return packets, nil
 }
 
