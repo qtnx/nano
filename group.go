@@ -21,7 +21,9 @@
 package nano
 
 import (
+	"errors"
 	"fmt"
+	"github.com/lonng/nano/cluster"
 	"sync"
 	"sync/atomic"
 
@@ -135,7 +137,14 @@ func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) err
 			continue
 		}
 		if err = s.Push(route, data); err != nil {
-			log.Println(err.Error())
+			if errors.Is(err, cluster.ErrBrokenPipe) {
+				err := c.Leave(s)
+				if err != nil {
+					log.Println(err.Error())
+				}
+			} else {
+				log.Println(fmt.Sprintf("Session Multicast message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+			}
 		}
 	}
 
@@ -163,7 +172,15 @@ func (c *Group) Singlecast(route string, v interface{}, id int64) error {
 	}
 
 	if err = s.Push(route, data); err != nil {
-		log.Println(err.Error())
+		if errors.Is(err, cluster.ErrBrokenPipe) {
+			err := c.LeaveWithSID(id)
+			if err != nil {
+				log.Println(err.Error())
+			}
+		} else {
+			log.Println(err.Error())
+		}
+		return err
 	}
 	return nil
 }
@@ -188,11 +205,54 @@ func (c *Group) Broadcast(route string, v interface{}) error {
 
 	for _, s := range c.sessions {
 		if err = s.Push(route, data); err != nil {
-			log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+			if errors.Is(err, cluster.ErrBrokenPipe) {
+				err := c.Leave(s)
+				if err != nil {
+					log.Println(err.Error())
+				}
+			} else {
+				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+			}
+
 		}
 	}
-
 	return err
+}
+
+// BroadcastWithFallbackClosedSession push  the message(s) to  all members
+func (c *Group) BroadcastWithFallbackClosedSession(route string, v interface{}) ([]int64, error) {
+	closedSession := make([]int64, 0)
+	if c.isClosed() {
+		return closedSession, ErrClosedGroup
+	}
+
+	data, err := message.Serialize(v)
+	if err != nil {
+		return closedSession, err
+	}
+
+	if env.Debug {
+		log.Println(fmt.Sprintf("Broadcast %s, Data=%+v", route, v))
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, s := range c.sessions {
+		if err = s.Push(route, data); err != nil {
+			if errors.Is(err, cluster.ErrBrokenPipe) {
+				closedSession = append(closedSession, s.ID())
+				err := c.Leave(s)
+				if err != nil {
+					log.Println(err.Error())
+				}
+			} else {
+				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+			}
+
+		}
+	}
+	return closedSession, err
 }
 
 // Contains check whether a UID is contained in current group or not
@@ -238,6 +298,23 @@ func (c *Group) Leave(s *session.Session) error {
 	defer c.mu.Unlock()
 
 	delete(c.sessions, s.ID())
+	return nil
+}
+
+// LeaveWithSID remove specified UID related session from group with SID
+func (c *Group) LeaveWithSID(ID int64) error {
+	if c.isClosed() {
+		return ErrClosedGroup
+	}
+
+	if env.Debug {
+		log.Println(fmt.Sprintf("Remove session from group %s, UID=%d", c.name, ID))
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.sessions, ID)
 	return nil
 }
 
