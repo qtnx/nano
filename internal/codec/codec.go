@@ -22,7 +22,6 @@ package codec
 
 import (
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/packet"
@@ -69,8 +68,8 @@ func (c *Decoder) forward() error {
 }
 
 // Decode decode the network bytes slice to packet.Packet(s)
+// TODO(Warning): shared slice
 func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
-	log.Debug("decode data: %v, str= %v, base64=%v", data, string(data), base64.StdEncoding.EncodeToString(data))
 	c.buf.Write(data)
 
 	var (
@@ -89,22 +88,12 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		}
 	}
 
-	// Create a shared slice to avoid allocations
-	sharedSlice := c.buf.Bytes()
-
-	for c.size <= len(sharedSlice) {
-		p := &packet.Packet{
-			Type:   packet.Type(c.typ),
-			Length: c.size,
-			Data:   sharedSlice[:c.size],
-		}
+	for c.size <= c.buf.Len() {
+		p := &packet.Packet{Type: packet.Type(c.typ), Length: c.size, Data: c.buf.Next(c.size)}
 		packets = append(packets, p)
 
-		// Move the slice forward
-		sharedSlice = sharedSlice[c.size:]
-
 		// more packet
-		if len(sharedSlice) <= HeadLength {
+		if c.buf.Len() < HeadLength {
 			c.size = -1
 			break
 		}
@@ -114,26 +103,78 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		}
 	}
 
-	// Update the buffer to remove processed data
-	//c.buf.Next(len(data) - len(sharedSlice))
-
-	nextBytes := len(data) - len(sharedSlice)
-	if nextBytes > 0 {
-		currentLen := c.buf.Len()
-		if nextBytes > currentLen {
-			log.Warn("nextBytes (%d) larger than buffer length (%d), adjusting", nextBytes, currentLen)
-			nextBytes = currentLen
-		}
-		if nextBytes > 0 {
-			c.buf.Next(nextBytes)
-		}
-	} else { //  nextBytes <= 0
-		log.Error("Negative nextBytes value: %d", nextBytes)
-		c.buf.Reset()
-		c.size = -1
-	}
 	return packets, nil
 }
+
+//// Decode decode the network bytes slice to packet.Packet(s)
+//func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
+//	log.Debug("decode data: %v, str= %v, base64=%v", data, string(data), base64.StdEncoding.EncodeToString(data))
+//	c.buf.Write(data)
+//
+//	var (
+//		packets []*packet.Packet
+//		err     error
+//	)
+//	// check length
+//	if c.buf.Len() < HeadLength {
+//		return nil, err
+//	}
+//
+//	// first time
+//	if c.size < 0 {
+//		if err = c.forward(); err != nil {
+//			return nil, err
+//		}
+//	}
+//
+//	// Create a shared slice to avoid allocations
+//	sharedSlice := c.buf.Bytes()
+//
+//	for c.size <= len(sharedSlice) {
+//		p := &packet.Packet{
+//			Type:   packet.Type(c.typ),
+//			Length: c.size,
+//			Data:   sharedSlice[:c.size],
+//		}
+//		packets = append(packets, p)
+//
+//		// Move the slice forward
+//		sharedSlice = sharedSlice[c.size:]
+//
+//		// more packet
+//		if len(sharedSlice) <= HeadLength {
+//			c.size = -1
+//			break
+//		}
+//
+//		if err = c.forward(); err != nil {
+//			return packets, err
+//		}
+//	}
+//
+//	// Update the buffer to remove processed data
+//	//c.buf.Next(len(data) - len(sharedSlice))
+//
+//	nextBytes := len(data) - len(sharedSlice)
+//	if nextBytes > 0 {
+//		currentLen := c.buf.Len()
+//		if nextBytes > currentLen {
+//			log.Warn("nextBytes (%d) larger than buffer length (%d), adjusting", nextBytes, currentLen)
+//			nextBytes = currentLen
+//		}
+//		if nextBytes > 0 {
+//			c.buf.Next(nextBytes)
+//		} else {
+//			c.buf.Reset()
+//			c.size = -1
+//		}
+//	} else { //  nextBytes <= 0
+//		log.Error("Negative nextBytes value: %d", nextBytes)
+//		c.buf.Reset()
+//		c.size = -1
+//	}
+//	return packets, nil
+//}
 
 // Encode create a packet.Packet from  the raw bytes slice and then encode to network bytes slice
 // Protocol refs: https://github.com/NetEase/pomelo/wiki/Communication-Protocol

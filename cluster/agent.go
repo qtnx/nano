@@ -347,6 +347,7 @@ func (a *agent) write() {
 				log.Println(err)
 				break
 			}
+			log.Println("push encoded t chWrite")
 			chWrite <- p
 
 		case <-a.chDie: // agent closed signal

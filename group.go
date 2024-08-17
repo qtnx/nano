@@ -88,7 +88,7 @@ func (c *Group) Member(uid int64) (*session.Session, error) {
 	return nil, ErrMemberNotFound
 }
 
-// Member by session id
+// MemberBySessionID Member by session id
 func (c *Group) MemberBySessionID(id int64) (*session.Session, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -138,10 +138,7 @@ func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) err
 		}
 		if err = s.Push(route, data); err != nil {
 			if errors.Is(err, cluster.ErrBrokenPipe) {
-				err := c.Leave(s)
-				if err != nil {
-					log.Println(err.Error())
-				}
+				return err
 			} else {
 				log.Println(fmt.Sprintf("Session Multicast message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
 			}
@@ -173,10 +170,7 @@ func (c *Group) Singlecast(route string, v interface{}, id int64) error {
 
 	if err = s.Push(route, data); err != nil {
 		if errors.Is(err, cluster.ErrBrokenPipe) {
-			err := c.LeaveWithSID(id)
-			if err != nil {
-				log.Println(err.Error())
-			}
+			return err
 		} else {
 			log.Println(err.Error())
 		}
@@ -205,12 +199,7 @@ func (c *Group) Broadcast(route string, v interface{}) error {
 
 	for _, s := range c.sessions {
 		if err = s.Push(route, data); err != nil {
-			if errors.Is(err, cluster.ErrBrokenPipe) {
-				err := c.Leave(s)
-				if err != nil {
-					log.Println(err.Error())
-				}
-			} else {
+			if !errors.Is(err, cluster.ErrBrokenPipe) {
 				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
 			}
 
@@ -242,16 +231,16 @@ func (c *Group) BroadcastWithFallbackClosedSession(route string, v interface{}) 
 		if err = s.Push(route, data); err != nil {
 			if errors.Is(err, cluster.ErrBrokenPipe) {
 				closedSession = append(closedSession, s.ID())
-				err := c.Leave(s)
-				if err != nil {
-					log.Println(err.Error())
-				}
 			} else {
 				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
 			}
 
 		}
 	}
+	if env.Debug {
+		log.Println(fmt.Sprintf("Broadcast done %s, Data=%+v, closedSession=%+v", route, v, closedSession))
+	}
+
 	return closedSession, err
 }
 
