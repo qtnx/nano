@@ -354,6 +354,8 @@ func (h *LocalHandler) handle(conn net.Conn) {
 func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) error {
 	switch p.Type {
 	case packet.Handshake:
+
+		agent.lastMid = 1
 		if err := env.HandshakeValidator(agent.session, p.Data); err != nil {
 			return err
 		}

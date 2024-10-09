@@ -121,6 +121,11 @@ func (s *Session) LastMid() uint64 {
 	return s.entity.LastMid()
 }
 
+// SetLastMid returns the last message id
+func (s *Session) SetLastMid() uint64 {
+	return s.entity.LastMid()
+}
+
 // get client uid
 func (s *Session) ClientUid() int64 {
 	return s.clientUid
