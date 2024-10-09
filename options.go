@@ -1,6 +1,7 @@
 package nano
 
 import (
+	"github.com/lonng/nano/session"
 	"net/http"
 	"time"
 
@@ -155,7 +156,7 @@ func WithLogger(l log.Logger) Option {
 }
 
 // WithHandshakeValidator sets the function that Verify `handshake` data
-func WithHandshakeValidator(fn func([]byte) error) Option {
+func WithHandshakeValidator(fn func(*session.Session, []byte) error) Option {
 	return func(opt *cluster.Options) {
 		env.HandshakeValidator = fn
 	}

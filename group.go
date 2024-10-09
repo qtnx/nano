@@ -196,7 +196,6 @@ func (c *Group) Broadcast(route string, v interface{}) error {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
 	for _, s := range c.sessions {
 		if err = s.Push(route, data); err != nil {
 			if !errors.Is(err, cluster.ErrBrokenPipe) {
