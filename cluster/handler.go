@@ -483,6 +483,10 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 	sessionUserData, _ := json.Marshal(session.State())
 
 	client := clusterpb.NewMemberClient(pool.Get())
+
+	// Start timing before making the RPC call
+	startTime := time.Now()
+
 	switch msg.Type {
 	case message.Request:
 		request := &clusterpb.RequestMessage{
@@ -515,6 +519,11 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 			log.Errorf("[RemoteProcess] request process (notify) remoteProcess ssid: %v msg: %v msgId: %d Error: %v", session.ID(), msg, session.ID(), err)
 		}
 	}
+
+	// Record the duration after the RPC call
+	duration := time.Since(startTime).Seconds()
+	RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
+
 	if err != nil {
 		log.Error(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
 	}
@@ -582,6 +591,10 @@ func (h *LocalHandler) localProcess(
 	}
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
+
+	// Start timing before processing the request
+	startTime := time.Now()
+
 	task := func() {
 		//log.Debugf("Local process start, session id: %d, message: %v, func name: %v , args: %v", session.ID(), msg, handler.Method.Name, args)
 		switch v := session.NetworkEntity().(type) {
@@ -597,7 +610,10 @@ func (h *LocalHandler) localProcess(
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
 			}
 		}
-		//log.Debugf("Local process completed, session id: %d, message: %v", session.ID(), msg)
+
+		// Record the duration after processing
+		duration := time.Since(startTime).Seconds()
+		RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")

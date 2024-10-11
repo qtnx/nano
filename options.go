@@ -1,9 +1,10 @@
 package nano
 
 import (
-	"github.com/lonng/nano/session"
 	"net/http"
 	"time"
+
+	"github.com/lonng/nano/session"
 
 	"github.com/lonng/nano/cluster"
 	"github.com/lonng/nano/component"
@@ -130,6 +131,12 @@ func WithSerializer(serializer serialize.Serializer) Option {
 func WithLabel(label string) Option {
 	return func(opt *cluster.Options) {
 		opt.Label = label
+	}
+}
+
+func WithOpenPrometheus(enable bool) Option {
+	return func(opt *cluster.Options) {
+		opt.OpenPrometheus = enable
 	}
 }
 

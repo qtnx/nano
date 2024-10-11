@@ -66,6 +66,7 @@ type Options struct {
 	RemoteServiceRoute CustomerRemoteServiceRoute
 	ForceHostname      bool
 	LimitConnectPerIp  uint
+	OpenPrometheus     bool
 }
 
 // Node represents a node in nano cluster, which will contains a group of services.
@@ -134,10 +135,12 @@ func (n *Node) Startup() error {
 
 	// Expose Prometheus metrics endpoint
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(":2112", nil)
-		if err != nil {
-			log.Fatalf("Error starting Prometheus HTTP server: %v", err)
+		if n.OpenPrometheus {
+			http.Handle("/metrics", promhttp.Handler())
+			err := http.ListenAndServe(":2112", nil)
+			if err != nil {
+				log.Fatalf("Error starting Prometheus HTTP server: %v", err)
+			}
 		}
 	}()
 

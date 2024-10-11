@@ -26,10 +26,20 @@ var (
 			Buckets: prometheus.DefBuckets,
 		},
 	)
+
+	RouteRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "route_request_duration_seconds",
+			Help:    "Duration of processing requests per route in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"route"},
+	)
 )
 
 func init() {
 	prometheus.MustRegister(TotalConnections)
 	prometheus.MustRegister(CurrentConnections)
 	prometheus.MustRegister(ConnectionDuration)
+	prometheus.MustRegister(RouteRequestDuration)
 }
