@@ -233,6 +233,13 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		log.Debug(fmt.Sprintf("New session established: %s", agent.String()))
 	}
 
+	// Increment the total and current connections metrics
+	TotalConnections.Inc()
+	CurrentConnections.Inc()
+
+	// Record the start time of the connection
+	startTime := time.Now()
+
 	// guarantee agent related resource be destroyed
 	defer func() {
 		request := &clusterpb.SessionClosedRequest{
@@ -265,6 +272,13 @@ func (h *LocalHandler) handle(conn net.Conn) {
 				fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", agent.session.ID(), agent.session.UID()),
 			)
 		}
+
+		// Decrement the current connections metric
+		CurrentConnections.Dec()
+
+		// Observe the connection duration
+		duration := time.Since(startTime).Seconds()
+		ConnectionDuration.Observe(duration)
 	}()
 
 	// read loop

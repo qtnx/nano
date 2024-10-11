@@ -40,6 +40,7 @@ import (
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 )
 
@@ -130,6 +131,15 @@ func (n *Node) Startup() error {
 			}
 		}()
 	}
+
+	// Expose Prometheus metrics endpoint
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		err := http.ListenAndServe(":2112", nil)
+		if err != nil {
+			log.Fatalf("Error starting Prometheus HTTP server: %v", err)
+		}
+	}()
 
 	return nil
 }
