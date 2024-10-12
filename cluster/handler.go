@@ -239,6 +239,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 
 	// Record the start time of the connection
 	startTime := time.Now()
+	metrics.CurrentConnections.Inc()
 
 	// guarantee agent related resource be destroyed
 	defer func() {
@@ -276,6 +277,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		// Observe the connection duration
 		duration := time.Since(startTime).Seconds()
 		metrics.ConnectionDuration.Observe(duration)
+		metrics.CurrentConnections.Dec()
 	}()
 
 	// read loop
@@ -519,7 +521,7 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 
 	// Record the duration after the RPC call
 	duration := time.Since(startTime).Seconds()
-	metrics.RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
+	metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "remote").Observe(duration)
 
 	if err != nil {
 		log.Error(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
@@ -610,7 +612,7 @@ func (h *LocalHandler) localProcess(
 
 		// Record the duration after processing
 		duration := time.Since(startTime).Seconds()
-		metrics.RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
+		metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "local").Observe(duration)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")

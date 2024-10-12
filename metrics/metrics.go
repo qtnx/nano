@@ -33,7 +33,15 @@ var (
 			Help:    "Duration of processing requests per route in seconds",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"route"},
+		[]string{"route", "type", "request_type"},
+	)
+
+	ConnectionsPerIP = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "connections_per_ip",
+			Help: "Number of active connections per IP address",
+		},
+		[]string{"ip"},
 	)
 )
 
@@ -42,4 +50,5 @@ func init() {
 	prometheus.MustRegister(CurrentConnections)
 	prometheus.MustRegister(ConnectionDuration)
 	prometheus.MustRegister(RouteRequestDuration)
+	prometheus.MustRegister(ConnectionsPerIP)
 }

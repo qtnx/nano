@@ -37,6 +37,7 @@ import (
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
+	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
@@ -402,6 +403,7 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 // / increaseConnection prevent too many connections from the same ip
 // / maybe cheat or ddos
 func (n *Node) increaseConnection(ipAddress string) error {
+	metrics.ConnectionsPerIP.WithLabelValues(ipAddress).Inc()
 	if n.LimitConnectPerIp > 0 {
 		n.mu.Lock()
 		defer n.mu.Unlock()
@@ -422,6 +424,7 @@ func (n *Node) increaseConnection(ipAddress string) error {
 }
 
 func (n *Node) decreaseConnection(ipAddress string) {
+	metrics.ConnectionsPerIP.WithLabelValues(ipAddress).Dec()
 
 	if n.LimitConnectPerIp > 0 {
 		if _, ok := n.connectionCount[ipAddress]; ok {

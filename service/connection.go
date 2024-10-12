@@ -23,8 +23,6 @@ package service
 import (
 	"os"
 	"sync/atomic"
-
-	"github.com/lonng/nano/metrics"
 )
 
 type Connection interface {
@@ -54,13 +52,11 @@ func newConnectionService() *connectionService {
 
 // Increment increment the connection count
 func (c *connectionService) Increment() {
-	metrics.CurrentConnections.Inc()
 	atomic.AddInt64(&c.count, 1)
 }
 
 // Decrement decrement the connection count
 func (c *connectionService) Decrement() {
-	metrics.CurrentConnections.Dec()
 	atomic.AddInt64(&c.count, -1)
 }
 
