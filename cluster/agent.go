@@ -34,6 +34,7 @@ import (
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
 	"github.com/lonng/nano/internal/packet"
+	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
@@ -218,7 +219,7 @@ func (a *agent) Close() error {
 		close(a.chDie)
 		scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
 	}
-
+	metrics.AgentClose.Inc()
 	return a.conn.Close()
 }
 

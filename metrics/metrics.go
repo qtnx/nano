@@ -43,6 +43,13 @@ var (
 		},
 		[]string{"ip"},
 	)
+
+	AgentClose = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agent_close_total",
+			Help: "Total number of agent close operations",
+		},
+	)
 )
 
 func init() {
@@ -51,4 +58,5 @@ func init() {
 	prometheus.MustRegister(ConnectionDuration)
 	prometheus.MustRegister(RouteRequestDuration)
 	prometheus.MustRegister(ConnectionsPerIP)
+	prometheus.MustRegister(AgentClose)
 }
