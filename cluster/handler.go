@@ -40,6 +40,7 @@ import (
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
 	"github.com/lonng/nano/internal/packet"
+	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
@@ -234,8 +235,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	}
 
 	// Increment the total and current connections metrics
-	TotalConnections.Inc()
-	CurrentConnections.Inc()
+	metrics.TotalConnections.Inc()
 
 	// Record the start time of the connection
 	startTime := time.Now()
@@ -274,11 +274,11 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		}
 
 		// Decrement the current connections metric
-		CurrentConnections.Dec()
+		metrics.CurrentConnections.Dec()
 
 		// Observe the connection duration
 		duration := time.Since(startTime).Seconds()
-		ConnectionDuration.Observe(duration)
+		metrics.ConnectionDuration.Observe(duration)
 	}()
 
 	// read loop
@@ -522,7 +522,7 @@ func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Mess
 
 	// Record the duration after the RPC call
 	duration := time.Since(startTime).Seconds()
-	RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
+	metrics.RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
 
 	if err != nil {
 		log.Error(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
@@ -613,7 +613,7 @@ func (h *LocalHandler) localProcess(
 
 		// Record the duration after processing
 		duration := time.Since(startTime).Seconds()
-		RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
+		metrics.RouteRequestDuration.WithLabelValues(msg.Route).Observe(duration)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")

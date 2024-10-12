@@ -21,11 +21,12 @@
 package cluster
 
 import (
-	"github.com/gorilla/websocket"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // wsConn is an adapter to t.Conn, which implements all t.Conn
@@ -92,10 +93,6 @@ func (c *wsConn) Write(b []byte) (int, error) {
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *wsConn) Close() error {
-
-	// Decrement current connections when WebSocket is closed
-	CurrentConnections.Dec()
-
 	return c.conn.Close()
 }
 
