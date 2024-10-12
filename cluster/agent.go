@@ -268,90 +268,96 @@ func (a *agent) setStatus(state int32) {
 
 func (a *agent) write() {
 	ticker := time.NewTicker(env.Heartbeat)
-	defer ticker.Stop()
+	chWrite := make(chan []byte, agentWriteBacklog)
+	// clean func
+	defer func() {
+		ticker.Stop()
+		close(a.chSend)
+		close(chWrite)
+		a.Close()
+		if env.Debug {
+			log.Println(fmt.Sprintf("Session write goroutine exit, SessionID=%d, UID=%d", a.session.ID(), a.session.UID()))
+		}
+	}()
 
 	for {
 		select {
 		case <-ticker.C:
 			deadline := time.Now().Add(-2 * env.Heartbeat).Unix()
 			if atomic.LoadInt64(&a.lastAt) < deadline {
-				log.Println("Session heartbeat timeout")
+				log.Println(
+					fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline),
+				)
 				return
 			}
-			if err := a.writeMessage(hbd); err != nil {
+			chWrite <- hbd
+
+		case data := <-chWrite:
+			// close agent while low-level conn broken
+			if _, err := a.conn.Write(data); err != nil {
+				log.Println(err.Error())
 				return
 			}
 
 		case data := <-a.chSend:
-			if err := a.handleSendData(data); err != nil {
-				return
+			payload, err := message.Serialize(data.payload)
+			if err != nil {
+				switch data.typ {
+				case message.Push:
+					log.Println(fmt.Sprintf("Push: %s error: %s", data.route, err.Error()))
+				case message.Response:
+					log.Println(fmt.Sprintf("Response message(id: %d) error: %s", data.mid, err.Error()))
+				default:
+					// expect
+				}
+				break
 			}
 
-		case <-a.chDie:
+			if data.route == "" {
+				log.Println("empty route")
+			}
+
+			// construct message and encode
+			m := &message.Message{
+				Type:  data.typ,
+				Data:  payload,
+				Route: data.route,
+				ID:    data.mid,
+			}
+
+			//log.Debug(fmt.Sprintf("Send message, Type=%d, ID=%d, Route=%s, Data=%+v",
+			//	m.Type, m.ID, m.Route, m.Data))
+
+			if pipe := a.pipeline; pipe != nil {
+				err := pipe.Outbound().Process(a.session, m)
+				if err != nil {
+					log.Println("broken pipeline", err.Error())
+					break
+				}
+			}
+
+			em, err := m.Encode()
+			if err != nil {
+				log.Println(err.Error())
+				break
+			}
+
+			// packet encode
+			p, err := codec.Encode(packet.Data, em)
+			if err != nil {
+				log.Println(err)
+				break
+			}
+			log.Println("push encoded t chWrite")
+			chWrite <- p
+
+		case <-a.chDie: // agent closed signal
 			return
 
-		case <-env.Die:
+		case <-env.Die: // application quit
 			return
 		}
 	}
-}
-
-func (a *agent) writeMessage(msg []byte) error {
-	_, err := a.conn.Write(msg)
-	return err
-}
-
-func (a *agent) handleSendData(data pendingMessage) error {
-	payload, err := message.Serialize(data.payload)
-	if err != nil {
-		switch data.typ {
-		case message.Push:
-			log.Println(fmt.Sprintf("Push: %s error: %s", data.route, err.Error()))
-		case message.Response:
-			log.Println(fmt.Sprintf("Response message(id: %d) error: %s", data.mid, err.Error()))
-		default:
-			// expect
-		}
-		return err
-	}
-
-	if data.route == "" {
-		log.Println("empty route")
-	}
-
-	// construct message and encode
-	m := &message.Message{
-		Type:  data.typ,
-		Data:  payload,
-		Route: data.route,
-		ID:    data.mid,
-	}
-
-	//log.Debug(fmt.Sprintf("Send message, Type=%d, ID=%d, Route=%s, Data=%+v",
-	//	m.Type, m.ID, m.Route, m.Data))
-
-	if pipe := a.pipeline; pipe != nil {
-		err := pipe.Outbound().Process(a.session, m)
-		if err != nil {
-			log.Println("broken pipeline", err.Error())
-			return err
-		}
-	}
-
-	em, err := m.Encode()
-	if err != nil {
-		log.Println(err.Error())
-		return err
-	}
-
-	// packet encode
-	p, err := codec.Encode(packet.Data, em)
-	if err != nil {
-		log.Println(err)
-		return err
-	}
-	log.Println("push encoded t chWrite")
-	return a.writeMessage(p)
 }
 
 // OriginalSid get original session id

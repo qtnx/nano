@@ -29,12 +29,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var wsConnPool = sync.Pool{
-	New: func() interface{} {
-		return &wsConn{}
-	},
-}
-
 // wsConn is an adapter to t.Conn, which implements all t.Conn
 // interface base on *websocket.Conn
 type wsConn struct {
@@ -46,13 +40,10 @@ type wsConn struct {
 
 // newWSConn return an initialized *wsConn
 func newWSConn(conn *websocket.Conn) (*wsConn, error) {
-	c := wsConnPool.Get().(*wsConn)
-	c.conn = conn
-	c.mu = sync.Mutex{}
+	c := &wsConn{conn: conn}
 
 	t, r, err := conn.NextReader()
 	if err != nil {
-		wsConnPool.Put(c)
 		return nil, err
 	}
 
@@ -102,11 +93,7 @@ func (c *wsConn) Write(b []byte) (int, error) {
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *wsConn) Close() error {
-	err := c.conn.Close()
-	c.conn = nil
-	c.reader = nil
-	wsConnPool.Put(c)
-	return err
+	return c.conn.Close()
 }
 
 // LocalAddr returns the local network address.
