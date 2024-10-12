@@ -273,9 +273,6 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			)
 		}
 
-		// Decrement the current connections metric
-		metrics.CurrentConnections.Dec()
-
 		// Observe the connection duration
 		duration := time.Since(startTime).Seconds()
 		metrics.ConnectionDuration.Observe(duration)
