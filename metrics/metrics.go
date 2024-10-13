@@ -1,7 +1,12 @@
 package metrics
 
 import (
+	"fmt"
+	"log"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/shirou/gopsutil/cpu"
 )
 
 var (
@@ -70,6 +75,30 @@ var (
 			Help: "Number of pending tasks in the scheduler",
 		},
 	)
+
+	CPUUsage = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cpu_usage_percent",
+			Help: "Current CPU usage in percent",
+		},
+		[]string{"cpu"},
+	)
+
+	CPUUserTime = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cpu_user_time_seconds",
+			Help: "CPU time spent in user mode in seconds",
+		},
+		[]string{"cpu"},
+	)
+
+	CPUSystemTime = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cpu_system_time_seconds",
+			Help: "CPU time spent in system mode in seconds",
+		},
+		[]string{"cpu"},
+	)
 )
 
 func init() {
@@ -82,4 +111,35 @@ func init() {
 	prometheus.MustRegister(ClientClosedConnections)
 	prometheus.MustRegister(ServerClosedConnections)
 	prometheus.MustRegister(SchedulePendingTasks)
+	prometheus.MustRegister(CPUUsage)
+	prometheus.MustRegister(CPUUserTime)
+	prometheus.MustRegister(CPUSystemTime)
+	go updateCPUMetrics()
+}
+
+func updateCPUMetrics() {
+	for {
+		percentages, err := cpu.Percent(time.Second, true)
+		if err != nil {
+			log.Printf("Error getting CPU usage: %v", err)
+			continue
+		}
+
+		for i, percentage := range percentages {
+			CPUUsage.WithLabelValues(fmt.Sprintf("cpu%d", i)).Set(percentage)
+		}
+
+		times, err := cpu.Times(true)
+		if err != nil {
+			log.Printf("Error getting CPU times: %v", err)
+			continue
+		}
+
+		for i, t := range times {
+			CPUUserTime.WithLabelValues(fmt.Sprintf("cpu%d", i)).Set(t.User)
+			CPUSystemTime.WithLabelValues(fmt.Sprintf("cpu%d", i)).Set(t.System)
+		}
+
+		time.Sleep(15 * time.Second)
+	}
 }

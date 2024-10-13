@@ -10,6 +10,7 @@ require (
 	github.com/pingcap/errors v0.11.4
 	github.com/prometheus/client_golang v1.20.4
 	github.com/rs/zerolog v1.32.0
+	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/urfave/cli v1.22.5
 	google.golang.org/grpc v1.39.0
 	google.golang.org/protobuf v1.34.2
@@ -29,6 +30,7 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	go.uber.org/atomic v1.8.0 // indirect
 	go.uber.org/multierr v1.7.0 // indirect
 	go.uber.org/zap v1.18.1 // indirect
