@@ -28,6 +28,7 @@ import (
 	"github.com/lonng/nano/internal/codec"
 	"github.com/lonng/nano/internal/message"
 	"github.com/lonng/nano/internal/packet"
+	"github.com/lonng/nano/metrics"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -160,6 +161,7 @@ func (c *Connector) On(event string, callback Callback) {
 
 // Close close the connection, and shutdown the benchmark
 func (c *Connector) Close() {
+	metrics.ClientClosedConnections.Inc()
 	c.conn.Close()
 	close(c.die)
 }

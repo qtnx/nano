@@ -219,6 +219,8 @@ func (a *agent) Close() error {
 		close(a.chDie)
 		scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
 	}
+
+	metrics.ServerClosedConnections.Inc()
 	metrics.AgentClose.Inc()
 	return a.conn.Close()
 }

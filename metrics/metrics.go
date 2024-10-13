@@ -50,6 +50,19 @@ var (
 			Help: "Total number of agent close operations",
 		},
 	)
+	ClientClosedConnections = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "client_closed_connections_total",
+			Help: "Total number of connections closed by the client",
+		},
+	)
+
+	ServerClosedConnections = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "server_closed_connections_total",
+			Help: "Total number of connections closed by the server",
+		},
+	)
 )
 
 func init() {
@@ -59,4 +72,6 @@ func init() {
 	prometheus.MustRegister(RouteRequestDuration)
 	prometheus.MustRegister(ConnectionsPerIP)
 	prometheus.MustRegister(AgentClose)
+	prometheus.MustRegister(ClientClosedConnections)
+	prometheus.MustRegister(ServerClosedConnections)
 }
