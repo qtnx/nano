@@ -63,6 +63,13 @@ var (
 			Help: "Total number of connections closed by the server",
 		},
 	)
+
+	SchedulePendingTasks = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "schedule_pending_tasks",
+			Help: "Number of pending tasks in the scheduler",
+		},
+	)
 )
 
 func init() {
@@ -74,4 +81,5 @@ func init() {
 	prometheus.MustRegister(AgentClose)
 	prometheus.MustRegister(ClientClosedConnections)
 	prometheus.MustRegister(ServerClosedConnections)
+	prometheus.MustRegister(SchedulePendingTasks)
 }

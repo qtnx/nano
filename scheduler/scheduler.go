@@ -28,6 +28,7 @@ import (
 
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
+	"github.com/lonng/nano/metrics"
 )
 
 const (
@@ -99,6 +100,7 @@ func Close() {
 
 func PushTask(task Task) {
 	chTasks <- task
+	metrics.SchedulePendingTasks.Set(float64(len(chTasks)))
 	if env.Debug {
 		log.Println("Scheduler push task channel size %d", len(chTasks))
 	}
