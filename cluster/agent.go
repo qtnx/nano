@@ -238,25 +238,28 @@ func (a *agent) RemoteAddrStr() string {
 
 // RemoteAddrWithoutPortStr return remote address without port string
 func (a *agent) RemoteAddrWithoutPortStr() string {
-
-	address := a.conn.RemoteAddr().String()
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
-
-	host = strings.Trim(host, "[]")
-
-	ip := net.ParseIP(host)
-	if ip == nil {
+	if a.conn == nil {
+		log.Error("RemoteAddrWithoutPortStr: agent.conn is nil")
 		return ""
 	}
-
-	return ip.String()
+	remoteAddr := a.conn.RemoteAddr()
+	if remoteAddr == nil {
+		log.Error("RemoteAddrWithoutPortStr: RemoteAddr() returned nil")
+		return ""
+	}
+	return strings.Split(remoteAddr.String(), ":")[0]
 }
 
 // String, implementation for Stringer interface
 func (a *agent) String() string {
+	if a.conn == nil {
+		log.Error("String: agent.conn is nil")
+		return ""
+	}
+	if a.conn.RemoteAddr() == nil {
+		log.Error("String: RemoteAddr() returned nil")
+		return ""
+	}
 	return fmt.Sprintf("Remote=%s, LastTime=%d", a.conn.RemoteAddr().String(), atomic.LoadInt64(&a.lastAt))
 }
 

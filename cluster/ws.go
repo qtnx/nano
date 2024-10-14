@@ -21,12 +21,15 @@
 package cluster
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
+	"github.com/lonng/nano/internal/log"
 )
 
 // wsConn is an adapter to t.Conn, which implements all t.Conn
@@ -80,13 +83,20 @@ func (c *wsConn) Read(b []byte) (int, error) {
 // Write can be made to time out and return an Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (c *wsConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
-		return 0, err
+	if c == nil || c.conn == nil {
+		log.Error("wsConn or its underlying connection is nil")
+		return 0, errors.New("wsConn or its underlying connection is nil")
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	log.Debug(fmt.Sprintf("Writing %d bytes to WebSocket connection", len(b)))
+	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
+	if err != nil {
+		log.Error(fmt.Sprintf("Error writing to WebSocket: %v", err))
+		return 0, err
+	}
 	return len(b), nil
 }
 
@@ -103,6 +113,10 @@ func (c *wsConn) LocalAddr() net.Addr {
 
 // RemoteAddr returns the remote network address.
 func (c *wsConn) RemoteAddr() net.Addr {
+	if c.conn == nil {
+		log.Error("RemoteAddr: conn is nil")
+		return nil
+	}
 	return c.conn.RemoteAddr()
 }
 

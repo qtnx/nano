@@ -32,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
 	"github.com/lonng/nano/cluster/clusterpb"
 	"github.com/lonng/nano/component"
 	"github.com/lonng/nano/internal/codec"
@@ -219,12 +219,29 @@ func (h *LocalHandler) RemoteService() []string {
 }
 
 func (h *LocalHandler) handle(conn net.Conn) {
+	if conn == nil {
+		log.Error("handle: conn is nil")
+		return
+	}
+
 	// create a client agent and startup write gorontine
 	agent := newAgent(conn, h.pipeline, h.remoteProcess)
+	if agent == nil {
+		log.Error("handle: agent is nil after newAgent")
+		return
+	}
+
 	h.currentNode.storeSession(agent.session)
 
-	err := h.currentNode.increaseConnection(agent.RemoteAddrWithoutPortStr())
+	remoteAddr := agent.RemoteAddrWithoutPortStr()
+	if remoteAddr == "" {
+		log.Error("handle: RemoteAddrWithoutPortStr returned empty string")
+		return
+	}
+
+	err := h.currentNode.increaseConnection(remoteAddr)
 	if err != nil {
+		log.Errorf("handle: increaseConnection error: %v", err)
 		return
 	}
 	// startup write goroutine
@@ -243,6 +260,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 
 	// guarantee agent related resource be destroyed
 	defer func() {
+		log.Println("Closing session")
 		request := &clusterpb.SessionClosedRequest{
 			SessionId: agent.session.ID(),
 		}
@@ -545,7 +563,7 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 	if !found {
 		h.remoteProcess(agent.session, msg, false)
 	} else {
-		h.localProcess(handler, lastMid, agent.session, msg)
+		h.localProcess(handler, lastMid, agent.session, msg, nil)
 	}
 }
 
@@ -555,7 +573,7 @@ func (h *LocalHandler) handleWS(conn *websocket.Conn) {
 		log.Println(err)
 		return
 	}
-	go h.handle(c)
+	h.handle(c)
 }
 
 func (h *LocalHandler) localProcess(
@@ -563,6 +581,7 @@ func (h *LocalHandler) localProcess(
 	lastMid uint64,
 	session *session.Session,
 	msg *message.Message,
+	responseChan chan<- []byte,
 ) {
 	if pipe := h.pipeline; pipe != nil {
 		err := pipe.Inbound().Process(session, msg)
@@ -586,7 +605,7 @@ func (h *LocalHandler) localProcess(
 	}
 
 	if env.Debug {
-		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v ClienUid=%d", session.ID(), session.UID(), msg.String(), data, session.ClientUid()))
+		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v ClientUid=%d", session.ID(), session.UID(), msg.String(), data, session.ClientUid()))
 	}
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
@@ -595,7 +614,7 @@ func (h *LocalHandler) localProcess(
 	startTime := time.Now()
 
 	task := func() {
-		//log.Debugf("Local process start, session id: %d, message: %v, func name: %v , args: %v", session.ID(), msg, handler.Method.Name, args)
+		// Set the last message ID
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
 			v.lastMid = lastMid
@@ -607,12 +626,31 @@ func (h *LocalHandler) localProcess(
 		if len(result) > 0 {
 			if err := result[0].Interface(); err != nil {
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
+				if responseChan != nil {
+					responseChan <- []byte(fmt.Sprintf(`{"error": "%v"}`, err))
+				}
+				return
 			}
 		}
 
 		// Record the duration after processing
 		duration := time.Since(startTime).Seconds()
 		metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "local").Observe(duration)
+
+		if responseChan != nil {
+			// Assuming the last return value is the response
+			if len(result) > 1 {
+				response, err := json.Marshal(result[len(result)-1].Interface())
+				if err != nil {
+					log.Println(fmt.Sprintf("Failed to marshal response: %v", err))
+					responseChan <- []byte(`{"error": "Internal server error"}`)
+					return
+				}
+				responseChan <- response
+			} else {
+				responseChan <- []byte(`{"status": "ok"}`)
+			}
+		}
 	}
 
 	index := strings.LastIndex(msg.Route, ".")
@@ -621,26 +659,24 @@ func (h *LocalHandler) localProcess(
 		return
 	}
 
-	// A message can be dispatch to global thread or a user customized thread
+	// Dispatch the message to the appropriate scheduler
 	service := msg.Route[:index]
 	if s, found := h.localServices[service]; found && s.SchedName != "" {
 		sched := session.Value(s.SchedName)
 		if sched == nil {
-			log.Println(fmt.Sprintf("nanl/handler: cannot found `schedular.LocalScheduler` by %s", s.SchedName))
+			log.Println(fmt.Sprintf("nano/handler: cannot find `scheduler.LocalScheduler` by %s", s.SchedName))
 			return
 		}
-
-		//log.Debugf("Dispatch message to local scheduler %s service %v", s.SchedName, service)
 
 		local, ok := sched.(scheduler.LocalScheduler)
 		if !ok {
-			log.Println(fmt.Sprintf("nanl/handler: Type %T does not implement the `schedular.LocalScheduler` interface",
-				sched))
+			log.Println(fmt.Sprintf("nano/handler: Type %T does not implement the `scheduler.LocalScheduler` interface", sched))
 			return
 		}
+		log.Infof("Schedule task: %v", task)
 		local.Schedule(task)
 	} else {
-		//log.Debugf("Dispatch message to global scheduler service %v handler %v", service, handler)
+		log.Infof("Push task: %v", task)
 		scheduler.PushTask(task)
 	}
 }

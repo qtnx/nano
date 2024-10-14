@@ -21,17 +21,19 @@
 package cluster
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
 	"github.com/lonng/nano/cluster/clusterpb"
 	"github.com/lonng/nano/component"
 	"github.com/lonng/nano/internal/env"
@@ -42,6 +44,8 @@ import (
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"google.golang.org/grpc"
 )
 
@@ -70,9 +74,9 @@ type Options struct {
 	OpenPrometheus     bool
 }
 
-// Node represents a node in nano cluster, which will contains a group of services.
-// All services will register to cluster and messages will be forwarded to the node
-// which provides respective service
+// Node represents a node in nano cluster, which will contain a group of services.
+// All services will register to cluster, and messages will be forwarded to the node
+// which provides the respective service.
 type Node struct {
 	Options            // current node options
 	ServiceAddr string // current server service address (RPC)
@@ -82,13 +86,16 @@ type Node struct {
 	server    *grpc.Server
 	rpcClient *rpcClient
 
-	mu       sync.RWMutex
-	sessions map[int64]*session.Session
-
+	mu              sync.RWMutex
+	sessions        map[int64]*session.Session
+	sseClients      map[string]chan []byte
 	connectionCount map[string]uint
 
 	once          sync.Once
 	keepaliveExit chan struct{}
+
+	// HTTP server
+	httpServer *http.Server
 }
 
 func (n *Node) Startup() error {
@@ -99,6 +106,7 @@ func (n *Node) Startup() error {
 	n.connectionCount = map[string]uint{}
 	n.cluster = newCluster(n)
 	n.handler = NewHandler(n, n.Pipeline)
+	n.sseClients = map[string]chan []byte{}
 	components := n.Components.List()
 	for _, c := range components {
 		err := n.handler.register(c.Comp, c.Opts)
@@ -120,18 +128,10 @@ func (n *Node) Startup() error {
 		c.Comp.AfterInit()
 	}
 
+	// Start the server to handle connections and HTTP requests
 	if n.ClientAddr != "" {
-		go func() {
-			if n.IsWebsocket {
-				if len(n.TSLCertificate) != 0 {
-					n.listenAndServeWSTLS()
-				} else {
-					n.listenAndServeWS()
-				}
-			} else {
-				n.listenAndServe()
-			}
-		}()
+		log.Println(fmt.Sprintf("Listen and serve on %s", n.ClientAddr))
+		go n.listenAndServe()
 	}
 
 	// Expose Prometheus metrics endpoint
@@ -146,6 +146,248 @@ func (n *Node) Startup() error {
 	}()
 
 	return nil
+}
+
+// listenAndServe starts the server to handle both TCP and HTTP requests
+func (n *Node) listenAndServe() {
+	log.Println(fmt.Sprintf("Listening on %s", n.ClientAddr))
+
+	// Start the fasthttp server
+	server := &fasthttp.Server{
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			// Set CORS headers to accept all
+			ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+			ctx.Response.Header.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-SSE-SessionID")
+
+			// Handle preflight requests
+			if string(ctx.Method()) == "OPTIONS" {
+				ctx.SetStatusCode(fasthttp.StatusOK)
+				return
+			}
+
+			// Call the original handler
+			n.handleFastHTTP(ctx)
+		},
+	}
+
+	if err := server.ListenAndServe(n.ClientAddr); err != nil {
+		log.Println(fmt.Sprintf("Error starting fasthttp server: %v", err))
+	}
+}
+
+// handleFastHTTP is the request handler for fasthttp
+func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
+	log.Println(fmt.Sprintf("Received request on %s", string(ctx.Path())))
+	switch string(ctx.Path()) {
+	case "/api":
+		n.handleHTTPRequest(ctx)
+	case "/sse":
+		n.handleSSE(ctx)
+	case "/health":
+		ctx.SetStatusCode(fasthttp.StatusOK)
+	case "/" + strings.TrimPrefix(env.WSPath, "/"):
+		log.Println("Handling WebSocket request")
+		n.listenAndServeWS(ctx)
+	default:
+		// Use default http.Handler for unmatched routes
+		// Adapt net/http.DefaultServeMux to fasthttp.RequestHandler
+		fasthttpadaptor.NewFastHTTPHandler(http.DefaultServeMux)(ctx)
+	}
+}
+
+// handleHTTPRequest handles incoming HTTP requests from clients
+func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.Error("Only POST method is allowed", fasthttp.StatusMethodNotAllowed)
+		return
+	}
+
+	body := ctx.PostBody()
+
+	var request struct {
+		Route string          `json:"route"`
+		Data  json.RawMessage `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &request); err != nil {
+		ctx.Error("Invalid JSON", fasthttp.StatusBadRequest)
+		return
+	}
+
+	cookie := ctx.Request.Header.Cookie("sse_sessionID")
+	if len(cookie) == 0 {
+		cookie = ctx.Request.Header.Peek("X-SSE-SessionID")
+		if len(cookie) == 0 {
+			ctx.Error("Session ID cookie not found", fasthttp.StatusUnauthorized)
+			return
+		}
+	}
+
+	agent := NewHTTPAgent(nil, n.handler.remoteProcess, ctx)
+
+	msg := &message.Message{
+		Type:  message.Request,
+		Route: request.Route,
+		Data:  request.Data,
+	}
+
+	handler, found := n.handler.localHandlers[request.Route]
+	if !found {
+		ctx.Error("Route not found", fasthttp.StatusNotFound)
+		return
+	}
+
+	responseChan := make(chan []byte)
+	n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
+
+	select {
+	case response := <-responseChan:
+		ctx.SetContentType("application/json")
+		ctx.SetBody(response)
+	case <-time.After(10 * time.Second):
+		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+	}
+}
+
+// handleSSE handles Server-Sent Events to push events to clients
+func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
+	ctx.SetContentType("text/event-stream")
+	ctx.Response.Header.Set("Cache-Control", "no-cache")
+	ctx.Response.Header.Set("Connection", "keep-alive")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	log.Infof("SSE connection established")
+
+	// Check if session ID cookie exists
+	var sessionID string
+	cookie := ctx.Request.Header.Cookie("sse_sessionID")
+	if len(cookie) == 0 {
+		// Try to get sessionID from "X-SSE-SessionID" header
+		sessionIDHeader := ctx.Request.Header.Peek("X-SSE-SessionID")
+		sessionID = string(sessionIDHeader)
+	} else {
+		sessionID = string(cookie)
+	}
+
+	if len(sessionID) == 0 {
+		// Generate a new session ID if cookie doesn't exist
+		sessionID = generateSessionID()
+		// Set the session ID cookie for the client
+		c := fasthttp.AcquireCookie()
+		c.SetKey("sse_sessionID")
+		c.SetValue(sessionID)
+		c.SetPath("/")
+		c.SetMaxAge(3600) // 1 hour
+		c.SetHTTPOnly(true)
+		c.SetSecure(true)
+		ctx.Response.Header.SetCookie(c)
+		fasthttp.ReleaseCookie(c)
+	}
+
+	// Create a channel for sending events
+	eventChan := make(chan []byte, 100) // Increased buffer size to 100
+
+	// Register the client's event channel
+	n.registerSSEClient(sessionID, eventChan)
+	defer n.unregisterSSEClient(sessionID)
+
+	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
+		w.Flush()
+
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case event := <-eventChan:
+					log.Infof("Send SSE event: %s", event)
+					fmt.Fprintf(w, "data: %s\n\n", event)
+					if err := w.Flush(); err != nil {
+						log.Errorf("Error flushing SSE event: %v", err)
+						return
+					}
+				}
+			}
+		}()
+
+		<-ctx.Done()
+	})
+}
+
+func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sseClients[sessionID] = eventChan
+}
+
+func (n *Node) unregisterSSEClient(sessionID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.sseClients, sessionID)
+}
+
+func generateSessionID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// listenAndServeWS handles WebSocket connections using fasthttp
+func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
+	upgrader := websocket.FastHTTPUpgrader{
+		CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
+			// Convert fasthttp.RequestCtx to http.Request
+			r := &http.Request{
+				Method:     string(ctx.Method()),
+				URL:        &url.URL{Scheme: "http", Host: string(ctx.Host()), Path: string(ctx.Path())},
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header:     make(http.Header),
+				Host:       string(ctx.Host()),
+				RemoteAddr: ctx.RemoteAddr().String(),
+			}
+			ctx.Request.Header.VisitAll(func(key, value []byte) {
+				r.Header.Add(string(key), string(value))
+			})
+			ok := env.CheckOrigin(r)
+			log.Println(fmt.Sprintf("CheckOrigin ok: %v", ok))
+			return ok
+		},
+	}
+
+	err := upgrader.Upgrade(ctx, func(conn *websocket.Conn) {
+		if conn == nil {
+			log.Error("Upgrade error: conn is nil")
+			return
+		}
+		n.handler.handleWS(conn)
+	})
+	if err != nil {
+		log.Errorf("Upgrade error: %v", err)
+		return
+	}
+}
+
+func (n *Node) listenAndServeWSTLS() {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     env.CheckOrigin,
+	}
+
+	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
+			return
+		}
+
+		n.handler.handleWS(conn)
+	})
+
+	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
+		log.Fatal(err.Error())
+	}
 }
 
 func (n *Node) Handler() *LocalHandler {
@@ -229,21 +471,21 @@ func (n *Node) initNode() error {
 	return nil
 }
 
-// Shutdowns all components registered by application, that
-// call by reverse order against register
+// Shutdown gracefully shuts down the node and the HTTP server
 func (n *Node) Shutdown() {
-	// reverse call `BeforeShutdown` hooks
+	// Call `BeforeShutdown` hooks in reverse order
 	components := n.Components.List()
 	length := len(components)
 	for i := length - 1; i >= 0; i-- {
 		components[i].Comp.BeforeShutdown()
 	}
 
-	// reverse call `Shutdown` hooks
+	// Call `Shutdown` hooks in reverse order
 	for i := length - 1; i >= 0; i-- {
 		components[i].Comp.Shutdown()
 	}
-	// close sendHeartbeat
+
+	// Close sendHeartbeat
 	if n.keepaliveExit != nil {
 		close(n.keepaliveExit)
 	}
@@ -268,76 +510,14 @@ EXIT:
 	if n.server != nil {
 		n.server.GracefulStop()
 	}
-}
 
-// Enable current server accept connection
-func (n *Node) listenAndServe() {
-	listener, err := net.Listen("tcp", n.ClientAddr)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	defer listener.Close()
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Println(err.Error())
-			continue
+	// Shutdown HTTP server if running
+	if n.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := n.httpServer.Shutdown(ctx); err != nil {
+			log.Println(fmt.Sprintf("HTTP server Shutdown Error: %v", err))
 		}
-
-		go n.handler.handle(conn)
-	}
-}
-
-func (n *Node) listenAndServeWS() {
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin:     env.CheckOrigin,
-	}
-
-	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
-			return
-		}
-
-		n.handler.handleWS(conn)
-	})
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	if err := http.ListenAndServe(n.ClientAddr, nil); err != nil {
-		log.Fatal(err.Error())
-	}
-}
-
-func (n *Node) listenAndServeWSTLS() {
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin:     env.CheckOrigin,
-	}
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
-			return
-		}
-
-		n.handler.handleWS(conn)
-	})
-
-	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
-		log.Fatal(err.Error())
 	}
 }
 
@@ -465,7 +645,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, req.Id, s, msg)
+	n.handler.localProcess(handler, req.Id, s, msg, nil)
 	log.Debug("[Node] End handle HandleRequest", req.String())
 	return &clusterpb.MemberHandleResponse{}, nil
 }
@@ -486,7 +666,7 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, 0, s, msg)
+	n.handler.localProcess(handler, 0, s, msg, nil)
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
