@@ -11,13 +11,16 @@ import (
 )
 
 type httpAgent struct {
-	sseChan    chan []byte
-	rpcHandler rpcHandler
-	session    *session.Session
-	httpCtx    *fasthttp.RequestCtx
+	sseChan      chan []byte
+	rpcHandler   rpcHandler
+	session      *session.Session
+	httpCtx      *fasthttp.RequestCtx
+	responseChan chan []byte
 }
 
 func NewHTTPAgent(
+	sid int64,
+	s *session.Session,
 	sseChan chan []byte,
 	rpcHandler rpcHandler,
 	httpCtx *fasthttp.RequestCtx,
@@ -29,11 +32,17 @@ func NewHTTPAgent(
 		httpCtx:    httpCtx,
 	}
 
-	s := session.New(a)
+	if s == nil {
+		s = session.NewWithID(a, sid)
+	}
 	a.session = s
 
 	return a
 
+}
+
+func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
+	h.responseChan = responseChan
 }
 
 // Close implements session.NetworkEntity.
@@ -53,8 +62,33 @@ func (h *httpAgent) OriginalSid() int64 {
 
 // Push implements session.NetworkEntity.
 func (h *httpAgent) Push(route string, v interface{}) error {
-	data, err := json.Marshal(v)
+	log.Infof("[HTTP Agent] Raw Push event to route: %s, data: %v", route, v)
+	var body interface{}
+
+	// Check if v is already JSON
+	switch data := v.(type) {
+	case string:
+		if err := json.Unmarshal([]byte(data), &body); err != nil {
+			// If it's not valid JSON, use v as is
+			body = v
+		}
+	case []byte:
+		if err := json.Unmarshal(data, &body); err != nil {
+			// If it's not valid JSON, use v as is
+			body = v
+		}
+	default:
+		body = v
+	}
+
+	data, err := json.Marshal(
+		map[string]interface{}{
+			"route": route,
+			"body":  body,
+		},
+	)
 	if err != nil {
+		log.Errorf("[HTTP Agent] Failed to marshal event: %v error: %v", v, err)
 		return err
 	}
 	log.Infof("[HTTP Agent] Push event: %s", data)
@@ -94,12 +128,7 @@ func (h *httpAgent) RemoteAddr() net.Addr {
 
 // Response implements session.NetworkEntity.
 func (h *httpAgent) Response(v interface{}) error {
-	data, err := message.Serialize(v)
-	if err != nil {
-		return err
-	}
-	h.httpCtx.SetBody(data)
-	return nil
+	return h.ResponseMid(0, v)
 }
 
 // ResponseMid implements session.NetworkEntity.
@@ -108,6 +137,11 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	if err != nil {
 		return err
 	}
-	h.httpCtx.SetBody(data)
+	if h.responseChan != nil {
+		h.responseChan <- data
+	} else {
+		log.Infof("[HTTP Agent] response chan not found set to httpCtx: %s", data)
+		h.httpCtx.SetBody(data)
+	}
 	return nil
 }

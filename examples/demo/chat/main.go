@@ -116,11 +116,22 @@ func (mgr *RoomManager) Join(s *session.Session, msg []byte) error {
 	fakeUID := s.ID() //just use s.ID as uid !!!
 	s.Bind(fakeUID)   // binding session uids.Set(roomIDKey, room)
 	s.Set(roomIDKey, room)
-	s.Push("onMembers", &AllMembers{Members: room.group.Members()})
+	log.Printf("ss ptr: %p", s)
+	err := s.Push("onMembers", &AllMembers{Members: room.group.Members()})
+	if err != nil {
+		log.Println("Failed to push onMembers event:", err)
+	}
+	log.Println("onMembers event pushed: ", s.ID())
 	// notify others
-	room.group.Broadcast("onNewUser", &NewUser{Content: fmt.Sprintf("New user: %d", s.ID())})
+	err = room.group.Broadcast("onNewUser", &NewUser{Content: fmt.Sprintf("New user: %d", s.ID())})
+	if err != nil {
+		log.Println("Failed to push onNewUser event:", err)
+	}
 	// new user join group
-	room.group.Add(s) // add session to group
+	err = room.group.Add(s) // add session to group
+	if err != nil {
+		log.Println("Failed to add session to group:", err)
+	}
 	return s.Response(&JoinResponse{Result: "success"})
 }
 
@@ -140,6 +151,7 @@ func main() {
 		component.WithName("room"), // rewrite component and handler name
 		component.WithNameFunc(strings.ToLower),
 	)
+	// runTimes := 0
 
 	// traffic stats
 	pip := pipeline.New()
@@ -158,5 +170,17 @@ func main() {
 		nano.WithDebugMode(),
 		nano.WithSerializer(json.NewSerializer()), // override default serializer
 		nano.WithComponents(components),
+		nano.WithOpenPrometheus(true),
+		// nano.WithHandshakeValidator(func(s *session.Session, data []byte) error {
+		// 	log.Println("HandshakeValidator", string(data))
+		// 	r := rand.Intn(3) + 1
+		// 	log.Println("HandshakeValidator", runTimes, r)
+		// 	if runTimes < r {
+		// 		runTimes++
+		// 		return fmt.Errorf("random close")
+		// 	}
+		// 	runTimes++
+		// 	return nil
+		// }),
 	)
 }

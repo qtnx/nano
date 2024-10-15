@@ -23,9 +23,10 @@ package nano
 import (
 	"errors"
 	"fmt"
-	"github.com/lonng/nano/cluster"
 	"sync"
 	"sync/atomic"
+
+	"github.com/lonng/nano/cluster"
 
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
@@ -263,10 +264,12 @@ func (c *Group) Add(session *session.Session) error {
 	defer c.mu.Unlock()
 
 	id := session.ID()
-	_, ok := c.sessions[session.ID()]
+	_, ok := c.sessions[id]
 	if ok {
 		return ErrSessionDuplication
 	}
+
+	log.Debugf("Add session to group %s, ID=%d, UID=%d", c.name, id, session.UID())
 
 	c.sessions[id] = session
 	return nil

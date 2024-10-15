@@ -438,7 +438,11 @@ func (h *LocalHandler) findMembers(service string) []*clusterpb.MemberInfo {
 	return h.remoteServices[service]
 }
 
-func (h *LocalHandler) remoteProcess(session *session.Session, msg *message.Message, noCopy bool) {
+func (h *LocalHandler) remoteProcess(
+	session *session.Session,
+	msg *message.Message,
+	noCopy bool,
+) {
 	log.Debugf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d", session.ID(), msg, session.ID())
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {

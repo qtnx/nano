@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -208,6 +209,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	var request struct {
 		Route string          `json:"route"`
 		Data  json.RawMessage `json:"data"`
+		Type  int             `json:"type,omitempty"`
 	}
 
 	if err := json.Unmarshal(body, &request); err != nil {
@@ -215,38 +217,90 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	cookie := ctx.Request.Header.Cookie("sse_sessionID")
-	if len(cookie) == 0 {
-		cookie = ctx.Request.Header.Peek("X-SSE-SessionID")
-		if len(cookie) == 0 {
+	var msgType message.Type
+
+	if request.Type == 0 {
+		msgType = message.Request
+	} else if request.Type == 1 {
+		msgType = message.Notify
+	} else {
+		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
+		return
+	}
+
+	sid := ctx.Request.Header.Cookie("sse_sessionID")
+	if len(sid) == 0 {
+		sid = ctx.Request.Header.Peek("X-SSE-SessionID")
+		if len(sid) == 0 {
 			ctx.Error("Session ID cookie not found", fasthttp.StatusUnauthorized)
 			return
 		}
 	}
 
-	agent := NewHTTPAgent(nil, n.handler.remoteProcess, ctx)
+	ch := n.sseClients[string(sid)]
+	if ch == nil {
+		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
+		return
+	}
+
+	sidInt, err := strconv.ParseInt(string(sid), 10, 64)
+	if err != nil {
+		log.Errorf("Invalid session ID: %v", err)
+		ctx.Error("Invalid session ID", fasthttp.StatusBadRequest)
+		return
+	}
+
+	log.Infof("Received request on %s with session ID: %d", request.Route, sidInt)
+
+	existingSession := n.findSession(sidInt)
+	if existingSession == nil {
+		log.Infof("session not found for %d, create new", sidInt)
+	}
+
+	agent := NewHTTPAgent(sidInt, existingSession, ch, n.handler.remoteProcess, ctx)
+
+	if existingSession == nil {
+		n.storeSession(agent.session)
+	}
 
 	msg := &message.Message{
-		Type:  message.Request,
+		Type:  msgType,
 		Route: request.Route,
 		Data:  request.Data,
 	}
 
 	handler, found := n.handler.localHandlers[request.Route]
+	var responseChan chan []byte
 	if !found {
-		ctx.Error("Route not found", fasthttp.StatusNotFound)
-		return
+		n.handler.remoteProcess(agent.session, msg, false)
+		if msgType == message.Notify {
+			log.Infof("notify, send a response to client")
+			// if notify, just send a response to client
+			ctx.SetStatusCode(fasthttp.StatusOK)
+		} else if msgType == message.Request {
+			// if request, attach response chan to agent to wait for service handle
+			// and send a response to client
+			// flow: node -[gRPC.HandleRequest]-> service
+			//      service -[gRPC.HandleResponse]-> agent
+			//      agent -[responseChan]-> client
+			responseChan = make(chan []byte)
+			agent.AttachResponseChan(responseChan)
+		}
+	} else {
+		responseChan = make(chan []byte)
+		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
 	}
 
-	responseChan := make(chan []byte)
-	n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
-
-	select {
-	case response := <-responseChan:
-		ctx.SetContentType("application/json")
-		ctx.SetBody(response)
-	case <-time.After(10 * time.Second):
-		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+	if responseChan != nil {
+		// Wait for response or timeout
+		select {
+		case response := <-responseChan:
+			ctx.SetContentType("application/json")
+			log.Infof("ss ptr after insert %p", agent.session)
+			ctx.SetBody(response)
+		case <-time.After(10 * time.Second):
+			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+		}
 	}
 }
 
@@ -289,39 +343,51 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 
 	// Register the client's event channel
 	n.registerSSEClient(sessionID, eventChan)
-	defer n.unregisterSSEClient(sessionID)
 
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
 		w.Flush()
 
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case event := <-eventChan:
-					log.Infof("Send SSE event: %s", event)
-					fmt.Fprintf(w, "data: %s\n\n", event)
-					if err := w.Flush(); err != nil {
-						log.Errorf("Error flushing SSE event: %v", err)
-						return
-					}
-				}
-			}
+		// Keep the connection open with a ticker
+		ticker := time.NewTicker(15 * time.Second)
+		defer func() {
+			ticker.Stop()
+			n.unregisterSSEClient(sessionID)
+			log.Infof("SSE connection closed: %s", sessionID)
 		}()
 
-		<-ctx.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-eventChan:
+				log.Infof("Send SSE event: %s", event)
+				fmt.Fprintf(w, "data: %s\n\n", event)
+				if err := w.Flush(); err != nil {
+					log.Errorf("Error flushing SSE event: %v", err)
+					return
+				}
+			case <-ticker.C:
+				// Send a keep-alive comment to prevent connection timeout
+				fmt.Fprintf(w, ": keep-alive\n\n")
+				if err := w.Flush(); err != nil {
+					log.Errorf("Error flushing keep-alive: %v", err)
+					return
+				}
+			}
+		}
 	})
 }
 
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
+	log.Infof("Register SSE client: %s", sessionID)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.sseClients[sessionID] = eventChan
 }
 
 func (n *Node) unregisterSSEClient(sessionID string) {
+	log.Infof("Unregister SSE client: %s", sessionID)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	delete(n.sseClients, sessionID)
@@ -524,6 +590,7 @@ EXIT:
 func (n *Node) storeSession(s *session.Session) {
 	n.mu.Lock()
 	n.sessions[s.ID()] = s
+	log.Infof("session %d stored", s.ID())
 	n.mu.Unlock()
 }
 
