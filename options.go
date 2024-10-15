@@ -1,6 +1,7 @@
 package nano
 
 import (
+	"github.com/valyala/fasthttp"
 	"net/http"
 	"time"
 
@@ -166,6 +167,12 @@ func WithLogger(l log.Logger) Option {
 func WithHandshakeValidator(fn func(*session.Session, []byte) error) Option {
 	return func(opt *cluster.Options) {
 		env.HandshakeValidator = fn
+	}
+}
+
+func WithMiddlewareHttp(fn func(ctx *fasthttp.RequestCtx) error) Option {
+	return func(opt *cluster.Options) {
+		env.MiddlewareHttp = fn
 	}
 }
 

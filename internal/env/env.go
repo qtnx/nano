@@ -24,6 +24,7 @@ package env
 
 import (
 	"github.com/lonng/nano/session"
+	"github.com/valyala/fasthttp"
 	"net/http"
 	"time"
 
@@ -40,7 +41,7 @@ var (
 	Debug              bool                                 // enable Debug
 	WSPath             string                               // WebSocket path(eg: ws://127.0.0.1/WSPath)
 	HandshakeValidator func(*session.Session, []byte) error // When you need to verify the custom data of the handshake request
-
+	MiddlewareHttp     func(ctx *fasthttp.RequestCtx) error // Middleware for http server
 	// timerPrecision indicates the precision of timer, default is time.Second
 	TimerPrecision = time.Second
 
@@ -59,5 +60,6 @@ func init() {
 	Debug = false
 	CheckOrigin = func(_ *http.Request) bool { return true }
 	HandshakeValidator = func(s *session.Session, _ []byte) error { return nil }
+	MiddlewareHttp = func(ctx *fasthttp.RequestCtx) error { return nil }
 	Serializer = protobuf.NewSerializer()
 }

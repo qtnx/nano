@@ -199,6 +199,8 @@ func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
 
 // handleHTTPRequest handles incoming HTTP requests from clients
 func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
+
+	log.Println("Handling HTTP request")
 	if !ctx.IsPost() {
 		ctx.Error("Only POST method is allowed", fasthttp.StatusMethodNotAllowed)
 		return
@@ -236,6 +238,13 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			ctx.Error("Session ID cookie not found", fasthttp.StatusUnauthorized)
 			return
 		}
+	}
+
+	// validate authen
+	err := env.MiddlewareHttp(ctx)
+	if err != nil {
+		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+		return
 	}
 
 	ch := n.sseClients[string(sid)]
@@ -299,7 +308,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		select {
 		case response := <-responseChan:
 			ctx.SetContentType("application/json")
-			log.Infof("ss ptr after insert %p", agent.session)
+			log.Infof("ss ptr after insert %v", agent.session)
 			ctx.SetBody(response)
 		case <-time.After(10 * time.Second):
 			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
@@ -324,6 +333,13 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		sessionID = string(sessionIDHeader)
 	} else {
 		sessionID = string(cookie)
+	}
+
+	// validate authen
+	err := env.MiddlewareHttp(ctx)
+	if err != nil {
+		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+		return
 	}
 
 	if len(sessionID) == 0 {
