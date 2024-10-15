@@ -224,6 +224,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	} else if request.Type == 1 {
 		msgType = message.Notify
 	} else {
+		log.Errorf("Invalid message type: %d", request.Type)
 		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
 		return
 	}
@@ -253,11 +254,13 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	log.Infof("Received request on %s with session ID: %d", request.Route, sidInt)
 
 	existingSession := n.findSession(sidInt)
+	var agent *httpAgent
 	if existingSession == nil {
 		log.Infof("session not found for %d, create new", sidInt)
+		agent = NewHTTPAgent(sidInt, nil, ch, n.handler.remoteProcess, ctx)
+	} else {
+		agent = existingSession.NetworkEntity().(*httpAgent)
 	}
-
-	agent := NewHTTPAgent(sidInt, existingSession, ch, n.handler.remoteProcess, ctx)
 
 	if existingSession == nil {
 		n.storeSession(agent.session)
