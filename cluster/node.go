@@ -350,15 +350,6 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		sessionID = string(cookie)
 	}
 
-	if env.MiddlewareHttp != nil {
-		// validate authen
-		mockAgent := NewHTTPAgent(0, nil, nil, n.handler.remoteProcess, ctx)
-		if err := env.MiddlewareHttp(mockAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
-			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
-			return
-		}
-	}
-
 	if len(sessionID) == 0 {
 		// Generate a new session ID if cookie doesn't exist
 		sessionID = generateSessionID()
@@ -376,6 +367,22 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 
 	// Create a channel for sending events
 	eventChan := make(chan []byte, 100) // Increased buffer size to 100
+	sidInt, err := strconv.ParseInt(sessionID, 10, 64)
+	if err != nil {
+		log.Errorf("Invalid session ID: %v", err)
+		ctx.Error("Invalid session ID", fasthttp.StatusBadRequest)
+		return
+	}
+
+	httpAgent := NewHTTPAgent(sidInt, nil, eventChan, n.handler.remoteProcess, ctx)
+	if env.MiddlewareHttp != nil {
+		// validate authen
+		if err := env.MiddlewareHttp(httpAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+			return
+		}
+	}
+	n.storeSession(httpAgent.session)
 
 	// Register the client's event channel
 	n.registerSSEClient(sessionID, eventChan)
