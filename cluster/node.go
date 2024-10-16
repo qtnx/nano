@@ -399,7 +399,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		w.Flush()
 
 		// Keep the connection open with a ticker
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer func() {
 			ticker.Stop()
 			n.unregisterSSEClient(sessionID)
