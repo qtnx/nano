@@ -338,6 +338,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	ctx.SetContentType("text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
+	ctx.Response.Header.Set("Transfer-Encoding", "chunked")
 	ctx.SetStatusCode(fasthttp.StatusOK)
 	log.Infof("SSE connection established")
 
@@ -389,12 +390,12 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	// Register the client's event channel
 	n.registerSSEClient(sessionID, eventChan)
 
-	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+	ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
 		w.Flush()
 
 		// Keep the connection open with a ticker
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer func() {
 			ticker.Stop()
 			n.unregisterSSEClient(sessionID)
@@ -421,7 +422,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 				}
 			}
 		}
-	})
+	}))
 }
 
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
