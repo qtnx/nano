@@ -204,7 +204,7 @@ func convertFastHTTPToHTTP(ctx *fasthttp.RequestCtx) *http.Request {
 	})
 	return &http.Request{
 		Method:     string(ctx.Method()),
-		URL:        &url.URL{Scheme: "http", Host: string(ctx.Host()), Path: string(ctx.Path())},
+		URL:        &url.URL{Scheme: "http", Host: string(ctx.Host()), Path: string(ctx.Path()), RawQuery: string(ctx.QueryArgs().QueryString())},
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
