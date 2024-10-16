@@ -34,14 +34,14 @@ import (
 )
 
 var (
-	Wd                 string                               // working path
-	Die                chan bool                            // wait for end application
-	Heartbeat          time.Duration                        // Heartbeat internal
-	CheckOrigin        func(*http.Request) bool             // check origin when websocket enabled
-	Debug              bool                                 // enable Debug
-	WSPath             string                               // WebSocket path(eg: ws://127.0.0.1/WSPath)
-	HandshakeValidator func(*session.Session, []byte) error // When you need to verify the custom data of the handshake request
-	MiddlewareHttp     func(ctx *http.Request) error        // Middleware for http serve
+	Wd                 string                                            // working path
+	Die                chan bool                                         // wait for end application
+	Heartbeat          time.Duration                                     // Heartbeat internal
+	CheckOrigin        func(*http.Request) bool                          // check origin when websocket enabled
+	Debug              bool                                              // enable Debug
+	WSPath             string                                            // WebSocket path(eg: ws://127.0.0.1/WSPath)
+	HandshakeValidator func(*session.Session, []byte) error              // When you need to verify the custom data of the handshake request
+	MiddlewareHttp     func(s *session.Session, ctx *http.Request) error // Middleware for http serve
 	// timerPrecision indicates the precision of timer, default is time.Second
 	TimerPrecision = time.Second
 
@@ -60,6 +60,6 @@ func init() {
 	Debug = false
 	CheckOrigin = func(_ *http.Request) bool { return true }
 	HandshakeValidator = func(s *session.Session, _ []byte) error { return nil }
-	MiddlewareHttp = func(ctx *http.Request) error { return nil }
+	MiddlewareHttp = func(s *session.Session, ctx *http.Request) error { return nil }
 	Serializer = protobuf.NewSerializer()
 }

@@ -257,13 +257,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// validate authen
-	err := env.MiddlewareHttp(convertFastHTTPToHTTP(ctx))
-	if err != nil {
-		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
-		return
-	}
-
 	ch := n.sseClients[string(sid)]
 	if ch == nil {
 		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
@@ -284,12 +277,17 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	if existingSession == nil {
 		log.Infof("session not found for %d, create new", sidInt)
 		agent = NewHTTPAgent(sidInt, nil, ch, n.handler.remoteProcess, ctx)
+		n.storeSession(agent.session)
 	} else {
 		agent = existingSession.NetworkEntity().(*httpAgent)
 	}
 
-	if existingSession == nil {
-		n.storeSession(agent.session)
+	// validate authen
+	if env.MiddlewareHttp != nil {
+		if err := env.MiddlewareHttp(agent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+			return
+		}
 	}
 
 	msg := &message.Message{
@@ -352,11 +350,13 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		sessionID = string(cookie)
 	}
 
-	// validate authen
-	err := env.MiddlewareHttp(convertFastHTTPToHTTP(ctx))
-	if err != nil {
-		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
-		return
+	if env.MiddlewareHttp != nil {
+		// validate authen
+		mockAgent := NewHTTPAgent(0, nil, nil, n.handler.remoteProcess, ctx)
+		if err := env.MiddlewareHttp(mockAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+			return
+		}
 	}
 
 	if len(sessionID) == 0 {
