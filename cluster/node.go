@@ -349,6 +349,10 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		// Try to get sessionID from "X-SSE-SessionID" header
 		sessionIDHeader := ctx.Request.Header.Peek("X-SSE-SessionID")
 		sessionID = string(sessionIDHeader)
+		// if sessionIDHeader is not exist, get from search params
+		if sessionID == "" {
+			sessionID = string(ctx.QueryArgs().Peek("sse_sessionID"))
+		}
 	} else {
 		sessionID = string(cookie)
 	}
