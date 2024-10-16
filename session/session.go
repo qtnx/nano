@@ -75,6 +75,19 @@ func New(entity NetworkEntity) *Session {
 	}
 }
 
+func NewWithID(entity NetworkEntity, id int64) *Session {
+	if id == 0 {
+		id = service.Connections.SessionID()
+	}
+	return &Session{
+		id:       id,
+		entity:   entity,
+		data:     make(map[string]interface{}),
+		lastTime: time.Now().Unix(),
+		router:   newRouter(),
+	}
+}
+
 // NetworkEntity returns the low-level network agent object
 func (s *Session) NetworkEntity() NetworkEntity {
 	return s.entity

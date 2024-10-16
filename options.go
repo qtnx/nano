@@ -169,6 +169,12 @@ func WithHandshakeValidator(fn func(*session.Session, []byte) error) Option {
 	}
 }
 
+func WithMiddlewareHttp(fn func(ctx *http.Request) error) Option {
+	return func(opt *cluster.Options) {
+		env.MiddlewareHttp = fn
+	}
+}
+
 // WithNodeId set nodeId use snowflake nodeId generate sessionId, default: pid
 func WithNodeId(nodeId uint64) Option {
 	return func(opt *cluster.Options) {

@@ -53,6 +53,27 @@ func (rs *RoomService) SyncMessage(s *session.Session, msg *SyncMessage) error {
 	return rs.group.Broadcast("onMessage", msg)
 }
 
+func (rs *RoomService) SyncMessageAndResponse(s *session.Session, msg *SyncMessage) error {
+	fmt.Println("SyncMessageAndResponse", msg, s.ID())
+	// Send an RPC to master server to stats
+	if err := s.RPC("TopicService.Stats", &protocol.MasterStats{Uid: s.UID()}); err != nil {
+		return errors.Trace(err)
+	}
+
+	// Sync message to all members in this room
+	if err := rs.group.Broadcast("onMessage", msg); err != nil {
+		return errors.Trace(err)
+	}
+
+	err := s.Response(msg)
+	if err != nil {
+		log.Println("Response error", err)
+	} else {
+		log.Println("Response success")
+	}
+	return nil
+}
+
 func (rs *RoomService) userDisconnected(s *session.Session) {
 	if err := rs.group.Leave(s); err != nil {
 		log.Println("Remove user from group failed", s.UID(), err)

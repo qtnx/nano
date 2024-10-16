@@ -2,11 +2,11 @@ package main
 
 import (
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"time"
 
 	"github.com/lonng/nano"
 	"github.com/lonng/nano/cluster"
@@ -123,6 +123,8 @@ func runMaster(args *cli.Context) error {
 	return nil
 }
 
+var runTimes int
+
 func runGate(args *cli.Context) error {
 	listen := args.String("listen")
 	if listen == "" {
@@ -146,22 +148,28 @@ func runGate(args *cli.Context) error {
 	pip := pipeline.New()
 
 	pip.Inbound().PushBack(func(s *session.Session, msg *pipeline.Message) error {
-		log.Println("Inbound", string(s.UID()))
+		runTimes++
+		log.Println("Inbound", runTimes, string(s.UID()))
+		if runTimes < rand.Intn(3)+1 {
+			log.Println("Closing session due to random check")
+			// s.Close()
+			return nil
+		}
 		s.SetClientUid(9999)
 		return nil
 	})
 
-	go func() {
-		for {
-			time.Sleep(time.Second * 2)
-			labels := []string{"chat"}
-			lives, dies, err := nano.PingNodes(labels)
-			if err != nil {
-				log.Println("PingNodes error", err)
-			}
-			log.Println("PingNodes", lives, dies)
-		}
-	}()
+	// go func() {
+	// 	for {
+	// 		time.Sleep(time.Second * 2)
+	// 		labels := []string{"chat"}
+	// 		lives, dies, err := nano.PingNodes(labels)
+	// 		if err != nil {
+	// 			log.Println("PingNodes error", err)
+	// 		}
+	// 		log.Println("PingNodes", lives, dies)
+	// 	}
+	// }()
 
 	// Startup Nano server with the specified listen address
 	nano.Listen(listen,

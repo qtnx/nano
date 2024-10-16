@@ -37,6 +37,7 @@
     });
 
     var onMessage = function (msg) {
+        console.log("onMessage", msg);
         v.messages.push(msg)
     };
 
@@ -44,7 +45,6 @@
         console.log(data);
         if(data.code === 0) {
             v.messages.push({name:'system', content:data.result});
-            starx.on('onMessage', onMessage)
         }
     };
 
@@ -60,8 +60,17 @@
 
     starx.init({host: '127.0.0.1', port: 3250, path: '/nano'}, function () {
         console.log("initialized");
+        for (let i = 1; i <= 10; i++) {
+            (function(index) {
+                starx.request("room.join", {}, function(data) {
+                        console.log("Join request #" + index + " response:", data);
+                    });
+                
+            })(i);
+        }
         starx.on("onNewUser", onNewUser);
         starx.on("onMembers", onMembers);
+        starx.on("onMessage", onMessage);
         starx.request("room.join", {}, join);
     })
 </script>
