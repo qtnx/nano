@@ -217,7 +217,6 @@ func convertFastHTTPToHTTP(ctx *fasthttp.RequestCtx) *http.Request {
 // handleHTTPRequest handles incoming HTTP requests from clients
 func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 
-	log.Println("Handling HTTP request")
 	if !ctx.IsPost() {
 		ctx.Error("Only POST method is allowed", fasthttp.StatusMethodNotAllowed)
 		return
@@ -243,7 +242,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	} else if request.Type == 1 {
 		msgType = message.Notify
 	} else {
-		log.Errorf("Invalid message type: %d", request.Type)
+		log.Errorf("[Nano] Invalid message type: %d", request.Type)
 		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
 		return
 	}
@@ -252,6 +251,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	if len(sid) == 0 {
 		sid = ctx.Request.Header.Peek("X-SSE-SessionID")
 		if len(sid) == 0 {
+			log.Infof("[Nano] Session ID cookie not found")
 			ctx.Error("Session ID cookie not found", fasthttp.StatusUnauthorized)
 			return
 		}
@@ -259,23 +259,24 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 
 	ch := n.sseClients[string(sid)]
 	if ch == nil {
+		log.Infof("[Nano] Session ID not found")
 		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
 		return
 	}
 
 	sidInt, err := strconv.ParseInt(string(sid), 10, 64)
 	if err != nil {
-		log.Errorf("Invalid session ID: %v", err)
+		log.Errorf("[Nano] Invalid session ID: %v", err)
 		ctx.Error("Invalid session ID", fasthttp.StatusBadRequest)
 		return
 	}
 
-	log.Infof("Received request on %s with session ID: %d", request.Route, sidInt)
+	log.Infof("[Nano] Received request %v with session ID: %d", request, sidInt)
 
 	existingSession := n.findSession(sidInt)
 	var agent *httpAgent
 	if existingSession == nil {
-		log.Infof("session not found for %d, create new", sidInt)
+		log.Infof("[Nano] session not found for %d, create new", sidInt)
 		agent = NewHTTPAgent(sidInt, nil, ch, n.handler.remoteProcess, ctx)
 		n.storeSession(agent.session)
 	} else {
@@ -285,6 +286,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	// validate authen
 	if env.MiddlewareHttp != nil {
 		if err := env.MiddlewareHttp(agent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			log.Infof("[Nano] Invalidate authenticate middleware")
 			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
 			return
 		}
@@ -301,7 +303,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	if !found {
 		n.handler.remoteProcess(agent.session, msg, false)
 		if msgType == message.Notify {
-			log.Infof("notify, send a response to client")
 			// if notify, just send a response to client
 			ctx.SetStatusCode(fasthttp.StatusOK)
 		} else if msgType == message.Request {
@@ -326,6 +327,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			log.Infof("ss ptr after insert %v", agent.session)
 			ctx.SetBody(response)
 		case <-time.After(10 * time.Second):
+			log.Infof("[Nano] Request timeout")
 			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
 		}
 	}
