@@ -197,6 +197,23 @@ func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
 	}
 }
 
+func convertFastHTTPToHTTP(ctx *fasthttp.RequestCtx) *http.Request {
+	header := make(http.Header)
+	ctx.Request.Header.VisitAll(func(key, value []byte) {
+		header[string(key)] = []string{string(value)}
+	})
+	return &http.Request{
+		Method:     string(ctx.Method()),
+		URL:        &url.URL{Scheme: "http", Host: string(ctx.Host()), Path: string(ctx.Path())},
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Host:       string(ctx.Host()),
+		RemoteAddr: ctx.RemoteAddr().String(),
+	}
+}
+
 // handleHTTPRequest handles incoming HTTP requests from clients
 func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 
@@ -241,7 +258,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}
 
 	// validate authen
-	err := env.MiddlewareHttp(ctx)
+	err := env.MiddlewareHttp(convertFastHTTPToHTTP(ctx))
 	if err != nil {
 		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
 		return
@@ -336,7 +353,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	}
 
 	// validate authen
-	err := env.MiddlewareHttp(ctx)
+	err := env.MiddlewareHttp(convertFastHTTPToHTTP(ctx))
 	if err != nil {
 		ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
 		return
