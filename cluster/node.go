@@ -394,40 +394,44 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	// Register the client's event channel
 	n.registerSSEClient(sessionID, eventChan)
 
-	ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
-		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
-		w.Flush()
+	go func() {
+		ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
+			fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
+			w.Flush()
 
-		// Keep the connection open with a ticker
-		ticker := time.NewTicker(1 * time.Second)
-		defer func() {
-			ticker.Stop()
-			n.unregisterSSEClient(sessionID)
-			log.Infof("SSE connection closed: %s", sessionID)
-		}()
+			// Keep the connection open with a ticker
+			ticker := time.NewTicker(1 * time.Second)
+			defer func() {
+				ticker.Stop()
+				n.unregisterSSEClient(sessionID)
+				log.Infof("SSE connection closed: %s", sessionID)
+			}()
 
-		for {
-			select {
-			case <-ctx.Done():
-				log.Infof("SSE connection closed as client disconnect: %s", sessionID)
-				return
-			case event := <-eventChan:
-				log.Infof("Send SSE event: %s", event)
-				fmt.Fprintf(w, "data: %s\n\n", event)
-				if err := w.Flush(); err != nil {
-					log.Errorf("Error flushing SSE event: %v", err)
+			for {
+				select {
+				case <-ctx.Done():
+					log.Infof("SSE connection closed as client disconnect: %s", sessionID)
 					return
-				}
-			case <-ticker.C:
-				// Send a keep-alive comment to prevent connection timeout
-				fmt.Fprintf(w, ": keep-alive\n\n")
-				if err := w.Flush(); err != nil {
-					log.Errorf("Error flushing keep-alive: %v", err)
-					return
+				case event := <-eventChan:
+					log.Infof("Send SSE event: %s", event)
+					fmt.Fprintf(w, "data: %s\n\n", event)
+					if err := w.Flush(); err != nil {
+						log.Errorf("Error flushing SSE event: %v", err)
+						return
+					}
+				case <-ticker.C:
+					// Send a keep-alive comment to prevent connection timeout
+					fmt.Fprintf(w, ": keep-alive\n\n")
+					if err := w.Flush(); err != nil {
+						log.Errorf("Error flushing keep-alive: %v", err)
+						return
+					}
 				}
 			}
-		}
-	}))
+		}))
+	}()
+
+	<-ctx.Done()
 }
 
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
