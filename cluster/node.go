@@ -257,12 +257,12 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	//ch := n.sseClients[string(sid)]
-	//if ch == nil {
-	//	log.Infof("[Nano] Session ID not found")
-	//	ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
-	//	return
-	//}
+	ch := n.sseClients[string(sid)]
+	if ch == nil {
+		log.Infof("[Nano] Session ID not found")
+		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
+		return
+	}
 
 	sidInt, err := strconv.ParseInt(string(sid), 10, 64)
 	if err != nil {
@@ -277,7 +277,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	var agent *httpAgent
 	if existingSession == nil {
 		log.Infof("[Nano] session not found for %d, create new", sidInt)
-		agent = NewHTTPAgent(sidInt, nil, nil, n.handler.remoteProcess, ctx)
+		agent = NewHTTPAgent(sidInt, nil, ch, n.handler.remoteProcess, ctx)
 		n.storeSession(agent.session)
 	} else {
 		agent = existingSession.NetworkEntity().(*httpAgent)
@@ -409,7 +409,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Infof("SSE connection closed as client disconnect: %s", sessionID)
+				log.Infof("SSE connection closed by context done: %s", sessionID)
 				return
 			case event := <-eventChan:
 				log.Infof("Send SSE event: %s", event)
