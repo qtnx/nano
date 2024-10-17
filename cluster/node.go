@@ -316,6 +316,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	} else {
 		responseChan = make(chan []byte)
+		agent.AttachResponseChan(responseChan)
 		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
 	}
 
