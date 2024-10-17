@@ -409,6 +409,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Infof("SSE connection closed as client disconnect: %s", sessionID)
 				return
 			case event := <-eventChan:
 				log.Infof("Send SSE event: %s", event)
