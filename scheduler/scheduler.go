@@ -76,8 +76,8 @@ func Sched() {
 
 	for {
 		select {
-		case <-ticker.C:
-			cron()
+		//case <-ticker.C:
+		//	cron()
 
 		case f := <-chTasks:
 			try(f)

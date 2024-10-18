@@ -77,6 +77,9 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 	log.Infof("[Acceptor] Response message to session: %s", request.String())
 
 	_, err = a.gateClient.HandleResponse(context.Background(), request)
+	if err != nil {
+		log.Errorf("[Acceptor] Failed to response message: %v", err)
+	}
 	return err
 }
 
