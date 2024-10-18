@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"github.com/lonng/nano/internal/log"
 	"net"
 
 	"github.com/lonng/nano/cluster/clusterpb"
@@ -73,6 +74,8 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 		Id:        mid,
 		Data:      data,
 	}
+	log.Infof("[Acceptor] Response message to session: %s", request.String())
+
 	_, err = a.gateClient.HandleResponse(context.Background(), request)
 	return err
 }

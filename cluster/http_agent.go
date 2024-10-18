@@ -142,6 +142,7 @@ func (h *httpAgent) Response(v interface{}) error {
 func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	data, err := message.Serialize(v)
 	if err != nil {
+		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
 		return err
 	}
 	if h.responseChan != nil {

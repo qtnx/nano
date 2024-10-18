@@ -806,6 +806,7 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
+	log.Println("[Node] HandleResponse %s", req.String())
 	s := n.findSession(req.SessionId)
 	if s == nil {
 		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
@@ -820,7 +821,7 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 }
 
 func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*clusterpb.DelMemberResponse, error) {
-	log.Println("DelMember member", req.String())
+	log.Println("[Node] DelMember member", req.String())
 	n.handler.delMember(req.ServiceAddr)
 	n.cluster.delMember(req.ServiceAddr)
 	return &clusterpb.DelMemberResponse{}, nil
