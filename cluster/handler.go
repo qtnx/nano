@@ -618,6 +618,8 @@ func (h *LocalHandler) localProcess(
 	startTime := time.Now()
 
 	task := func() {
+
+		log.Infof("Local process task: %v", msg.Route)
 		// Set the last message ID
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
@@ -627,6 +629,7 @@ func (h *LocalHandler) localProcess(
 		}
 
 		result := handler.Method.Func.Call(args)
+		log.Infof("Local process task completed: %v", msg.Route)
 		if len(result) > 0 {
 			if err := result[0].Interface(); err != nil {
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
