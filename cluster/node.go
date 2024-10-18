@@ -378,29 +378,13 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Create a channel for sending events
-	eventChan := make(chan []byte, 100) // Increased buffer size to 100
+	sseEventChan := make(chan []byte, 100) // Increased buffer size to 100
 	sidInt, err := strconv.ParseInt(sessionID, 10, 64)
 	if err != nil {
 		log.Errorf("Invalid session ID: %v", err)
 		ctx.Error("Invalid session ID", fasthttp.StatusBadRequest)
 		return
 	}
-
-	httpAgent := NewHTTPAgent(sidInt, nil, eventChan, n.handler.remoteProcess, ctx)
-	var responChan chan []byte
-	responChan = make(chan []byte)
-	httpAgent.AttachResponseChan(responChan)
-	if env.MiddlewareHttp != nil {
-		// validate authen
-		if err := env.MiddlewareHttp(httpAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
-			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
-			return
-		}
-	}
-	n.storeSession(httpAgent.session)
-
-	// Register the client's event channel
-	n.registerSSEClient(sessionID, eventChan)
 
 	ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
@@ -419,7 +403,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			case <-ctx.Done():
 				log.Infof("SSE connection closed by context done: %s", sessionID)
 				return
-			case event := <-eventChan:
+			case event := <-sseEventChan:
 				log.Infof("Send SSE event: %s", event)
 				fmt.Fprintf(w, "data: %s\n\n", event)
 				if err := w.Flush(); err != nil {
@@ -436,6 +420,20 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			}
 		}
 	}))
+
+	httpAgent := NewHTTPAgent(sidInt, nil, sseEventChan, n.handler.remoteProcess, ctx)
+	responseChan := make(chan []byte)
+	httpAgent.AttachResponseChan(responseChan)
+	if env.MiddlewareHttp != nil {
+		// validate authen
+		if err := env.MiddlewareHttp(httpAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+			return
+		}
+	}
+	n.storeSession(httpAgent.session)
+	// Register the client's event channel
+	n.registerSSEClient(sessionID, sseEventChan)
 
 }
 
