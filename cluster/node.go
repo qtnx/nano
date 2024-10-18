@@ -421,6 +421,8 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		}
 	}))
 
+	log.Infof("after ctx.SetBodyStreamWriter SSE connection established: %s", sessionID)
+
 	httpAgent := NewHTTPAgent(sidInt, nil, sseEventChan, n.handler.remoteProcess, ctx)
 	responseChan := make(chan []byte)
 	httpAgent.AttachResponseChan(responseChan)
