@@ -283,6 +283,10 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		agent = existingSession.NetworkEntity().(*httpAgent)
 	}
 
+	var responseChan chan []byte
+	responseChan = make(chan []byte)
+	agent.AttachResponseChan(responseChan)
+
 	// validate authen
 	if env.MiddlewareHttp != nil {
 		if err := env.MiddlewareHttp(agent.session, convertFastHTTPToHTTP(ctx)); err != nil {
@@ -299,11 +303,12 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}
 
 	handler, found := n.handler.localHandlers[request.Route]
-	var responseChan chan []byte
 	if !found {
 		log.Infof("[Nano] No local handler found for route: %s", request.Route)
 		n.handler.remoteProcess(agent.session, msg, false)
 		if msgType == message.Notify {
+			responseChan = nil
+			agent.DeAttachResponseChan()
 			// if notify, just send a response to client
 			ctx.SetStatusCode(fasthttp.StatusOK)
 		} else if msgType == message.Request {
@@ -312,13 +317,10 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			// flow: node -[gRPC.HandleRequest]-> service
 			//      service -[gRPC.HandleResponse]-> agent
 			//      agent -[responseChan]-> client
-			responseChan = make(chan []byte)
-			agent.AttachResponseChan(responseChan)
+
 		}
 	} else {
 		log.Infof("[Nano] Found local handler for route: %s", request.Route)
-		responseChan = make(chan []byte)
-		agent.AttachResponseChan(responseChan)
 		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
 	}
 

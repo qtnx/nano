@@ -45,6 +45,10 @@ func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
 	h.responseChan = responseChan
 }
 
+func (h *httpAgent) DeAttachResponseChan() {
+	h.responseChan = nil
+}
+
 // Close implements session.NetworkEntity.
 func (h *httpAgent) Close() error {
 	return nil
