@@ -387,6 +387,9 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	}
 
 	httpAgent := NewHTTPAgent(sidInt, nil, eventChan, n.handler.remoteProcess, ctx)
+	var responChan chan []byte
+	responChan = make(chan []byte)
+	httpAgent.AttachResponseChan(responChan)
 	if env.MiddlewareHttp != nil {
 		// validate authen
 		if err := env.MiddlewareHttp(httpAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {

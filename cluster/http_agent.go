@@ -27,9 +27,10 @@ func NewHTTPAgent(
 ) *httpAgent {
 
 	a := &httpAgent{
-		sseChan:    sseChan,
-		rpcHandler: rpcHandler,
-		httpCtx:    httpCtx,
+		sseChan:      sseChan,
+		rpcHandler:   rpcHandler,
+		httpCtx:      httpCtx,
+		responseChan: nil,
 	}
 
 	if s == nil {
@@ -42,11 +43,13 @@ func NewHTTPAgent(
 }
 
 func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
+	h.session.NetworkEntity().(*httpAgent).responseChan = responseChan
 	h.responseChan = responseChan
 }
 
 func (h *httpAgent) DeAttachResponseChan() {
 	h.responseChan = nil
+	h.session.NetworkEntity().(*httpAgent).responseChan = nil
 }
 
 // Close implements session.NetworkEntity.
