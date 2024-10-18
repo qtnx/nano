@@ -23,6 +23,7 @@ package scheduler
 import (
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,21 +74,58 @@ func Sched() {
 		ticker.Stop()
 		close(chExit)
 	}()
+	var wg sync.WaitGroup
 
 	for {
 		select {
-		//case <-ticker.C:
-		//	cron()
+		case <-ticker.C:
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cron()
+			}()
 
 		case f := <-chTasks:
-			try(f)
+			wg.Add(1)
+			go func(t Task) {
+				defer wg.Done()
+				try(t)
+			}(f)
 
 		case <-chDie:
 			log.Println("[Nano] Scheduler stopped")
+			wg.Wait()
 			return
 		}
 	}
 }
+
+//func Sched() {
+//	log.Debug("[Nano] Scheduler started")
+//	if atomic.AddInt32(&started, 1) != 1 {
+//		return
+//	}
+//
+//	ticker := time.NewTicker(env.TimerPrecision)
+//	defer func() {
+//		ticker.Stop()
+//		close(chExit)
+//	}()
+//
+//	for {
+//		select {
+//		case <-ticker.C:
+//			cron()
+//
+//		case f := <-chTasks:
+//			try(f)
+//
+//		case <-chDie:
+//			log.Println("[Nano] Scheduler stopped")
+//			return
+//		}
+//	}
+//}
 
 func Close() {
 	if atomic.AddInt32(&closed, 1) != 1 {
