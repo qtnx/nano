@@ -630,9 +630,9 @@ func (h *LocalHandler) localProcess(
 		if len(result) > 0 {
 			if err := result[0].Interface(); err != nil {
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
-				if responseChan != nil {
-					responseChan <- []byte(fmt.Sprintf(`{"error": "%v"}`, err))
-				}
+				//if responseChan != nil {
+				//	responseChan <- []byte(fmt.Sprintf(`{"error": "%v"}`, err))
+				//}
 				return
 			}
 		}
@@ -641,20 +641,20 @@ func (h *LocalHandler) localProcess(
 		duration := time.Since(startTime).Seconds()
 		metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "local").Observe(duration)
 
-		if responseChan != nil {
-			// Assuming the last return value is the response
-			if len(result) > 1 {
-				response, err := json.Marshal(result[len(result)-1].Interface())
-				if err != nil {
-					log.Println(fmt.Sprintf("Failed to marshal response: %v", err))
-					responseChan <- []byte(`{"error": "Internal server error"}`)
-					return
-				}
-				responseChan <- response
-			} else {
-				responseChan <- []byte(`{"status": "ok"}`)
-			}
-		}
+		//if responseChan != nil {
+		//	// Assuming the last return value is the response
+		//	if len(result) > 1 {
+		//		response, err := json.Marshal(result[len(result)-1].Interface())
+		//		if err != nil {
+		//			log.Println(fmt.Sprintf("Failed to marshal response: %v", err))
+		//			responseChan <- []byte(`{"error": "Internal server error"}`)
+		//			return
+		//		}
+		//		responseChan <- response
+		//	} else {
+		//		responseChan <- []byte(`{"status": "ok"}`)
+		//	}
+		//}
 	}
 
 	index := strings.LastIndex(msg.Route, ".")

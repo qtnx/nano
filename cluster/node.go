@@ -301,6 +301,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	handler, found := n.handler.localHandlers[request.Route]
 	var responseChan chan []byte
 	if !found {
+		log.Infof("[Nano] No local handler found for route: %s", request.Route)
 		n.handler.remoteProcess(agent.session, msg, false)
 		if msgType == message.Notify {
 			// if notify, just send a response to client
@@ -315,6 +316,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			agent.AttachResponseChan(responseChan)
 		}
 	} else {
+		log.Infof("[Nano] Found local handler for route: %s", request.Route)
 		responseChan = make(chan []byte)
 		agent.AttachResponseChan(responseChan)
 		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
