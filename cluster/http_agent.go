@@ -149,6 +149,7 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	if h.responseChan != nil {
 		log.Infof("[HTTP Agent] response chan found set to httpCtx: %s", data)
 		h.responseChan <- data
+		log.Infof("[HTTP Agent] response chan sent: %s", data)
 	} else {
 		log.Infof("[HTTP Agent] response chan not found set to httpCtx: %s", data)
 		h.httpCtx.SetBody(data)

@@ -263,17 +263,16 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 
 	existingSession := n.findSession(sidInt)
 	var agent *httpAgent
+	var responseChan chan []byte
 	if existingSession == nil {
 		log.Infof("[Nano] session not found for %d, create new", sidInt)
 		agent = NewHTTPAgent(sidInt, nil, nil, n.handler.remoteProcess, ctx)
+		responseChan = make(chan []byte)
+		agent.AttachResponseChan(responseChan)
 		n.storeSession(agent.session)
 	} else {
 		agent = existingSession.NetworkEntity().(*httpAgent)
 	}
-
-	var responseChan chan []byte
-	responseChan = make(chan []byte)
-	agent.AttachResponseChan(responseChan)
 
 	// validate authen
 	if env.MiddlewareHttp != nil {
@@ -310,8 +309,8 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		log.Infof("[Nano] No local handler found for route: %s", request.Route)
 		n.handler.remoteProcess(agent.session, msg, false)
 		if msgType == message.Notify {
-			responseChan = nil
-			agent.DeAttachResponseChan()
+			//responseChan = nil
+			//agent.DeAttachResponseChan()
 			// if notify, just send a response to client
 			ctx.SetStatusCode(fasthttp.StatusOK)
 		} else if msgType == message.Request {
@@ -334,7 +333,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			ctx.SetContentType("application/json")
 			log.Infof("ss ptr after insert %v", agent.session)
 			ctx.SetBody(response)
-			close(responseChan)
 			return
 		case <-time.After(10 * time.Second):
 			log.Infof("[Nano] Request timeout")
