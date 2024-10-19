@@ -325,7 +325,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	} else {
 		log.Infof("[Nano] Found local handler for route: %s", request.Route)
-		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
+		n.handler.localProcess(handler, messageID, agent.session, msg, responseChan)
 	}
 
 	//timer := time.Now()
