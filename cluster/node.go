@@ -334,6 +334,8 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			ctx.SetContentType("application/json")
 			log.Infof("ss ptr after insert %v", agent.session)
 			ctx.SetBody(response)
+			close(responseChan)
+			return
 		case <-time.After(10 * time.Second):
 			log.Infof("[Nano] Request timeout")
 			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
