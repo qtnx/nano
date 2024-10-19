@@ -16,11 +16,12 @@ type HttpObserveStatus uint
 const (
 	HttpObserveSuccess HttpObserveStatus = iota
 	HttpObserveError   HttpObserveStatus = 1
+	HttpObserveWaiting
 )
 
 type fastHttpContextObserve struct {
-	context  *fasthttp.RequestCtx
-	chanDone chan HttpObserveStatus
+	context       *fasthttp.RequestCtx
+	observeStatus HttpObserveStatus
 }
 
 type httpAgent struct {
@@ -59,16 +60,15 @@ func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCt
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.messageIDMapToRequest[mid] = &fastHttpContextObserve{
-		context:  httpCtx,
-		chanDone: make(chan HttpObserveStatus),
+		context:       httpCtx,
+		observeStatus: HttpObserveWaiting,
 	}
 }
 
 func (h *httpAgent) RemoveHttpRequestCtx(mid uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if ctx, exists := h.messageIDMapToRequest[mid]; exists {
-		close(ctx.chanDone)
+	if _, exists := h.messageIDMapToRequest[mid]; exists {
 		delete(h.messageIDMapToRequest, mid)
 	}
 }
@@ -202,7 +202,7 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	ctx.context.SetBody(data)
 	ctx.context.SetStatusCode(fasthttp.StatusOK)
 
-	ctx.chanDone <- HttpObserveSuccess
+	h.messageIDMapToRequest[mid].observeStatus = HttpObserveSuccess
 
 	//
 	//log.Infof("[HTTP Agent] Setting response directly to context for messageID: %d", mid)

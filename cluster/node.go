@@ -333,22 +333,56 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	httpObserve := agent.GetFastHttpContextObserve(messageID)
 
 	if httpObserve != nil {
-		//  Wait for response or timeout
-		select {
-		case observeStatus := <-httpObserve.chanDone:
-			if observeStatus == HttpObserveSuccess {
+
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-timer.C:
+				log.Infof("[Nano] Request timeout")
+				ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
 				return
+			default:
+				agent.mu.Lock()
+				observeStatus := httpObserve.observeStatus
+				agent.mu.Unlock()
+				if observeStatus != HttpObserveWaiting {
+
+					if observeStatus == HttpObserveSuccess {
+						log.Infof("[Nano] Request success %v", messageID)
+						return
+					}
+					if observeStatus == HttpObserveError {
+						log.Infof("[Nano] Request error %v", messageID)
+						ctx.Error("Request error", fasthttp.StatusInternalServerError)
+						return
+					}
+				}
+				time.Sleep(3 * time.Millisecond) // Sleep for a short duration before checking again
 			}
-			if observeStatus == HttpObserveError {
-				log.Infof("[Nano] Request error")
-				ctx.Error("Request error", fasthttp.StatusInternalServerError)
-				return
-			}
-		case <-time.After(10 * time.Second):
-			log.Infof("[Nano] Request timeout")
-			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-			return
 		}
+
+		//  Wait for response or timeout
+
+		//for {
+		//
+		//}
+		//select {
+		//case observeStatus := <-httpObserve.chanDone:
+		//	if observeStatus == HttpObserveSuccess {
+		//		return
+		//	}
+		//	if observeStatus == HttpObserveError {
+		//		log.Infof("[Nano] Request error")
+		//		ctx.Error("Request error", fasthttp.StatusInternalServerError)
+		//		return
+		//	}
+		//case <-time.After(10 * time.Second):
+		//	log.Infof("[Nano] Request timeout")
+		//	ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+		//	return
+		//}
 	}
 
 	//select {
