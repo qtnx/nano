@@ -64,6 +64,8 @@ func (a *acceptor) Response(v interface{}) error {
 
 // ResponseMid implements the session.NetworkEntity interface
 func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
+
+	log.Infof("[Acceptor] ResponseMid: %d", mid)
 	// TODO: buffer
 	data, err := message.Serialize(v)
 	if err != nil {

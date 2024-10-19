@@ -300,6 +300,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		Type:  msgType,
 		Route: request.Route,
 		Data:  request.Data,
+		ID:    uint64(time.Now().UnixNano()),
 	}
 
 	handler, found := n.handler.localHandlers[request.Route]

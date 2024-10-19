@@ -140,12 +140,14 @@ func (h *httpAgent) Response(v interface{}) error {
 
 // ResponseMid implements session.NetworkEntity.
 func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
+	log.Infof("[HTTP Agent] ResponseMid: %v", v)
 	data, err := message.Serialize(v)
 	if err != nil {
 		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
 		return err
 	}
 	if h.responseChan != nil {
+		log.Infof("[HTTP Agent] response chan found set to httpCtx: %s", data)
 		h.responseChan <- data
 	} else {
 		log.Infof("[HTTP Agent] response chan not found set to httpCtx: %s", data)
