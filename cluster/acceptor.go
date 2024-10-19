@@ -82,6 +82,7 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 	if err != nil {
 		log.Errorf("[Acceptor] Failed to response message: %v", err)
 	}
+	log.Infof("[Acceptor] Response message OKOKOK to session: %s with err ", request.String(), err)
 	return err
 }
 
