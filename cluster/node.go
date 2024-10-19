@@ -328,19 +328,39 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
 	}
 
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
+	//timer := time.Now()
 
-	select {
-	case <-ctx.Done():
-		log.Infof("[Nano] Request canceled for messageID: %d", messageID)
-		agent.RemoveHttpRequestCtx(messageID)
-	case <-timer.C:
-		log.Infof("[Nano] Request timeout for messageID: %d", messageID)
-		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-		ctx.SetConnectionClose()
-		agent.RemoveHttpRequestCtx(messageID)
+	httpObserve := agent.GetFastHttpContextObserve(messageID)
+
+	if httpObserve != nil {
+		//  Wait for response or timeout
+		select {
+		case observeStatus := <-httpObserve.chanDone:
+			if observeStatus == HttpObserveSuccess {
+				return
+			}
+			if observeStatus == HttpObserveError {
+				log.Infof("[Nano] Request error")
+				ctx.Error("Request error", fasthttp.StatusInternalServerError)
+				return
+			}
+		case <-time.After(10 * time.Second):
+			log.Infof("[Nano] Request timeout")
+			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+			return
+		}
 	}
+
+	//select {
+	//case <-ctx.Done():
+	//	log.Infof("[Nano] Request canceled for messageID: %d", messageID)
+	//	agent.RemoveHttpRequestCtx(messageID)
+	//case <-timer.C:
+	//	log.Infof("[Nano] Request timeout for messageID: %d", messageID)
+	//	ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+	//	ctx.SetConnectionClose()
+	//	agent.RemoveHttpRequestCtx(messageID)
+	//}
 
 	// if responseChan != nil {
 	// 	// Wait for response or timeout

@@ -11,12 +11,24 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+type HttpObserveStatus uint
+
+const (
+	HttpObserveSuccess HttpObserveStatus = iota
+	HttpObserveError   HttpObserveStatus = 1
+)
+
+type fastHttpContextObserve struct {
+	context  *fasthttp.RequestCtx
+	chanDone chan HttpObserveStatus
+}
+
 type httpAgent struct {
 	sseChan               chan []byte
 	rpcHandler            rpcHandler
 	session               *session.Session
 	httpCtx               *fasthttp.RequestCtx
-	messageIDMapToRequest map[uint64]*fasthttp.RequestCtx
+	messageIDMapToRequest map[uint64]*fastHttpContextObserve
 	responseChan          chan []byte
 	mu                    sync.Mutex
 }
@@ -32,7 +44,7 @@ func NewHTTPAgent(
 		sseChan:               sseChan,
 		rpcHandler:            rpcHandler,
 		httpCtx:               httpCtx,
-		messageIDMapToRequest: make(map[uint64]*fasthttp.RequestCtx),
+		messageIDMapToRequest: make(map[uint64]*fastHttpContextObserve),
 	}
 
 	if s == nil {
@@ -46,13 +58,29 @@ func NewHTTPAgent(
 func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCtx) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.messageIDMapToRequest[mid] = httpCtx
+	h.messageIDMapToRequest[mid] = &fastHttpContextObserve{
+		context:  httpCtx,
+		chanDone: make(chan HttpObserveStatus),
+	}
 }
 
 func (h *httpAgent) RemoveHttpRequestCtx(mid uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.messageIDMapToRequest, mid)
+	if ctx, exists := h.messageIDMapToRequest[mid]; exists {
+		close(ctx.chanDone)
+		delete(h.messageIDMapToRequest, mid)
+	}
+}
+
+func (h *httpAgent) GetFastHttpContextObserve(mid uint64) *fastHttpContextObserve {
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ctxObserve, exists := h.messageIDMapToRequest[mid]; exists {
+		return ctxObserve
+	}
+	return nil
 }
 
 func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
@@ -156,7 +184,7 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	log.Infof("[HTTP Agent] ResponseMid: %v", v)
+	log.Infof("[HTTP Agent] ResponseMid: %v", mid)
 	data, err := message.Serialize(v)
 	if err != nil {
 		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
@@ -170,10 +198,11 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	}
 
 	log.Infof("ss ptr after insert %v", h.session.ID())
-	ctx.SetContentType("application/json")
-	ctx.SetBody(data)
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetConnectionClose()
+	ctx.context.SetContentType("application/json")
+	ctx.context.SetBody(data)
+	ctx.context.SetStatusCode(fasthttp.StatusOK)
+
+	ctx.chanDone <- HttpObserveSuccess
 
 	//
 	//log.Infof("[HTTP Agent] Setting response directly to context for messageID: %d", mid)
