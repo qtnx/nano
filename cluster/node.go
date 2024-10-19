@@ -235,18 +235,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var msgType message.Type
-
-	if request.Type == 0 {
-		msgType = message.Request
-	} else if request.Type == 1 {
-		msgType = message.Notify
-	} else {
-		log.Errorf("[Nano] Invalid message type: %d", request.Type)
-		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
-		return
-	}
-
 	sid := ctx.Request.Header.Cookie("sse_sessionID")
 	if len(sid) == 0 {
 		sid = ctx.Request.Header.Peek("X-SSE-SessionID")
@@ -296,10 +284,24 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
+	var msgType message.Type
+
+	if request.Type == 0 {
+		msgType = message.Request
+	} else if request.Type == 1 {
+		msgType = message.Notify
+	} else {
+		log.Errorf("[Nano] Invalid message type: %d", request.Type)
+		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
+		return
+	}
+
+	rawData, _ := request.Data.MarshalJSON()
+
 	msg := &message.Message{
 		Type:  msgType,
 		Route: request.Route,
-		Data:  request.Data,
+		Data:  rawData,
 		ID:    uint64(time.Now().UnixNano()),
 	}
 
@@ -778,6 +780,15 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
+func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
+	log.Println("[Node] HandleResponse %s", req.String())
+	s := n.findSession(req.SessionId)
+	if s == nil {
+		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
+	}
+	return &clusterpb.MemberHandleResponse{}, s.ResponseMID(req.Id, req.Data)
+}
+
 func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
 	log.Debug("[Node] Start handle HandleNotify", req.String())
 	handler, found := n.handler.localHandlers[req.Route]
@@ -804,15 +815,6 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
 	}
 	return &clusterpb.MemberHandleResponse{}, s.Push(req.Route, req.Data)
-}
-
-func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Println("[Node] HandleResponse %s", req.String())
-	s := n.findSession(req.SessionId)
-	if s == nil {
-		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
-	}
-	return &clusterpb.MemberHandleResponse{}, s.ResponseMID(req.Id, req.Data)
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
