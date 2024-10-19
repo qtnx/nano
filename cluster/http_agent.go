@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/json"
 	"net"
+	"sync"
 
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
@@ -11,11 +12,13 @@ import (
 )
 
 type httpAgent struct {
-	sseChan      chan []byte
-	rpcHandler   rpcHandler
-	session      *session.Session
-	httpCtx      *fasthttp.RequestCtx
-	responseChan chan []byte
+	sseChan               chan []byte
+	rpcHandler            rpcHandler
+	session               *session.Session
+	httpCtx               *fasthttp.RequestCtx
+	messageIDMapToRequest map[uint64]*fasthttp.RequestCtx
+	responseChan          chan []byte
+	mu                    sync.Mutex
 }
 
 func NewHTTPAgent(
@@ -25,12 +28,11 @@ func NewHTTPAgent(
 	rpcHandler rpcHandler,
 	httpCtx *fasthttp.RequestCtx,
 ) *httpAgent {
-
 	a := &httpAgent{
-		sseChan:      sseChan,
-		rpcHandler:   rpcHandler,
-		httpCtx:      httpCtx,
-		responseChan: nil,
+		sseChan:               sseChan,
+		rpcHandler:            rpcHandler,
+		httpCtx:               httpCtx,
+		messageIDMapToRequest: make(map[uint64]*fasthttp.RequestCtx),
 	}
 
 	if s == nil {
@@ -39,7 +41,18 @@ func NewHTTPAgent(
 	a.session = s
 
 	return a
+}
 
+func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCtx) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messageIDMapToRequest[mid] = httpCtx
+}
+
+func (h *httpAgent) RemoveHttpRequestCtx(mid uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.messageIDMapToRequest, mid)
 }
 
 func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
@@ -140,23 +153,33 @@ func (h *httpAgent) Response(v interface{}) error {
 
 // ResponseMid implements session.NetworkEntity.
 func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	log.Infof("[HTTP Agent] ResponseMid: %v", v)
 	data, err := message.Serialize(v)
 	if err != nil {
 		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
 		return err
 	}
-	if h.responseChan != nil {
-		log.Infof("[HTTP Agent] response chan found set to httpCtx: %s", data)
-		select {
-		case h.responseChan <- data:
-			log.Infof("[HTTP Agent] response chan sent: %s", data)
-		default:
-			log.Infof("[HTTP Agent] response chan is blocked, unable to send: %s", data)
-		}
-	} else {
-		log.Infof("[HTTP Agent] response chan not found set to httpCtx: %s", data)
-		h.httpCtx.SetBody(data)
+
+	ctx, exists := h.messageIDMapToRequest[mid]
+	if !exists {
+		log.Infof("[HTTP Agent] No context found for messageID: %d, response might have timed out", mid)
+		return nil
 	}
+
+	log.Infof("ss ptr after insert %v", h.session.ID())
+	ctx.SetContentType("application/json")
+	ctx.SetBody(data)
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetConnectionClose()
+
+	//
+	//log.Infof("[HTTP Agent] Setting response directly to context for messageID: %d", mid)
+	//ctx.SetContentType("application/json")
+	//ctx.SetBody(data)
+	//delete(h.messageIDMapToRequest, mid)
+
 	return nil
 }

@@ -268,11 +268,14 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		log.Infof("[Nano] session not found for %d, create new", sidInt)
 		agent = NewHTTPAgent(sidInt, nil, nil, n.handler.remoteProcess, ctx)
 		responseChan = make(chan []byte)
-		agent.AttachResponseChan(responseChan)
+		//agent.AttachResponseChan(responseChan)
 		n.storeSession(agent.session)
 	} else {
 		agent = existingSession.NetworkEntity().(*httpAgent)
 	}
+
+	messageID := uint64(time.Now().UnixNano())
+	agent.AttackHttpRequestCtx(messageID, ctx)
 
 	// validate authen
 	if env.MiddlewareHttp != nil {
@@ -296,12 +299,11 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}
 
 	rawData, _ := request.Data.MarshalJSON()
-
 	msg := &message.Message{
 		Type:  msgType,
 		Route: request.Route,
 		Data:  rawData,
-		ID:    uint64(time.Now().UnixNano()),
+		ID:    messageID,
 	}
 
 	handler, found := n.handler.localHandlers[request.Route]
@@ -326,19 +328,33 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		n.handler.localProcess(handler, 0, agent.session, msg, responseChan)
 	}
 
-	if responseChan != nil {
-		// Wait for response or timeout
-		select {
-		case response := <-responseChan:
-			ctx.SetContentType("application/json")
-			log.Infof("ss ptr after insert %v", agent.session)
-			ctx.SetBody(response)
-			return
-		case <-time.After(10 * time.Second):
-			log.Infof("[Nano] Request timeout")
-			ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-		}
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		log.Infof("[Nano] Request canceled for messageID: %d", messageID)
+		agent.RemoveHttpRequestCtx(messageID)
+	case <-timer.C:
+		log.Infof("[Nano] Request timeout for messageID: %d", messageID)
+		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+		ctx.SetConnectionClose()
+		agent.RemoveHttpRequestCtx(messageID)
 	}
+
+	// if responseChan != nil {
+	// 	// Wait for response or timeout
+	// 	select {
+	// 	case response := <-responseChan:
+	// 		ctx.SetContentType("application/json")
+	// 		log.Infof("ss ptr after insert %v", agent.session)
+	// 		ctx.SetBody(response)
+	// 		return
+	// 	case <-time.After(10 * time.Second):
+	// 		log.Infof("[Nano] Request timeout")
+	// 		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+	// 	}
+	// }
 }
 
 // handleSSE handles Server-Sent Events to push events to clients
