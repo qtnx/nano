@@ -628,6 +628,8 @@ func (h *LocalHandler) localProcess(
 			v.lastMid = lastMid
 		case *acceptor:
 			v.lastMid = lastMid
+		case *httpAgent:
+			v.lastMid = lastMid
 		}
 
 		result := handler.Method.Func.Call(args)

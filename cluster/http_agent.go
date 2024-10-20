@@ -31,6 +31,7 @@ type httpAgent struct {
 	httpCtx               *fasthttp.RequestCtx
 	messageIDMapToRequest map[uint64]*fastHttpContextObserve
 	responseChan          chan []byte
+	lastMid               uint64
 	mu                    sync.Mutex
 }
 
@@ -176,7 +177,7 @@ func (h *httpAgent) RemoteAddr() net.Addr {
 
 // Response implements session.NetworkEntity.
 func (h *httpAgent) Response(v interface{}) error {
-	return h.ResponseMid(0, v)
+	return h.ResponseMid(h.lastMid, v)
 }
 
 // ResponseMid implements session.NetworkEntity.
