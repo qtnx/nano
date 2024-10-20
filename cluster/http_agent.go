@@ -96,6 +96,12 @@ func (h *httpAgent) DeAttachResponseChan() {
 
 // Close implements session.NetworkEntity.
 func (h *httpAgent) Close() error {
+	h.httpCtx = nil
+	h.rpcHandler = nil
+	h.session = nil
+	h.sseChan = nil
+	h.responseChan = nil
+	h.messageIDMapToRequest = nil
 	return nil
 }
 
@@ -204,12 +210,6 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	ctx.context.SetStatusCode(fasthttp.StatusOK)
 
 	h.messageIDMapToRequest[mid].observeStatus = HttpObserveSuccess
-
-	//
-	//log.Infof("[HTTP Agent] Setting response directly to context for messageID: %d", mid)
-	//ctx.SetContentType("application/json")
-	//ctx.SetBody(data)
-	//delete(h.messageIDMapToRequest, mid)
 
 	return nil
 }

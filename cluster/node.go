@@ -245,12 +245,12 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	//ch := n.sseClients[string(sid)]
-	//if ch == nil {
-	//	log.Infof("[Nano] Session ID not found")
-	//	ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
-	//	return
-	//}
+	ch := n.sseClients[string(sid)]
+	if ch == nil {
+		log.Infof("[Nano] Session ID not found")
+		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
+		return
+	}
 
 	sidInt, err := strconv.ParseInt(string(sid), 10, 64)
 	if err != nil {
@@ -275,6 +275,9 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}
 
 	messageID := uint64(time.Now().UnixNano())
+	defer func() {
+		agent.RemoveHttpRequestCtx(messageID)
+	}()
 	agent.AttackHttpRequestCtx(messageID, ctx)
 
 	// validate authen
@@ -315,6 +318,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			//agent.DeAttachResponseChan()
 			// if notify, just send a response to client
 			ctx.SetStatusCode(fasthttp.StatusOK)
+			return
 		} else if msgType == message.Request {
 			// if request, attach response chan to agent to wait for service handle
 			// and send a response to client
@@ -333,7 +337,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	httpObserve := agent.GetFastHttpContextObserve(messageID)
 
 	if httpObserve != nil {
-
 		timer := time.NewTimer(10 * time.Second)
 		defer timer.Stop()
 
@@ -359,56 +362,13 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 						return
 					}
 				}
-				time.Sleep(3 * time.Millisecond) // Sleep for a short duration before checking again
+				time.Sleep(1 * time.Millisecond) // Sleep for a short duration before checking again
 			}
 		}
 
-		//  Wait for response or timeout
-
-		//for {
-		//
-		//}
-		//select {
-		//case observeStatus := <-httpObserve.chanDone:
-		//	if observeStatus == HttpObserveSuccess {
-		//		return
-		//	}
-		//	if observeStatus == HttpObserveError {
-		//		log.Infof("[Nano] Request error")
-		//		ctx.Error("Request error", fasthttp.StatusInternalServerError)
-		//		return
-		//	}
-		//case <-time.After(10 * time.Second):
-		//	log.Infof("[Nano] Request timeout")
-		//	ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-		//	return
-		//}
 	}
+	return
 
-	//select {
-	//case <-ctx.Done():
-	//	log.Infof("[Nano] Request canceled for messageID: %d", messageID)
-	//	agent.RemoveHttpRequestCtx(messageID)
-	//case <-timer.C:
-	//	log.Infof("[Nano] Request timeout for messageID: %d", messageID)
-	//	ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-	//	ctx.SetConnectionClose()
-	//	agent.RemoveHttpRequestCtx(messageID)
-	//}
-
-	// if responseChan != nil {
-	// 	// Wait for response or timeout
-	// 	select {
-	// 	case response := <-responseChan:
-	// 		ctx.SetContentType("application/json")
-	// 		log.Infof("ss ptr after insert %v", agent.session)
-	// 		ctx.SetBody(response)
-	// 		return
-	// 	case <-time.After(10 * time.Second):
-	// 		log.Infof("[Nano] Request timeout")
-	// 		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-	// 	}
-	// }
 }
 
 // handleSSE handles Server-Sent Events to push events to clients
@@ -451,7 +411,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Create a channel for sending events
-	sseEventChan := make(chan []byte, 100) // Increased buffer size to 100
+	sseEventChan := make(chan []byte, 2<<7) // Increased buffer size to 2 ^7
 	sidInt, err := strconv.ParseInt(sessionID, 10, 64)
 	if err != nil {
 		log.Errorf("Invalid session ID: %v", err)
@@ -523,6 +483,10 @@ func (n *Node) unregisterSSEClient(sessionID string) {
 	log.Infof("Unregister SSE client: %s", sessionID)
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// convert sessionID  to uint64
+	sidInt, _ := strconv.ParseInt(sessionID, 10, 64)
+	// close the agentHttp
+	n.sessions[sidInt].NetworkEntity().Close()
 	delete(n.sseClients, sessionID)
 }
 

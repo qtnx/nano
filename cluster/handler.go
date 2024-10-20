@@ -598,10 +598,8 @@ func (h *LocalHandler) localProcess(
 	payload := msg.Data
 	var data interface{}
 	if handler.IsRawArg {
-		log.Infof("Deserialize to raw data: %v", payload)
 		data = payload
 	} else {
-		log.Infof("Deserialize to %T", handler.Type.Elem())
 		data = reflect.New(handler.Type.Elem()).Interface()
 		err := env.Serializer.Unmarshal(payload, data)
 		if err != nil {
@@ -621,7 +619,6 @@ func (h *LocalHandler) localProcess(
 
 	task := func() {
 
-		log.Infof("Local process task: %v", msg.Route)
 		// Set the last message ID
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
