@@ -23,6 +23,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,7 +59,7 @@ func (a *connPool) init(addr string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		conn, err := grpc.DialContext(
 			ctx,
-			addr,
+			fmt.Sprintf("dns:///%s", addr),
 			env.GrpcOptions...,
 		)
 		cancel()

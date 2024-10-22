@@ -280,7 +280,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}()
 	agent.AttackHttpRequestCtx(messageID, ctx)
 
-	// validate authen
+	// validate authenticate
 	if env.MiddlewareHttp != nil {
 		if err := env.MiddlewareHttp(agent.session, convertFastHTTPToHTTP(ctx)); err != nil {
 			log.Infof("[Nano] Invalidate authenticate middleware")
