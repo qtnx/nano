@@ -2,8 +2,9 @@ package cluster
 
 import (
 	"context"
-	"github.com/lonng/nano/internal/log"
 	"net"
+
+	"github.com/lonng/nano/internal/log"
 
 	"github.com/lonng/nano/cluster/clusterpb"
 	"github.com/lonng/nano/internal/message"
@@ -50,6 +51,21 @@ func (a *acceptor) RPC(route string, v interface{}) error {
 	}
 	a.rpcHandler(a.session, msg, true)
 	return nil
+}
+
+// RPC with response
+func (a *acceptor) RPCWithResponse(route string, v interface{}) ([]byte, error) {
+
+	// data, err := message.Serialize(v)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// msg := &message.Message{
+	// 	Type:  message.Request,
+	// 	Route: route,
+	// 	Data:  data,
+	// }
+	return nil, nil
 }
 
 // LastMid implements the session.NetworkEntity interface

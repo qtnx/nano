@@ -486,7 +486,9 @@ func (n *Node) unregisterSSEClient(sessionID string) {
 	// convert sessionID  to uint64
 	sidInt, _ := strconv.ParseInt(sessionID, 10, 64)
 	// close the agentHttp
-	n.sessions[sidInt].NetworkEntity().Close()
+	if ne := n.sessions[sidInt].NetworkEntity(); ne != nil {
+		ne.Close()
+	}
 	delete(n.sseClients, sessionID)
 }
 
