@@ -486,8 +486,10 @@ func (n *Node) unregisterSSEClient(sessionID string) {
 	// convert sessionID  to uint64
 	sidInt, _ := strconv.ParseInt(sessionID, 10, 64)
 	// close the agentHttp
-	if ne := n.sessions[sidInt].NetworkEntity(); ne != nil {
-		ne.Close()
+	if session, exists := n.sessions[sidInt]; exists && session != nil {
+		if ne := session.NetworkEntity(); ne != nil {
+			ne.Close()
+		}
 	}
 	delete(n.sseClients, sessionID)
 }
@@ -817,7 +819,6 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 }
 
 func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Println("[Node] HandleResponse %s", req.String())
 	s := n.findSession(req.SessionId)
 	if s == nil {
 		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
