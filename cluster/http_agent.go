@@ -117,7 +117,6 @@ func (h *httpAgent) OriginalSid() int64 {
 
 // Push implements session.NetworkEntity.
 func (h *httpAgent) Push(route string, v interface{}) error {
-	log.Infof("[HTTP Agent] Raw Push event to route: %s, data: %v", route, v)
 	var body interface{}
 
 	// Check if v is already JSON
