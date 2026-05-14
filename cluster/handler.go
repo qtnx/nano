@@ -563,6 +563,14 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 		return
 	}
 
+	if pipe := h.pipeline; pipe != nil {
+		err := pipe.Inbound().Process(agent.session, msg)
+		if err != nil {
+			log.Println("Pipeline process failed: " + err.Error())
+			return
+		}
+	}
+
 	handler, found := h.localHandlers[msg.Route]
 	if !found {
 		h.remoteProcess(agent.session, msg, false)
@@ -587,14 +595,6 @@ func (h *LocalHandler) localProcess(
 	msg *message.Message,
 	responseChan chan<- []byte,
 ) {
-	if pipe := h.pipeline; pipe != nil {
-		err := pipe.Inbound().Process(session, msg)
-		if err != nil {
-			log.Println("Pipeline process failed: " + err.Error())
-			return
-		}
-	}
-
 	payload := msg.Data
 	var data interface{}
 	if handler.IsRawArg {
