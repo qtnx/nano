@@ -158,7 +158,7 @@ func TestReconcileMembersSkipsOlderHeartbeatSnapshotAfterNewEpochAccepted(t *tes
 	c.membershipEpoch = 200
 	c.membershipSnapshotSeq = 2
 
-	added, updated, removed := c.reconcileMembersSnapshot([]*clusterpb.MemberInfo{oldMember}, nil, 10, 100, 1)
+	added, updated, removed := c.reconcileMembersSnapshot([]*clusterpb.MemberInfo{oldMember}, nil, 10, 100, 1, false)
 
 	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
 		t.Fatalf("stale heartbeat snapshot changed membership: added=%v updated=%v removed=%v", added, updated, removed)
@@ -171,6 +171,37 @@ func TestReconcileMembersSkipsOlderHeartbeatSnapshotAfterNewEpochAccepted(t *tes
 	}
 	if countMemberAddr(c, newMember.ServiceAddr) != 1 {
 		t.Fatalf("current member %s count = %d, want 1", newMember.ServiceAddr, countMemberAddr(c, newMember.ServiceAddr))
+	}
+}
+
+func TestReconcileMembersResetPrunesMembersAbsentFromSnapshot(t *testing.T) {
+	known := mkMemberInfo("user-service", "user:8085", "UserService")
+	stale := mkMemberInfo("old-service", "old:8085", "OldService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{
+		{memberInfo: known, membershipVersion: 4, membershipEpoch: 10},
+		{memberInfo: stale, membershipVersion: 4, membershipEpoch: 10},
+	}
+	c.membershipVersion = 4
+	c.membershipEpoch = 10
+	c.membershipSnapshotSeq = 1
+
+	added, updated, removed := c.reconcileMembersSnapshot([]*clusterpb.MemberInfo{known}, nil, 7, 10, 2, true)
+
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("added=%v updated=%v, want none", added, updated)
+	}
+	if len(removed) != 1 || removed[0] != stale.ServiceAddr {
+		t.Fatalf("removed=%v, want only %s", removed, stale.ServiceAddr)
+	}
+	if countMemberAddr(c, stale.ServiceAddr) != 0 {
+		t.Fatalf("stale member %s survived reset", stale.ServiceAddr)
+	}
+	if countMemberAddr(c, known.ServiceAddr) != 1 {
+		t.Fatalf("known member %s count = %d, want 1", known.ServiceAddr, countMemberAddr(c, known.ServiceAddr))
+	}
+	if c.removedMembershipVersion != 7 {
+		t.Fatalf("removedMembershipVersion = %d, want 7", c.removedMembershipVersion)
 	}
 }
 
@@ -189,6 +220,30 @@ func TestReconcileMembersAcceptsFirstEpochWhenLocalVersionIsHigher(t *testing.T)
 	}
 	if c.membershipEpoch != 200 || c.membershipVersion != 1 {
 		t.Fatalf("membership state = epoch %d version %d, want epoch 200 version 1", c.membershipEpoch, c.membershipVersion)
+	}
+}
+
+func TestReconcileMembersNewEpochResetsRemovalAcknowledgement(t *testing.T) {
+	missed := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.membershipVersion = 10
+	c.membershipEpoch = 100
+	c.removedMembershipVersion = 9
+	c.membershipCompactVersion = 8
+
+	added, updated, removed := c.reconcileMembers([]*clusterpb.MemberInfo{missed}, nil, 1, 200)
+
+	if len(added) != 1 || added[0].ServiceAddr != missed.ServiceAddr {
+		t.Fatalf("added=%v, want %s", added, missed.ServiceAddr)
+	}
+	if len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("updated=%v removed=%v, want none", updated, removed)
+	}
+	if c.removedMembershipVersion != 0 {
+		t.Fatalf("removedMembershipVersion = %d, want 0 after epoch reset", c.removedMembershipVersion)
+	}
+	if c.membershipCompactVersion != 0 {
+		t.Fatalf("membershipCompactVersion = %d, want 0 after epoch reset", c.membershipCompactVersion)
 	}
 }
 
@@ -278,6 +333,22 @@ func TestDelMemberSkipsStaleDeleteAfterReRegister(t *testing.T) {
 	}
 	if countMemberAddr(c, restarted.ServiceAddr) != 1 {
 		t.Fatalf("member count after stale delete = %d, want 1", countMemberAddr(c, restarted.ServiceAddr))
+	}
+}
+
+func TestDelMemberDoesNotAdvanceHeartbeatRemovalAck(t *testing.T) {
+	stale := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: stale, membershipVersion: 4, membershipEpoch: 10}}
+	c.membershipVersion = 4
+	c.membershipEpoch = 10
+
+	if !c.delMember(stale.ServiceAddr, 5, 10) {
+		t.Fatal("DelMember was not applied")
+	}
+
+	if c.removedMembershipVersion != 0 {
+		t.Fatalf("removedMembershipVersion = %d, want 0; DelMember pushes do not prove prior tombstones were observed", c.removedMembershipVersion)
 	}
 }
 
@@ -385,6 +456,9 @@ func TestReconcileMembersRemovesHeartbeatTombstones(t *testing.T) {
 	}
 	if members := h.findMembers("UserService"); len(members) != 0 {
 		t.Fatalf("tombstoned member route still exists: %v", members)
+	}
+	if c.removedMembershipVersion != 2 {
+		t.Fatalf("removedMembershipVersion = %d, want 2", c.removedMembershipVersion)
 	}
 }
 
@@ -617,6 +691,89 @@ func TestHeartbeatPrunesExpiredRemovedMemberTombstones(t *testing.T) {
 	}
 	if len(resp.GetRemovedMembers()) != 1 || resp.GetRemovedMembers()[0].GetServiceAddr() != "recent:8085" {
 		t.Fatalf("Heartbeat response removed members = %v, want only recent:8085", resp.GetRemovedMembers())
+	}
+}
+
+func TestHeartbeatRequestsResetWhenPeerMissedCompactedTombstone(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	member := mkMemberInfo("user-service", "user:8085")
+	c.members = []*Member{{memberInfo: member, isMaster: false}}
+	c.membershipVersion = 7
+	c.membershipEpoch = 10
+	c.removedMembers = map[string]removedMemberTombstone{
+		"expired:8085": {membershipVersion: 5, removedAt: time.Now().Add(-removedMemberRetention() - time.Second)},
+	}
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		MemberInfo:               member,
+		MembershipVersion:        4,
+		MembershipEpoch:          10,
+		RemovedMembershipVersion: 4,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if !resp.GetResetMembership() {
+		t.Fatal("Heartbeat did not request reset for peer behind compacted tombstone")
+	}
+	if len(resp.GetRemovedMembers()) != 0 {
+		t.Fatalf("Heartbeat removed members = %v, want compacted tombstone omitted", resp.GetRemovedMembers())
+	}
+	if c.membershipCompactVersion != 5 {
+		t.Fatalf("membershipCompactVersion = %d, want 5", c.membershipCompactVersion)
+	}
+}
+
+func TestHeartbeatDoesNotResetPeerPastCompactedTombstone(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	member := mkMemberInfo("user-service", "user:8085")
+	c.members = []*Member{{memberInfo: member, isMaster: false}}
+	c.membershipVersion = 7
+	c.membershipEpoch = 10
+	c.membershipCompactVersion = 5
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		MemberInfo:               member,
+		MembershipVersion:        6,
+		MembershipEpoch:          10,
+		RemovedMembershipVersion: 6,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if resp.GetResetMembership() {
+		t.Fatal("Heartbeat requested reset for peer already past compacted tombstone")
+	}
+}
+
+func TestHeartbeatRequestsResetWhenOnlyMembershipVersionPassedCompactedTombstone(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	member := mkMemberInfo("user-service", "user:8085")
+	c.members = []*Member{{memberInfo: member, isMaster: false}}
+	c.membershipVersion = 8
+	c.membershipEpoch = 10
+	c.membershipCompactVersion = 5
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		MemberInfo:               member,
+		MembershipVersion:        7,
+		MembershipEpoch:          10,
+		RemovedMembershipVersion: 4,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if !resp.GetResetMembership() {
+		t.Fatal("Heartbeat did not request reset for peer whose removal ack is behind compacted tombstone")
 	}
 }
 

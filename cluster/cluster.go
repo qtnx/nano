@@ -41,12 +41,17 @@ type cluster struct {
 	currentNode *Node
 	rpcClient   *rpcClient
 
-	mu                    sync.RWMutex
-	members               []*Member
-	removedMembers        map[string]removedMemberTombstone
-	membershipEpoch       uint64
-	membershipVersion     uint64
-	membershipSnapshotSeq uint64
+	mu                sync.RWMutex
+	members           []*Member
+	removedMembers    map[string]removedMemberTombstone
+	membershipEpoch   uint64
+	membershipVersion uint64
+	// Highest removal version observed through an ordered heartbeat snapshot.
+	// DelMember pushes do not advance this because independent pushes can be
+	// missed or delivered without proving older removals were seen.
+	removedMembershipVersion uint64
+	membershipCompactVersion uint64
+	membershipSnapshotSeq    uint64
 }
 
 type removedMemberTombstone struct {
@@ -270,7 +275,12 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	// any NewMember push it missed during churn (see reconcileMembers).
 	// Mirrors RegisterResponse: include every member, master included.
 	c.pruneRemovedMembersLocked(time.Now())
-	resp := &clusterpb.HeartbeatResponse{MembershipVersion: c.membershipVersion, MembershipEpoch: membershipEpoch, HeartbeatSeq: req.GetHeartbeatSeq()}
+	resp := &clusterpb.HeartbeatResponse{
+		MembershipVersion: c.membershipVersion,
+		MembershipEpoch:   membershipEpoch,
+		HeartbeatSeq:      req.GetHeartbeatSeq(),
+		ResetMembership:   c.heartbeatRequiresResetLocked(req, membershipEpoch),
+	}
 	for _, m := range c.members {
 		resp.Members = append(resp.Members, m.MemberInfo())
 	}
@@ -442,16 +452,17 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membe
 // live list: pruning here would let a transient or incomplete master view (for
 // example right after a master restart, before every member has re-heartbeated)
 // drop a live peer and break routing. Removals self-heal via explicit
-// RemovedMember tombstones, which are scoped by membership epoch/version.
+// RemovedMember tombstones; if old tombstones have already been compacted,
+// the master marks stale peers for a full membership reset.
 //
 // This is what lets a node self-heal a missed NewMember push: pingNodes and route
 // resolution only see c.members, so a member that registered after this node's
 // initial sync would otherwise stay invisible until a process restart.
 func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch uint64) (added, updated []*clusterpb.MemberInfo, removed []string) {
-	return c.reconcileMembersSnapshot(infos, removedInfos, membershipVersion, membershipEpoch, 0)
+	return c.reconcileMembersSnapshot(infos, removedInfos, membershipVersion, membershipEpoch, 0, false)
 }
 
-func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch, snapshotSeq uint64) (added, updated []*clusterpb.MemberInfo, removed []string) {
+func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch, snapshotSeq uint64, resetMembership bool) (added, updated []*clusterpb.MemberInfo, removed []string) {
 	if len(infos) == 0 && len(removedInfos) == 0 && membershipVersion == 0 && membershipEpoch == 0 {
 		return nil, nil, nil
 	}
@@ -473,10 +484,12 @@ func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, remove
 		}
 	}
 
+	snapshotMembers := make(map[string]struct{}, len(infos))
 	for _, info := range infos {
 		if info == nil || info.ServiceAddr == "" || info.ServiceAddr == selfAddr {
 			continue
 		}
+		snapshotMembers[info.ServiceAddr] = struct{}{}
 		if member, ok := known[info.ServiceAddr]; ok {
 			if !memberInfoEqual(member.memberInfo, info) {
 				member.memberInfo = info
@@ -499,6 +512,9 @@ func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, remove
 		if info == nil || info.GetServiceAddr() == "" || info.GetServiceAddr() == selfAddr {
 			continue
 		}
+		if info.GetMembershipVersion() > c.removedMembershipVersion {
+			c.removedMembershipVersion = info.GetMembershipVersion()
+		}
 		member, ok := known[info.GetServiceAddr()]
 		if ok && member.membershipEpoch == c.membershipEpoch && member.membershipVersion > info.GetMembershipVersion() {
 			continue
@@ -507,6 +523,29 @@ func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, remove
 			delete(known, info.GetServiceAddr())
 			removed = append(removed, info.GetServiceAddr())
 		}
+	}
+	if resetMembership {
+		for i := 0; i < len(c.members); {
+			member := c.members[i]
+			addr := ""
+			if member.memberInfo != nil {
+				addr = member.memberInfo.ServiceAddr
+			}
+			if addr == "" || addr == selfAddr {
+				i++
+				continue
+			}
+			if _, ok := snapshotMembers[addr]; ok {
+				i++
+				continue
+			}
+			c.members = append(c.members[:i], c.members[i+1:]...)
+			delete(known, addr)
+			removed = append(removed, addr)
+		}
+	}
+	if resetMembership && membershipVersion > c.removedMembershipVersion {
+		c.removedMembershipVersion = membershipVersion
 	}
 	return added, updated, removed
 }
@@ -575,6 +614,22 @@ func (c *cluster) nextMembershipSnapshotSeq() uint64 {
 	return c.membershipSnapshotSeq
 }
 
+func (c *cluster) membershipState() (membershipVersion, membershipEpoch, removedMembershipVersion uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.membershipVersion, c.membershipEpoch, c.removedMembershipVersion
+}
+
+func (c *cluster) heartbeatRequiresResetLocked(req *clusterpb.HeartbeatRequest, membershipEpoch uint64) bool {
+	if c.membershipCompactVersion == 0 {
+		return false
+	}
+	if req.GetMembershipEpoch() != membershipEpoch {
+		return false
+	}
+	return req.GetRemovedMembershipVersion() < c.membershipCompactVersion
+}
+
 func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, snapshotSeq uint64) bool {
 	if snapshotSeq > 0 {
 		if snapshotSeq < c.membershipSnapshotSeq {
@@ -588,6 +643,8 @@ func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEp
 		if membershipEpoch != c.membershipEpoch {
 			c.membershipEpoch = membershipEpoch
 			c.membershipVersion = 0
+			c.removedMembershipVersion = 0
+			c.membershipCompactVersion = 0
 		}
 	}
 	return c.acceptMembershipVersionLocked(membershipVersion)
@@ -598,6 +655,8 @@ func (c *cluster) acceptMembershipEventLocked(membershipVersion, membershipEpoch
 		if c.membershipEpoch == 0 {
 			c.membershipEpoch = membershipEpoch
 			c.membershipVersion = 0
+			c.removedMembershipVersion = 0
+			c.membershipCompactVersion = 0
 		} else if membershipEpoch != c.membershipEpoch {
 			return false
 		}
@@ -647,6 +706,9 @@ func (c *cluster) pruneRemovedMembersLocked(now time.Time) {
 			continue
 		}
 		if now.Sub(tombstone.removedAt) > retention {
+			if tombstone.membershipVersion > c.membershipCompactVersion {
+				c.membershipCompactVersion = tombstone.membershipVersion
+			}
 			delete(c.removedMembers, addr)
 		}
 	}

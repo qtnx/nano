@@ -23,6 +23,9 @@ message UnregisterResponse {}
 message HeartbeatRequest {
   MemberInfo memberInfo = 1;
   uint64 heartbeatSeq = 2;
+  uint64 membershipVersion = 3;
+  uint64 membershipEpoch = 4;
+  uint64 removedMembershipVersion = 5;
 }
 
 message HeartbeatResponse {
@@ -31,6 +34,7 @@ message HeartbeatResponse {
   uint64 membershipEpoch = 3;
   repeated RemovedMember removedMembers = 4;
   uint64 heartbeatSeq = 5;
+  bool resetMembership = 6;
 }
 
 message RemovedMember {
