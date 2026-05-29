@@ -37,28 +37,29 @@ import (
 // drops a task: a full queue is always surfaced as this error.
 var ErrSchedulerBacklog = errors.New("nano/scheduler: task queue backlog full")
 
-// shardSet is an immutable snapshot of the active shard workers. It is published
-// atomically by EnableSharded and read lock-free on the dispatch hot path, so
-// PushTaskOnShard never has to take a mutex per task. The teardown signal `die`
-// travels inside the set so every reader sees a consistent (chans, die)
-// snapshot and can never observe a shard channel without its matching die.
+// shardSet holds the active shard worker channels and their shared teardown
+// signal. It is only ever read/replaced under shardMu.
 type shardSet struct {
 	chans []chan Task   // one bounded task channel per shard
-	die   chan struct{} // closed by stopSharded to drain and stop this set's workers
+	die   chan struct{} // closed by stopSharded after it has exclusive access
 }
 
 var (
-	// shards holds the active shardSet, or nil when running in the default
-	// single-scheduler mode. Sharding is opt-in via EnableSharded.
-	shards atomic.Pointer[shardSet]
+	// shardMu guards shardCur. Enqueue paths take it for READ (concurrent, so
+	// dispatch still scales across cores); EnableSharded/stopSharded take it for
+	// WRITE. Because a writer waits for all readers, teardown is guaranteed that
+	// no enqueue is mid-flight when it unpublishes the set — there is no window
+	// where a task is accepted onto a shard that is being drained/abandoned.
+	shardMu  sync.RWMutex
+	shardCur *shardSet // active set, or nil in single-scheduler mode (guarded by shardMu)
 
-	// shardWG tracks the shard worker goroutines so stopSharded can guarantee
-	// none outlive teardown (no goroutine leaks on shutdown or between tests).
+	// shardOn is a lock-free hint for the hot pre-check Sharded(); the authoritative
+	// state is shardCur under shardMu.
+	shardOn atomic.Bool
+
+	// shardWG tracks shard worker goroutines so stopSharded can guarantee none
+	// outlive teardown (no goroutine leaks on shutdown or between tests).
 	shardWG sync.WaitGroup
-
-	// shardMu serializes EnableSharded/stopSharded so concurrent setup and
-	// teardown cannot publish or drain a half-built shard set.
-	shardMu sync.Mutex
 )
 
 // EnableSharded switches the scheduler into opt-in sharded mode by starting n
@@ -88,7 +89,7 @@ func EnableSharded(n int) {
 	shardMu.Lock()
 	defer shardMu.Unlock()
 
-	if shards.Load() != nil {
+	if shardCur != nil {
 		return // already enabled
 	}
 
@@ -102,19 +103,19 @@ func EnableSharded(n int) {
 		go shardWorker(ch, die)
 	}
 
-	// Publish the fully-built set last; its die channel is part of the snapshot,
-	// so any observer that sees sharding active also sees the matching die.
-	shards.Store(set)
+	shardCur = set
+	shardOn.Store(true)
 }
 
-// Sharded reports whether the sharded dispatcher is currently active.
+// Sharded reports whether the sharded dispatcher is currently active. It is a
+// lock-free hint; the enqueue paths re-check authoritatively under shardMu and
+// fall back to the single scheduler if sharding was turned off in between.
 func Sharded() bool {
-	return shards.Load() != nil
+	return shardOn.Load()
 }
 
 // drainChan runs every task currently buffered in ch (non-blocking) and returns
-// once the channel is empty. Used both by a worker shutting down and by the
-// final teardown sweep so accepted-but-unstarted tasks are never lost.
+// once the channel is empty.
 func drainChan(ch chan Task) {
 	for {
 		select {
@@ -129,9 +130,8 @@ func drainChan(ch chan Task) {
 // shardWorker is the per-shard actor loop. Because a given key always maps to
 // the same shard, a single goroutine drains each shard channel in FIFO order,
 // which is what preserves per-key (per-session) task ordering. Each task runs
-// under try() so a panicking task is recovered and cannot take down the worker
-// or the process. On teardown (die) it drains any already-queued tasks before
-// exiting so accepted work is not silently dropped.
+// under try() so a panicking task is recovered. On teardown (die) it drains any
+// already-queued tasks before exiting so accepted work is not dropped.
 func shardWorker(ch chan Task, die chan struct{}) {
 	defer shardWG.Done()
 	for {
@@ -149,29 +149,25 @@ func shardWorker(ch chan Task, die chan struct{}) {
 // always maps to the same shard, guaranteeing per-key ordering; distinct keys
 // may land on different shards and run concurrently.
 //
-// When sharding is not enabled (or is being torn down) it falls back to the
-// legacy single task channel. Either way the enqueue is non-blocking: if the
-// target queue is full it returns ErrSchedulerBacklog instead of blocking the
-// caller (and never drops the task).
+// When sharding is not enabled it falls back to the legacy single task channel.
+// Either way the enqueue is non-blocking: if the target queue is full it returns
+// ErrSchedulerBacklog instead of blocking the caller (and never drops the task).
 func PushTaskOnShard(key uint64, task Task) error {
-	set := shards.Load()
+	shardMu.RLock()
+	set := shardCur
 	if set == nil {
-		// Not sharded: behave like the legacy single path, but non-blocking.
-		return tryPushTask(task)
+		shardMu.RUnlock()
+		return tryPushTask(task) // not sharded: single path, non-blocking
 	}
-	// If this set is being torn down, route to the single scheduler rather than
-	// a shard whose worker may already be exiting.
-	select {
-	case <-set.die:
-		return tryPushTask(task)
-	default:
-	}
-	// One shard => one goroutine => FIFO for a given key.
+	// Holding the read lock guarantees the shard worker is alive for the
+	// duration of the send, so an accepted task always has a live drainer.
 	idx := mix(key) % uint64(len(set.chans))
 	select {
 	case set.chans[idx] <- task:
+		shardMu.RUnlock()
 		return nil
 	default:
+		shardMu.RUnlock()
 		return ErrSchedulerBacklog
 	}
 }
@@ -180,22 +176,24 @@ func PushTaskOnShard(key uint64, task Task) error {
 // blocking until that shard has capacity. Unlike falling back to the single
 // scheduler, it preserves the shard the key is confined to, so per-key
 // (per-session) FIFO ordering still holds. It is the correct backpressure path
-// for response-expecting work that must not be dropped under overload. If the
-// shard set is torn down while blocked, it falls back to the single scheduler so
-// it can never block forever on a shard with no live worker. When sharding is
-// not enabled it blocks on the single scheduler.
+// for response-expecting work that must not be dropped under overload. When
+// sharding is not enabled it blocks on the single scheduler.
+//
+// The read lock is held across the (possibly blocking) send: teardown takes the
+// write lock and therefore waits until the send completes, which is safe because
+// the shard worker keeps draining until teardown actually begins — so the send
+// is guaranteed to make progress and never targets a dead shard.
 func PushTaskOnShardBlocking(key uint64, task Task) {
-	set := shards.Load()
+	shardMu.RLock()
+	set := shardCur
 	if set == nil {
+		shardMu.RUnlock()
 		PushTask(task)
 		return
 	}
 	idx := mix(key) % uint64(len(set.chans))
-	select {
-	case set.chans[idx] <- task:
-	case <-set.die:
-		PushTask(task)
-	}
+	set.chans[idx] <- task
+	shardMu.RUnlock()
 }
 
 // TryPushTask is the non-blocking counterpart of PushTask: it enqueues task on
@@ -233,26 +231,29 @@ func mix(key uint64) uint64 {
 // stopSharded returns the scheduler to single-scheduler mode and drains every
 // shard worker goroutine. Production code reaches this through Close(); tests
 // call it (via DisableSharded) to reset global state and prove no worker
-// goroutine leaks. Accepted tasks are not lost: workers drain on die, and a
-// final sweep runs anything a racing PushTaskOnShard delivered into a buffer
-// after its worker exited.
+// goroutine leaks.
+//
+// Correctness: it acquires the write lock, so it cannot proceed until every
+// in-flight enqueue (which holds the read lock) has finished. Once it unpublishes
+// the set under the lock, no later enqueue can reference it (they re-read
+// shardCur and see nil). Only then does it close die and wait; workers drain
+// their queues on die, and a final sweep covers anything left, so no accepted
+// task is lost and none runs without a live worker.
 func stopSharded() {
 	shardMu.Lock()
-	defer shardMu.Unlock()
-
-	set := shards.Load()
+	set := shardCur
 	if set == nil {
+		shardMu.Unlock()
 		return
 	}
+	shardCur = nil
+	shardOn.Store(false)
+	shardMu.Unlock()
 
-	// Stop routing to shards first so any new PushTaskOnShard falls back to the
-	// single path, then signal workers to drain their queues and exit.
-	shards.Store(nil)
+	// Past this point no enqueue can target set.chans (new enqueues see a nil
+	// shardCur and use the single path), so closing/draining is race-free.
 	close(set.die)
 	shardWG.Wait()
-
-	// Final sweep: run any task delivered into a shard buffer in the small
-	// window between a worker's drain and its exit, so no accepted task is lost.
 	for _, ch := range set.chans {
 		drainChan(ch)
 	}
