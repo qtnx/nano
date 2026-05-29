@@ -1,9 +1,17 @@
 package message
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
+
+func appendStringParts(dst []byte, parts ...string) []byte {
+	for _, part := range parts {
+		dst = append(dst, part...)
+	}
+	return dst
+}
 
 func TestEncode(t *testing.T) {
 	dict := map[string]uint16{
@@ -160,5 +168,178 @@ func TestEncode(t *testing.T) {
 
 	if !reflect.DeepEqual(m8, dm8) {
 		t.Error("not equal")
+	}
+}
+
+func TestEncodeAllocationsStayLow(t *testing.T) {
+	SetDictionary(map[string]uint16{
+		"alloc.compressed": 0x1234,
+	})
+
+	tests := []struct {
+		name string
+		msg  *Message
+		want []byte
+	}{
+		{
+			name: "uncompressed request",
+			msg: &Message{
+				Type:  Request,
+				ID:    300,
+				Route: "alloc.request",
+				Data:  []byte("payload"),
+			},
+			want: appendStringParts(
+				[]byte{byte(Request << 1), 0xac, 0x02, byte(len("alloc.request"))},
+				"alloc.request",
+				"payload",
+			),
+		},
+		{
+			name: "compressed notify",
+			msg: &Message{
+				Type:  Notify,
+				Route: "alloc.compressed",
+				Data:  []byte("payload"),
+			},
+			want: appendStringParts(
+				[]byte{byte(Notify<<1) | msgRouteCompressMask, 0x12, 0x34},
+				"payload",
+			),
+		},
+		{
+			name: "response",
+			msg: &Message{
+				Type: Response,
+				ID:   300,
+				Data: []byte("payload"),
+			},
+			want: appendStringParts(
+				[]byte{byte(Response << 1), 0xac, 0x02},
+				"payload",
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var encoded []byte
+			var err error
+			allocs := testing.AllocsPerRun(1000, func() {
+				encoded, err = Encode(tt.msg)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if allocs > 1 {
+				t.Fatalf("Encode allocations = %.1f, want <= 1", allocs)
+			}
+			if !reflect.DeepEqual(tt.want, encoded) {
+				t.Fatalf("encoded message changed: want %v, got %v", tt.want, encoded)
+			}
+		})
+	}
+}
+
+func TestDecodeMalformedCompressedRouteReturnsError(t *testing.T) {
+	data := []byte{byte(Notify<<1) | msgRouteCompressMask, 0x12}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Decode panicked on truncated compressed route: %v", r)
+		}
+	}()
+
+	_, err := Decode(data)
+	if !errors.Is(err, ErrWrongMessage) {
+		t.Fatalf("Decode error = %v, want %v", err, ErrWrongMessage)
+	}
+}
+
+func TestDecodeMalformedMessagesReturnExpectedErrors(t *testing.T) {
+	delete(codes, 0xffff)
+
+	tests := []struct {
+		name string
+		data []byte
+		want error
+	}{
+		{
+			name: "too short",
+			data: []byte{byte(Notify << 1)},
+			want: ErrInvalidMessage,
+		},
+		{
+			name: "wrong type",
+			data: []byte{byte(0x04 << 1), 0x00},
+			want: ErrWrongMessageType,
+		},
+		{
+			name: "uncompressed route length exceeds payload",
+			data: []byte{byte(Notify << 1), 0x05, 'a', 'b'},
+			want: ErrWrongMessage,
+		},
+		{
+			name: "unknown compressed route code",
+			data: []byte{byte(Notify<<1) | msgRouteCompressMask, 0xff, 0xff},
+			want: ErrRouteInfoNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Decode(tt.data)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Decode error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func BenchmarkEncode(b *testing.B) {
+	SetDictionary(map[string]uint16{
+		"bench.compressed": 0x2345,
+	})
+
+	tests := []struct {
+		name string
+		msg  *Message
+	}{
+		{
+			name: "uncompressed_request",
+			msg: &Message{
+				Type:  Request,
+				ID:    300,
+				Route: "bench.request",
+				Data:  []byte("payload"),
+			},
+		},
+		{
+			name: "compressed_notify",
+			msg: &Message{
+				Type:  Notify,
+				Route: "bench.compressed",
+				Data:  []byte("payload"),
+			},
+		},
+		{
+			name: "response",
+			msg: &Message{
+				Type: Response,
+				ID:   300,
+				Data: []byte("payload"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := Encode(tt.msg); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

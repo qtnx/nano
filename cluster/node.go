@@ -23,9 +23,12 @@ package cluster
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -54,6 +57,12 @@ var (
 
 	// ErrLimitConnection the connection of the ip is reach the limit
 	ErrLimitConnection = errors.New("reach the limit of connection")
+)
+
+const (
+	defaultCORSAllowOrigin  = "*"
+	defaultCORSAllowMethods = "POST, GET, OPTIONS, PUT, DELETE"
+	defaultCORSAllowHeaders = "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-SSE-SessionID"
 )
 
 // Options contains some configurations for current node
@@ -156,13 +165,9 @@ func (n *Node) listenAndServe() {
 	// Start the fasthttp server
 	server := &fasthttp.Server{
 		Handler: func(ctx *fasthttp.RequestCtx) {
-			// Set CORS headers to accept all
-			ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
-			ctx.Response.Header.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-SSE-SessionID")
+			applyDefaultCORSHeaders(ctx)
 
-			// Handle preflight requests
-			if string(ctx.Method()) == "OPTIONS" {
+			if isPreflightRequest(ctx) {
 				ctx.SetStatusCode(fasthttp.StatusOK)
 				return
 			}
@@ -175,6 +180,16 @@ func (n *Node) listenAndServe() {
 	if err := server.ListenAndServe(n.ClientAddr); err != nil {
 		log.Println(fmt.Sprintf("Error starting fasthttp server: %v", err))
 	}
+}
+
+func applyDefaultCORSHeaders(ctx *fasthttp.RequestCtx) {
+	ctx.Response.Header.Set("Access-Control-Allow-Origin", defaultCORSAllowOrigin)
+	ctx.Response.Header.Set("Access-Control-Allow-Methods", defaultCORSAllowMethods)
+	ctx.Response.Header.Set("Access-Control-Allow-Headers", defaultCORSAllowHeaders)
+}
+
+func isPreflightRequest(ctx *fasthttp.RequestCtx) bool {
+	return string(ctx.Method()) == fasthttp.MethodOptions
 }
 
 // handleFastHTTP is the request handler for fasthttp
@@ -380,34 +395,12 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	ctx.SetStatusCode(fasthttp.StatusOK)
 	log.Infof("SSE connection established")
 
-	// Check if session ID cookie exists
-	var sessionID string
-	cookie := ctx.Request.Header.Cookie("sse_sessionID")
-	if len(cookie) == 0 {
-		// Try to get sessionID from "X-SSE-SessionID" header
-		sessionIDHeader := ctx.Request.Header.Peek("X-SSE-SessionID")
-		sessionID = string(sessionIDHeader)
-		// if sessionIDHeader is not exist, get from search params
-		if sessionID == "" {
-			sessionID = string(ctx.QueryArgs().Peek("sse_sessionID"))
-		}
-	} else {
-		sessionID = string(cookie)
-	}
-
+	sessionID := sseSessionIDFromRequest(ctx)
 	if len(sessionID) == 0 {
 		// Generate a new session ID if cookie doesn't exist
 		sessionID = generateSessionID()
 		// Set the session ID cookie for the client
-		c := fasthttp.AcquireCookie()
-		c.SetKey("sse_sessionID")
-		c.SetValue(sessionID)
-		c.SetPath("/")
-		c.SetMaxAge(3600) // 1 hour
-		c.SetHTTPOnly(true)
-		c.SetSecure(true)
-		ctx.Response.Header.SetCookie(c)
-		fasthttp.ReleaseCookie(c)
+		setSSESessionCookie(ctx, sessionID)
 	}
 
 	// Create a channel for sending events
@@ -472,6 +465,32 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 
 }
 
+func sseSessionIDFromRequest(ctx *fasthttp.RequestCtx) string {
+	cookie := ctx.Request.Header.Cookie("sse_sessionID")
+	if len(cookie) > 0 {
+		return string(cookie)
+	}
+
+	sessionIDHeader := ctx.Request.Header.Peek("X-SSE-SessionID")
+	if len(sessionIDHeader) > 0 {
+		return string(sessionIDHeader)
+	}
+
+	return string(ctx.QueryArgs().Peek("sse_sessionID"))
+}
+
+func setSSESessionCookie(ctx *fasthttp.RequestCtx, sessionID string) {
+	c := fasthttp.AcquireCookie()
+	c.SetKey("sse_sessionID")
+	c.SetValue(sessionID)
+	c.SetPath("/")
+	c.SetMaxAge(3600) // 1 hour
+	c.SetHTTPOnly(true)
+	c.SetSecure(true)
+	ctx.Response.Header.SetCookie(c)
+	fasthttp.ReleaseCookie(c)
+}
+
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
 	log.Infof("Register SSE client: %s", sessionID)
 	n.mu.Lock()
@@ -495,7 +514,11 @@ func (n *Node) unregisterSSEClient(sessionID string) {
 }
 
 func generateSessionID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(math.MaxInt64-1))
+	if err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d", n.Int64()+1)
 }
 
 // listenAndServeWS handles WebSocket connections using fasthttp
@@ -775,10 +798,10 @@ func (n *Node) decreaseConnection(ipAddress string) {
 	metrics.ConnectionsPerIP.WithLabelValues(ipAddress).Dec()
 
 	if n.LimitConnectPerIp > 0 {
+		n.mu.Lock()
+		defer n.mu.Unlock()
 		if _, ok := n.connectionCount[ipAddress]; ok {
 			if n.connectionCount[ipAddress] > 0 {
-				n.mu.Lock()
-				defer n.mu.Unlock()
 				n.connectionCount[ipAddress]--
 				log.Println(fmt.Sprintf("DecreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
 

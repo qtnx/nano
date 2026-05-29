@@ -104,6 +104,29 @@ func invalidType(t Type) bool {
 
 }
 
+func messageIDSize(id uint64) int {
+	size := 1
+	for id >>= 7; id != 0; id >>= 7 {
+		size++
+	}
+	return size
+}
+
+func encodedSize(m *Message, compressed bool) int {
+	size := 1 + len(m.Data)
+	if m.Type == Request || m.Type == Response {
+		size += messageIDSize(m.ID)
+	}
+	if routable(m.Type) {
+		if compressed {
+			size += 2
+		} else {
+			size += 1 + len(m.Route)
+		}
+	}
+	return size
+}
+
 // Encode marshals message to binary format. Different message types is corresponding to
 // different message header, message types is identified by 2-4 bit of flag field. The
 // relationship between message types and message header is presented as follows:
@@ -122,13 +145,14 @@ func Encode(m *Message) ([]byte, error) {
 		return nil, ErrWrongMessageType
 	}
 
-	buf := make([]byte, 0)
 	flag := byte(m.Type) << 1
 
 	code, compressed := routes[m.Route]
 	if compressed {
 		flag |= msgRouteCompressMask
 	}
+
+	buf := make([]byte, 0, encodedSize(m, compressed))
 	buf = append(buf, flag)
 
 	if m.Type == Request || m.Type == Response {
@@ -152,7 +176,7 @@ func Encode(m *Message) ([]byte, error) {
 			buf = append(buf, byte(code&0xFF))
 		} else {
 			buf = append(buf, byte(len(m.Route)))
-			buf = append(buf, []byte(m.Route)...)
+			buf = append(buf, m.Route...)
 		}
 	}
 
@@ -198,6 +222,9 @@ func Decode(data []byte) (*Message, error) {
 	if routable(m.Type) {
 		if flag&msgRouteCompressMask == 1 {
 			m.compressed = true
+			if offset+2 > len(data) {
+				return nil, ErrWrongMessage
+			}
 			code := binary.BigEndian.Uint16(data[offset:(offset + 2)])
 			route, ok := codes[code]
 			if !ok {

@@ -32,6 +32,7 @@ type httpAgent struct {
 	messageIDMapToRequest map[uint64]*fastHttpContextObserve
 	responseChan          chan []byte
 	lastMid               uint64
+	closed                bool
 	mu                    sync.Mutex
 }
 
@@ -57,9 +58,18 @@ func NewHTTPAgent(
 	return a
 }
 
+func (h *httpAgent) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCtx) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed || h.messageIDMapToRequest == nil {
+		return
+	}
 	h.messageIDMapToRequest[mid] = &fastHttpContextObserve{
 		context:       httpCtx,
 		observeStatus: HttpObserveWaiting,
@@ -69,6 +79,9 @@ func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCt
 func (h *httpAgent) RemoveHttpRequestCtx(mid uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.messageIDMapToRequest == nil {
+		return
+	}
 	if _, exists := h.messageIDMapToRequest[mid]; exists {
 		delete(h.messageIDMapToRequest, mid)
 	}
@@ -78,6 +91,9 @@ func (h *httpAgent) GetFastHttpContextObserve(mid uint64) *fastHttpContextObserv
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed || h.messageIDMapToRequest == nil {
+		return nil
+	}
 	if ctxObserve, exists := h.messageIDMapToRequest[mid]; exists {
 		return ctxObserve
 	}
@@ -85,17 +101,49 @@ func (h *httpAgent) GetFastHttpContextObserve(mid uint64) *fastHttpContextObserv
 }
 
 func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
-	h.session.NetworkEntity().(*httpAgent).responseChan = responseChan
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.session == nil {
+		return
+	}
 	h.responseChan = responseChan
+	if agent, ok := h.session.NetworkEntity().(*httpAgent); ok {
+		if agent == h {
+			return
+		}
+		agent.mu.Lock()
+		agent.responseChan = responseChan
+		agent.mu.Unlock()
+	}
 }
 
 func (h *httpAgent) DeAttachResponseChan() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
 	h.responseChan = nil
-	h.session.NetworkEntity().(*httpAgent).responseChan = nil
+	if h.session != nil {
+		if agent, ok := h.session.NetworkEntity().(*httpAgent); ok {
+			if agent == h {
+				return
+			}
+			agent.mu.Lock()
+			agent.responseChan = nil
+			agent.mu.Unlock()
+		}
+	}
 }
 
 // Close implements session.NetworkEntity.
 func (h *httpAgent) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
 	h.httpCtx = nil
 	h.rpcHandler = nil
 	h.session = nil
@@ -117,6 +165,10 @@ func (h *httpAgent) OriginalSid() int64 {
 
 // Push implements session.NetworkEntity.
 func (h *httpAgent) Push(route string, v interface{}) error {
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
+
 	var body interface{}
 
 	// Check if v is already JSON
@@ -147,6 +199,12 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 	}
 	log.Infof("[HTTP Agent] Push event: %s", data)
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.sseChan == nil {
+		return ErrBrokenPipe
+	}
+
 	// Use a select statement with a default case to avoid blocking
 	select {
 	case h.sseChan <- data:
@@ -161,6 +219,10 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 
 // RPC implements session.NetworkEntity.
 func (h *httpAgent) RPC(route string, v interface{}) error {
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
+
 	data, err := message.Serialize(v)
 	if err != nil {
 		return err
@@ -171,13 +233,29 @@ func (h *httpAgent) RPC(route string, v interface{}) error {
 		Data:  data,
 	}
 	log.Infof("[HTTP Agent] RPC event: %s", data)
-	h.rpcHandler(h.session, msg, true)
+
+	h.mu.Lock()
+	closed := h.closed
+	handler := h.rpcHandler
+	sess := h.session
+	h.mu.Unlock()
+	if closed || handler == nil || sess == nil {
+		return ErrBrokenPipe
+	}
+	handler(sess, msg, true)
 	return nil
 }
 
 // RemoteAddr implements session.NetworkEntity.
 func (h *httpAgent) RemoteAddr() net.Addr {
-	return h.httpCtx.RemoteAddr()
+	h.mu.Lock()
+	closed := h.closed
+	ctx := h.httpCtx
+	h.mu.Unlock()
+	if closed || ctx == nil {
+		return nil
+	}
+	return ctx.RemoteAddr()
 }
 
 // Response implements session.NetworkEntity.
@@ -187,14 +265,21 @@ func (h *httpAgent) Response(v interface{}) error {
 
 // ResponseMid implements session.NetworkEntity.
 func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	log.Infof("[HTTP Agent] ResponseMid: %v", mid)
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
+
 	data, err := message.Serialize(v)
 	if err != nil {
 		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
 		return err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.messageIDMapToRequest == nil {
+		return ErrBrokenPipe
 	}
 
 	ctx, exists := h.messageIDMapToRequest[mid]
@@ -202,13 +287,18 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 		log.Infof("[HTTP Agent] No context found for messageID: %d, response might have timed out", mid)
 		return nil
 	}
+	if ctx == nil || ctx.context == nil {
+		return ErrBrokenPipe
+	}
 
-	log.Infof("ss ptr after insert %v", h.session.ID())
+	if h.session != nil {
+		log.Infof("ss ptr after insert %v", h.session.ID())
+	}
 	ctx.context.SetContentType("application/json")
 	ctx.context.SetBody(data)
 	ctx.context.SetStatusCode(fasthttp.StatusOK)
 
-	h.messageIDMapToRequest[mid].observeStatus = HttpObserveSuccess
+	ctx.observeStatus = HttpObserveSuccess
 
 	return nil
 }
