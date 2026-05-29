@@ -194,12 +194,14 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	for _, m := range notifyMembers {
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if err != nil {
-			return nil, err
+			log.Println("Notify peer of deleted member failed (best-effort), get conn pool", m.memberInfo.ServiceAddr, err)
+			continue
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
 		_, err = client.DelMember(context.Background(), delMember)
 		if err != nil {
-			return nil, err
+			log.Println("Notify peer of deleted member failed (best-effort)", m.memberInfo.ServiceAddr, err)
+			continue
 		}
 	}
 

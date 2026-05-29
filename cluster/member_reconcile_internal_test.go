@@ -435,6 +435,45 @@ func TestRegisterClearsRemovedMemberTombstoneForSameAddress(t *testing.T) {
 	}
 }
 
+func TestUnregisterKeepsStateChangeWhenPeerNotificationsFail(t *testing.T) {
+	removed := mkMemberInfo("user-service", "user:8085", "UserService")
+	peerA := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
+	peerB := mkMemberInfo("chat-service", "chat:8090", "ChatService")
+	h := NewHandler(nil, nil)
+	h.addRemoteService(removed)
+	c := &cluster{
+		currentNode:       &Node{ServiceAddr: "master:8085", handler: h},
+		rpcClient:         &rpcClient{isClosed: true, pools: map[string]*connPool{}},
+		membershipVersion: 4,
+		membershipEpoch:   10,
+		members: []*Member{
+			{memberInfo: removed, membershipVersion: 4, membershipEpoch: 10},
+			{memberInfo: peerA, membershipVersion: 4, membershipEpoch: 10},
+			{memberInfo: peerB, membershipVersion: 4, membershipEpoch: 10},
+		},
+	}
+
+	resp, err := c.Unregister(context.Background(), &clusterpb.UnregisterRequest{ServiceAddr: removed.ServiceAddr})
+	if err != nil {
+		t.Fatalf("Unregister returned notification error after mutating master state: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Unregister response is nil")
+	}
+	if countMemberAddr(c, removed.ServiceAddr) != 0 {
+		t.Fatalf("removed member %s still exists", removed.ServiceAddr)
+	}
+	if c.removedMembers[removed.ServiceAddr] != 5 {
+		t.Fatalf("removed member tombstone version = %d, want 5", c.removedMembers[removed.ServiceAddr])
+	}
+	if members := h.findMembers("UserService"); len(members) != 0 {
+		t.Fatalf("removed member route still exists locally: %v", members)
+	}
+	if countMemberAddr(c, peerA.ServiceAddr) != 1 || countMemberAddr(c, peerB.ServiceAddr) != 1 {
+		t.Fatalf("unrelated peers were changed: peerA=%d peerB=%d", countMemberAddr(c, peerA.ServiceAddr), countMemberAddr(c, peerB.ServiceAddr))
+	}
+}
+
 func TestNewMemberRefreshesExistingRemoteServiceRoutes(t *testing.T) {
 	oldInfo := mkMemberInfo("user-service", "user:8085", "UserService")
 	newInfo := mkMemberInfo("user-service", "user:8085", "UserServiceV2")
