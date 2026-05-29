@@ -650,7 +650,7 @@ func (n *Node) initNode() error {
 			resp, err := client.Register(context.Background(), request)
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
-				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion())
+				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion(), resp.GetMembershipEpoch())
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
@@ -878,7 +878,7 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
-	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion()) {
+	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
 		n.handler.delMember(req.MemberInfo.GetServiceAddr())
 		n.handler.addRemoteService(req.MemberInfo)
 	}
@@ -887,7 +887,7 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 
 func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*clusterpb.DelMemberResponse, error) {
 	log.Println("[Node] DelMember member", req.String())
-	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion()) {
+	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
 		n.handler.delMember(req.ServiceAddr)
 	}
 	return &clusterpb.DelMemberResponse{}, nil
@@ -955,16 +955,20 @@ func (n *Node) keepalive() {
 		// Self-heal any NewMember push missed during churn: the master
 		// returns its authoritative member list, so a member that registered after
 		// our initial sync is re-learned here instead of staying invisible. Member
-		// removal remains with DelMember/heartbeat-timeout so an incomplete master
-		// view cannot prune live peers. Updated members must refresh existing routes
-		// so services no longer advertised by that member are removed.
-		added, updated := n.cluster.reconcileMembers(resp.GetMembers(), resp.GetMembershipVersion())
+		// removal self-heals through explicit tombstones so an incomplete master
+		// view cannot prune live peers just because they are absent. Updated
+		// members must refresh existing routes so services no longer advertised
+		// by that member are removed.
+		added, updated, removed := n.cluster.reconcileMembers(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch())
 		for _, info := range updated {
 			n.handler.delMember(info.ServiceAddr)
 			n.handler.addRemoteService(info)
 		}
 		for _, info := range added {
 			n.handler.addRemoteService(info)
+		}
+		for _, addr := range removed {
+			n.handler.delMember(addr)
 		}
 	}
 	go func() {

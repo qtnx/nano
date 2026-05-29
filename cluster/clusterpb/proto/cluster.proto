@@ -13,6 +13,7 @@ message RegisterRequest { MemberInfo memberInfo = 1; }
 message RegisterResponse {
   repeated MemberInfo members = 1;
   uint64 membershipVersion = 2;
+  uint64 membershipEpoch = 3;
 }
 
 message UnregisterRequest { string serviceAddr = 1; }
@@ -23,6 +24,13 @@ message HeartbeatRequest { MemberInfo memberInfo = 1; }
 
 message HeartbeatResponse {
   repeated MemberInfo members = 1;
+  uint64 membershipVersion = 2;
+  uint64 membershipEpoch = 3;
+  repeated RemovedMember removedMembers = 4;
+}
+
+message RemovedMember {
+  string serviceAddr = 1;
   uint64 membershipVersion = 2;
 }
 
@@ -72,6 +80,7 @@ message MemberHandleResponse {}
 message NewMemberRequest {
   MemberInfo memberInfo = 1;
   uint64 membershipVersion = 2;
+  uint64 membershipEpoch = 3;
 }
 
 message NewMemberResponse {}
@@ -79,6 +88,7 @@ message NewMemberResponse {}
 message DelMemberRequest {
   string serviceAddr = 1;
   uint64 membershipVersion = 2;
+  uint64 membershipEpoch = 3;
 }
 
 message DelMemberResponse {}

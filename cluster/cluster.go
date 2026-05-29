@@ -41,15 +41,26 @@ type cluster struct {
 
 	mu                sync.RWMutex
 	members           []*Member
+	removedMembers    map[string]uint64
+	membershipEpoch   uint64
 	membershipVersion uint64
 }
 
 func newCluster(currentNode *Node) *cluster {
 	c := &cluster{currentNode: currentNode}
 	if currentNode.IsMaster {
+		c.membershipEpoch = newMembershipEpoch()
 		c.checkMemberHeartbeat()
 	}
 	return c
+}
+
+func newMembershipEpoch() uint64 {
+	epoch := uint64(time.Now().UnixNano())
+	if epoch == 0 {
+		return 1
+	}
+	return epoch
 }
 
 // Register implements the MasterServer gRPC service
@@ -80,12 +91,21 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		}
 	}
 	c.membershipVersion++
+	c.clearRemovedMemberLocked(req.MemberInfo.ServiceAddr)
+	membershipEpoch := c.ensureMembershipEpochLocked()
 	resp.MembershipVersion = c.membershipVersion
-	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
+	resp.MembershipEpoch = membershipEpoch
+	c.members = append(c.members, &Member{
+		isMaster:          false,
+		memberInfo:        req.MemberInfo,
+		lastHeartbeatAt:   time.Now(),
+		membershipEpoch:   membershipEpoch,
+		membershipVersion: c.membershipVersion,
+	})
 	c.mu.Unlock()
 
 	// Notify registered node to update remote services
-	newMember := &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo, MembershipVersion: resp.MembershipVersion}
+	newMember := &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo, MembershipVersion: resp.MembershipVersion, MembershipEpoch: resp.MembershipEpoch}
 	for _, m := range notifyMembers {
 		// Best-effort notification: a peer that is briefly unreachable during
 		// churn must NOT abort the registration (which would also skip notifying
@@ -149,7 +169,9 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 		notifyMembers = append(notifyMembers, m)
 	}
 	c.membershipVersion++
+	membershipEpoch := c.ensureMembershipEpochLocked()
 	version = c.membershipVersion
+	c.rememberRemovedMemberLocked(req.ServiceAddr, version)
 	if index >= len(c.members)-1 {
 		c.members = c.members[:index]
 	} else {
@@ -159,7 +181,7 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	c.currentNode.handler.delMember(req.ServiceAddr)
 
 	// Notify registered node to update remote services
-	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr, MembershipVersion: version}
+	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr, MembershipVersion: version, MembershipEpoch: membershipEpoch}
 	for _, m := range notifyMembers {
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if err != nil {
@@ -197,6 +219,7 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 
 	var addedMember *clusterpb.MemberInfo
 	c.mu.Lock()
+	membershipEpoch := c.ensureMembershipEpochLocked()
 
 	isHit := false
 	for i, m := range c.members {
@@ -212,9 +235,12 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 			isMaster:        false,
 			memberInfo:      req.GetMemberInfo(),
 			lastHeartbeatAt: time.Now(),
+			membershipEpoch: membershipEpoch,
 		}
 		c.members = append(c.members, m)
 		c.membershipVersion++
+		m.membershipVersion = c.membershipVersion
+		c.clearRemovedMemberLocked(req.GetMemberInfo().GetServiceAddr())
 		addedMember = req.MemberInfo
 		log.Println("Heartbeat peer register to cluster", req.MemberInfo.ServiceAddr)
 	}
@@ -222,9 +248,15 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	// Return the authoritative member list so the requesting node can reconcile
 	// any NewMember push it missed during churn (see reconcileMembers).
 	// Mirrors RegisterResponse: include every member, master included.
-	resp := &clusterpb.HeartbeatResponse{MembershipVersion: c.membershipVersion}
+	resp := &clusterpb.HeartbeatResponse{MembershipVersion: c.membershipVersion, MembershipEpoch: membershipEpoch}
 	for _, m := range c.members {
 		resp.Members = append(resp.Members, m.MemberInfo())
+	}
+	for addr, version := range c.removedMembers {
+		resp.RemovedMembers = append(resp.RemovedMembers, &clusterpb.RemovedMember{
+			ServiceAddr:       addr,
+			MembershipVersion: version,
+		})
 	}
 	c.mu.Unlock()
 
@@ -334,60 +366,68 @@ func (c *cluster) remoteAddrs() []string {
 	return addrs
 }
 
-func (c *cluster) initMembers(members []*clusterpb.MemberInfo, membershipVersion uint64) {
+func (c *cluster) initMembers(members []*clusterpb.MemberInfo, membershipVersion, membershipEpoch uint64) {
 	c.mu.Lock()
-	c.observeMembershipVersionLocked(membershipVersion)
+	c.acceptMembershipStateLocked(membershipVersion, membershipEpoch)
 	for _, info := range members {
 		c.members = append(c.members, &Member{
-			memberInfo: info,
+			memberInfo:        info,
+			membershipEpoch:   c.membershipEpoch,
+			membershipVersion: c.membershipVersion,
 		})
 	}
 	c.mu.Unlock()
 }
 
-func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion uint64) bool {
+func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membershipEpoch uint64) bool {
 	if info == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.isStaleMembershipVersionLocked(membershipVersion) {
+	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
 		return false
 	}
-	c.observeMembershipVersionLocked(membershipVersion)
+	c.clearRemovedMemberLocked(info.GetServiceAddr())
 	var found bool
 	for _, member := range c.members {
 		if member.memberInfo.ServiceAddr == info.ServiceAddr {
 			member.memberInfo = info
+			member.membershipEpoch = c.membershipEpoch
+			member.membershipVersion = c.membershipVersion
 			found = true
 			break
 		}
 	}
 	if !found {
 		c.members = append(c.members, &Member{
-			memberInfo: info,
+			memberInfo:        info,
+			membershipEpoch:   c.membershipEpoch,
+			membershipVersion: c.membershipVersion,
 		})
 	}
 	return true
 }
 
-// reconcileMembers adds or updates any members reported by the master (e.g. in
-// a heartbeat response), and returns the members that need remote-service route
-// refreshes. Newly added members can be registered directly; updated members
-// must replace existing remote-service routes because addRemoteService cannot
-// remove routes for services the member no longer advertises.
+// reconcileMembers adds or updates any live members reported by the master
+// (e.g. in a heartbeat response), applies explicit removal tombstones, and
+// returns the remote-service route changes needed by the caller. Newly added
+// members can be registered directly; updated members must replace existing
+// remote-service routes because addRemoteService cannot remove routes for
+// services the member no longer advertises.
 //
-// It intentionally never removes members: removal stays with the heartbeat-timeout
-// / DelMember path. Pruning here would let a transient or
-// incomplete master view (for example right after a master restart, before every
-// member has re-heartbeated) drop a live peer and break routing.
+// It intentionally never removes members only because they are absent from the
+// live list: pruning here would let a transient or incomplete master view (for
+// example right after a master restart, before every member has re-heartbeated)
+// drop a live peer and break routing. Removals self-heal via explicit
+// RemovedMember tombstones, which are ordered by membership version/epoch.
 //
 // This is what lets a node self-heal a missed NewMember push: pingNodes and route
 // resolution only see c.members, so a member that registered after this node's
 // initial sync would otherwise stay invisible until a process restart.
-func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, membershipVersion uint64) (added, updated []*clusterpb.MemberInfo) {
-	if len(infos) == 0 && membershipVersion == 0 {
-		return nil, nil
+func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch uint64) (added, updated []*clusterpb.MemberInfo, removed []string) {
+	if len(infos) == 0 && len(removedInfos) == 0 && membershipVersion == 0 && membershipEpoch == 0 {
+		return nil, nil, nil
 	}
 	var selfAddr string
 	if c.currentNode != nil {
@@ -396,10 +436,9 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, membershipVers
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.isStaleMembershipVersionLocked(membershipVersion) {
-		return nil, nil
+	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
+		return nil, nil, nil
 	}
-	c.observeMembershipVersionLocked(membershipVersion)
 
 	known := make(map[string]*Member, len(c.members))
 	for _, m := range c.members {
@@ -415,16 +454,35 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, membershipVers
 		if member, ok := known[info.ServiceAddr]; ok {
 			if !memberInfoEqual(member.memberInfo, info) {
 				member.memberInfo = info
+				member.membershipEpoch = c.membershipEpoch
+				member.membershipVersion = c.membershipVersion
 				updated = append(updated, info)
+			} else {
+				member.membershipEpoch = c.membershipEpoch
+				member.membershipVersion = c.membershipVersion
 			}
 			continue
 		}
-		member := &Member{memberInfo: info}
+		member := &Member{memberInfo: info, membershipEpoch: c.membershipEpoch, membershipVersion: c.membershipVersion}
 		c.members = append(c.members, member)
 		known[info.ServiceAddr] = member
 		added = append(added, info)
 	}
-	return added, updated
+
+	for _, info := range removedInfos {
+		if info == nil || info.GetServiceAddr() == "" || info.GetServiceAddr() == selfAddr {
+			continue
+		}
+		member, ok := known[info.GetServiceAddr()]
+		if ok && member.membershipEpoch == c.membershipEpoch && member.membershipVersion > info.GetMembershipVersion() {
+			continue
+		}
+		if c.delMemberLocked(info.GetServiceAddr()) {
+			delete(known, info.GetServiceAddr())
+			removed = append(removed, info.GetServiceAddr())
+		}
+	}
+	return added, updated, removed
 }
 
 func memberInfoEqual(a, b *clusterpb.MemberInfo) bool {
@@ -447,13 +505,16 @@ func memberInfoEqual(a, b *clusterpb.MemberInfo) bool {
 	return true
 }
 
-func (c *cluster) delMember(addr string, membershipVersion uint64) bool {
+func (c *cluster) delMember(addr string, membershipVersion, membershipEpoch uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.isStaleMembershipVersionLocked(membershipVersion) {
+	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
 		return false
 	}
-	c.observeMembershipVersionLocked(membershipVersion)
+	return c.delMemberLocked(addr)
+}
+
+func (c *cluster) delMemberLocked(addr string) bool {
 	var index = -1
 	for i, member := range c.members {
 		if member.memberInfo.ServiceAddr == addr {
@@ -471,12 +532,50 @@ func (c *cluster) delMember(addr string, membershipVersion uint64) bool {
 	return true
 }
 
-func (c *cluster) isStaleMembershipVersionLocked(membershipVersion uint64) bool {
-	return membershipVersion > 0 && membershipVersion < c.membershipVersion
+func (c *cluster) ensureMembershipEpochLocked() uint64 {
+	if c.membershipEpoch == 0 {
+		c.membershipEpoch = newMembershipEpoch()
+	}
+	return c.membershipEpoch
 }
 
-func (c *cluster) observeMembershipVersionLocked(membershipVersion uint64) {
+func (c *cluster) acceptMembershipStateLocked(membershipVersion, membershipEpoch uint64) bool {
+	if membershipEpoch > 0 {
+		if c.membershipEpoch > 0 {
+			if membershipEpoch < c.membershipEpoch {
+				return false
+			}
+			if membershipEpoch > c.membershipEpoch {
+				c.membershipEpoch = membershipEpoch
+				c.membershipVersion = 0
+			}
+		} else {
+			c.membershipEpoch = membershipEpoch
+			c.membershipVersion = 0
+		}
+	}
+	if membershipVersion > 0 && membershipVersion < c.membershipVersion {
+		return false
+	}
 	if membershipVersion > c.membershipVersion {
 		c.membershipVersion = membershipVersion
 	}
+	return true
+}
+
+func (c *cluster) rememberRemovedMemberLocked(addr string, membershipVersion uint64) {
+	if addr == "" {
+		return
+	}
+	if c.removedMembers == nil {
+		c.removedMembers = make(map[string]uint64)
+	}
+	c.removedMembers[addr] = membershipVersion
+}
+
+func (c *cluster) clearRemovedMemberLocked(addr string) {
+	if c.removedMembers == nil || addr == "" {
+		return
+	}
+	delete(c.removedMembers, addr)
 }

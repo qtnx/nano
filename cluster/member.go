@@ -28,9 +28,11 @@ import (
 )
 
 type Member struct {
-	isMaster        bool
-	memberInfo      *clusterpb.MemberInfo
-	lastHeartbeatAt time.Time // cluster member report heartbeat time to the master
+	isMaster          bool
+	memberInfo        *clusterpb.MemberInfo
+	lastHeartbeatAt   time.Time // cluster member report heartbeat time to the master
+	membershipEpoch   uint64
+	membershipVersion uint64
 }
 
 func (m *Member) MemberInfo() *clusterpb.MemberInfo {
