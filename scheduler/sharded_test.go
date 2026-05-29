@@ -241,3 +241,26 @@ func TestPanicInTaskIsRecovered(t *testing.T) {
 		t.Fatal("shard worker did not survive a panicking task")
 	}
 }
+
+// Fix verification: DisableSharded (stopSharded) must run every accepted task —
+// workers drain on teardown and a final sweep catches buffered tasks — so no
+// accepted task is lost when sharding is turned off.
+func TestDisableShardedRunsAllAcceptedTasks(t *testing.T) {
+	EnableSharded(4)
+	var ran int64
+	const n = 200
+	accepted := 0
+	for i := 0; i < n; i++ {
+		if err := PushTaskOnShard(uint64(i), func() { atomic.AddInt64(&ran, 1) }); err == nil {
+			accepted++
+		}
+	}
+	// stopSharded drains workers + sweeps buffers synchronously before returning.
+	DisableSharded()
+	if got := int(atomic.LoadInt64(&ran)); got != accepted {
+		t.Fatalf("DisableSharded lost tasks: ran %d of %d accepted", got, accepted)
+	}
+	if Sharded() {
+		t.Fatal("sharding should be disabled after DisableSharded")
+	}
+}

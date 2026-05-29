@@ -37,21 +37,20 @@ import (
 // drops a task: a full queue is always surfaced as this error.
 var ErrSchedulerBacklog = errors.New("nano/scheduler: task queue backlog full")
 
-// shardSet is an immutable snapshot of the active shard workers. It is
-// published atomically by EnableSharded and read lock-free on the dispatch hot
-// path, so PushTaskOnShard never has to take a mutex per task.
+// shardSet is an immutable snapshot of the active shard workers. It is published
+// atomically by EnableSharded and read lock-free on the dispatch hot path, so
+// PushTaskOnShard never has to take a mutex per task. The teardown signal `die`
+// travels inside the set so every reader sees a consistent (chans, die)
+// snapshot and can never observe a shard channel without its matching die.
 type shardSet struct {
-	chans []chan Task // one bounded task channel per shard
+	chans []chan Task   // one bounded task channel per shard
+	die   chan struct{} // closed by stopSharded to drain and stop this set's workers
 }
 
 var (
 	// shards holds the active shardSet, or nil when running in the default
 	// single-scheduler mode. Sharding is opt-in via EnableSharded.
 	shards atomic.Pointer[shardSet]
-
-	// shardDie signals shard workers to drain and exit. It is recreated by each
-	// EnableSharded and closed by stopSharded.
-	shardDie chan struct{}
 
 	// shardWG tracks the shard worker goroutines so stopSharded can guarantee
 	// none outlive teardown (no goroutine leaks on shutdown or between tests).
@@ -70,19 +69,22 @@ var (
 //
 // n <= 0 is a no-op and leaves the default single-scheduler path active.
 // EnableSharded is idempotent: once sharding is enabled, further calls are
-// ignored. It is intended to be called once at startup.
+// ignored. It MUST be called once at startup (the framework does so in
+// Node.Startup, before nano.Listen starts the dispatcher); enabling it after
+// work has been queued cannot guarantee per-session ordering across the
+// legacy->shard cutover.
 func EnableSharded(n int) {
 	if n <= 0 {
 		return // stay single-scheduler
 	}
 
-	// Per-session ordering only holds across the legacy→shard cutover when no
-	// work was enqueued before sharding was turned on. The framework enables
-	// sharding in Node.Startup, before nano.Listen starts the dispatcher, so the
-	// normal path is safe; warn if a caller flips it on after the fact.
+	// Per-session ordering only holds across the cutover when no work was
+	// enqueued before sharding was turned on. Warn on misuse rather than
+	// silently degrading the ordering guarantee.
 	if atomic.LoadInt32(&started) != 0 {
 		log.Println("[Nano] EnableSharded called after the scheduler started; enable sharding before nano.Listen to preserve per-session ordering")
 	}
+
 	shardMu.Lock()
 	defer shardMu.Unlock()
 
@@ -91,7 +93,7 @@ func EnableSharded(n int) {
 	}
 
 	die := make(chan struct{})
-	set := &shardSet{chans: make([]chan Task, n)}
+	set := &shardSet{chans: make([]chan Task, n), die: die}
 	for i := 0; i < n; i++ {
 		// Size each shard channel like the existing single task backlog.
 		ch := make(chan Task, cap(chTasks))
@@ -100,9 +102,8 @@ func EnableSharded(n int) {
 		go shardWorker(ch, die)
 	}
 
-	// Publish shardDie before the shard set so any observer that sees sharding
-	// active also sees the matching die channel.
-	shardDie = die
+	// Publish the fully-built set last; its die channel is part of the snapshot,
+	// so any observer that sees sharding active also sees the matching die.
 	shards.Store(set)
 }
 
@@ -111,11 +112,26 @@ func Sharded() bool {
 	return shards.Load() != nil
 }
 
+// drainChan runs every task currently buffered in ch (non-blocking) and returns
+// once the channel is empty. Used both by a worker shutting down and by the
+// final teardown sweep so accepted-but-unstarted tasks are never lost.
+func drainChan(ch chan Task) {
+	for {
+		select {
+		case task := <-ch:
+			try(task)
+		default:
+			return
+		}
+	}
+}
+
 // shardWorker is the per-shard actor loop. Because a given key always maps to
 // the same shard, a single goroutine drains each shard channel in FIFO order,
 // which is what preserves per-key (per-session) task ordering. Each task runs
 // under try() so a panicking task is recovered and cannot take down the worker
-// or the process. It exits when the shard set is torn down (die).
+// or the process. On teardown (die) it drains any already-queued tasks before
+// exiting so accepted work is not silently dropped.
 func shardWorker(ch chan Task, die chan struct{}) {
 	defer shardWG.Done()
 	for {
@@ -123,6 +139,7 @@ func shardWorker(ch chan Task, die chan struct{}) {
 		case task := <-ch:
 			try(task)
 		case <-die:
+			drainChan(ch)
 			return
 		}
 	}
@@ -132,14 +149,22 @@ func shardWorker(ch chan Task, die chan struct{}) {
 // always maps to the same shard, guaranteeing per-key ordering; distinct keys
 // may land on different shards and run concurrently.
 //
-// When sharding is not enabled it falls back to the legacy single task channel.
-// Either way the enqueue is non-blocking: if the target queue is full it returns
-// ErrSchedulerBacklog instead of blocking the caller (and never drops the task).
+// When sharding is not enabled (or is being torn down) it falls back to the
+// legacy single task channel. Either way the enqueue is non-blocking: if the
+// target queue is full it returns ErrSchedulerBacklog instead of blocking the
+// caller (and never drops the task).
 func PushTaskOnShard(key uint64, task Task) error {
 	set := shards.Load()
 	if set == nil {
 		// Not sharded: behave like the legacy single path, but non-blocking.
 		return tryPushTask(task)
+	}
+	// If this set is being torn down, route to the single scheduler rather than
+	// a shard whose worker may already be exiting.
+	select {
+	case <-set.die:
+		return tryPushTask(task)
+	default:
 	}
 	// One shard => one goroutine => FIFO for a given key.
 	idx := mix(key) % uint64(len(set.chans))
@@ -148,6 +173,28 @@ func PushTaskOnShard(key uint64, task Task) error {
 		return nil
 	default:
 		return ErrSchedulerBacklog
+	}
+}
+
+// PushTaskOnShardBlocking enqueues task on the SAME shard selected for key,
+// blocking until that shard has capacity. Unlike falling back to the single
+// scheduler, it preserves the shard the key is confined to, so per-key
+// (per-session) FIFO ordering still holds. It is the correct backpressure path
+// for response-expecting work that must not be dropped under overload. If the
+// shard set is torn down while blocked, it falls back to the single scheduler so
+// it can never block forever on a shard with no live worker. When sharding is
+// not enabled it blocks on the single scheduler.
+func PushTaskOnShardBlocking(key uint64, task Task) {
+	set := shards.Load()
+	if set == nil {
+		PushTask(task)
+		return
+	}
+	idx := mix(key) % uint64(len(set.chans))
+	select {
+	case set.chans[idx] <- task:
+	case <-set.die:
+		PushTask(task)
 	}
 }
 
@@ -185,21 +232,30 @@ func mix(key uint64) uint64 {
 
 // stopSharded returns the scheduler to single-scheduler mode and drains every
 // shard worker goroutine. Production code reaches this through Close(); tests
-// call it directly to reset global state and prove no worker goroutine leaks.
+// call it (via DisableSharded) to reset global state and prove no worker
+// goroutine leaks. Accepted tasks are not lost: workers drain on die, and a
+// final sweep runs anything a racing PushTaskOnShard delivered into a buffer
+// after its worker exited.
 func stopSharded() {
 	shardMu.Lock()
 	defer shardMu.Unlock()
 
-	if shards.Load() == nil {
+	set := shards.Load()
+	if set == nil {
 		return
 	}
 
-	// Stop routing to shards first so any in-flight PushTaskOnShard falls back
-	// to the single path while the workers drain.
+	// Stop routing to shards first so any new PushTaskOnShard falls back to the
+	// single path, then signal workers to drain their queues and exit.
 	shards.Store(nil)
-	close(shardDie)
+	close(set.die)
 	shardWG.Wait()
-	shardDie = nil
+
+	// Final sweep: run any task delivered into a shard buffer in the small
+	// window between a worker's drain and its exit, so no accepted task is lost.
+	for _, ch := range set.chans {
+		drainChan(ch)
+	}
 }
 
 // DisableSharded returns the scheduler to single-scheduler mode, draining all

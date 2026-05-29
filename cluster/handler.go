@@ -839,10 +839,10 @@ func (h *LocalHandler) localProcess(
 		if err := scheduler.PushTaskOnShard(uint64(session.ID()), task); err == scheduler.ErrSchedulerBacklog {
 			if msg.Type == message.Request {
 				// Never silently drop a Request: the client waits for a response
-				// and would otherwise hang until timeout. Fall back to the
-				// blocking enqueue so it still runs (backpressure under overload)
-				// rather than being lost (H1).
-				scheduler.PushTask(task)
+				// and would otherwise hang until timeout. Block on the SAME shard
+				// (preserving per-session FIFO) until it drains — backpressure
+				// under overload instead of losing the task (H1).
+				scheduler.PushTaskOnShardBlocking(uint64(session.ID()), task)
 			} else {
 				log.Errorf("nano/handler: scheduler shard backlog full, dropping %s task route=%s sid=%d", msg.Type, msg.Route, session.ID())
 			}
