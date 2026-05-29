@@ -98,3 +98,50 @@ func BenchmarkDecoder_Decode(b *testing.B) {
 		}
 	}
 }
+
+// TestEncodeMaxPacketSize covers M1: Encode must reject payloads larger than
+// MaxPacketSize instead of silently allocating and wrapping the 3-byte length.
+func TestEncodeMaxPacketSize(t *testing.T) {
+	if _, err := Encode(Data, make([]byte, MaxPacketSize+1)); err != ErrPacketSizeExcced {
+		t.Fatalf("expected ErrPacketSizeExcced for oversized payload, got %v", err)
+	}
+
+	// A payload at exactly MaxPacketSize must still encode (boundary is inclusive,
+	// matching the decoder's `size > MaxPacketSize` check).
+	if _, err := Encode(Data, make([]byte, MaxPacketSize)); err != nil {
+		t.Fatalf("encode at MaxPacketSize boundary should succeed, got %v", err)
+	}
+}
+
+// TestDecoderResetAfterError covers L8: after a forward() error the decoder must
+// not retain stale frame state (oversized size / consumed header), so a reused
+// decoder can still parse a subsequent valid packet.
+func TestDecoderResetAfterError(t *testing.T) {
+	d := NewDecoder()
+
+	// Hand-craft an oversized frame header (valid type, length > MaxPacketSize).
+	oversize := make([]byte, HeadLength)
+	oversize[0] = byte(Data)
+	copy(oversize[1:], intToBytes(MaxPacketSize+1))
+	if _, err := d.Decode(oversize); err != ErrPacketSizeExcced {
+		t.Fatalf("expected ErrPacketSizeExcced, got %v", err)
+	}
+
+	// The same decoder must recover and decode a fresh, valid packet.
+	data := []byte("hello world")
+	valid, err := Encode(Kick, data)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	packets, err := d.Decode(valid)
+	if err != nil {
+		t.Fatalf("unexpected error decoding after recovery: %v", err)
+	}
+	if len(packets) != 1 {
+		t.Fatalf("expected 1 packet after decoder recovery, got %d", len(packets))
+	}
+	want := &Packet{Type: Type(Kick), Length: len(data), Data: data}
+	if !reflect.DeepEqual(want, packets[0]) {
+		t.Fatalf("expect: %v, got: %v", want, packets[0])
+	}
+}

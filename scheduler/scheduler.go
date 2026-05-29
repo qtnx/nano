@@ -114,7 +114,10 @@ func Sched() {
 	for {
 		select {
 		case <-ticker.C:
-			cron()
+			// Wrap cron in the same recover() boundary used for tasks. The
+			// scheduler runs in a single goroutine (`go scheduler.Sched()`), so
+			// an unrecovered panic here would crash the whole process.
+			try(cron)
 
 		case f := <-chTasks:
 			try(f)
@@ -139,6 +142,6 @@ func PushTask(task Task) {
 	chTasks <- task
 	metrics.SchedulePendingTasks.Set(float64(len(chTasks)))
 	if env.Debug {
-		log.Println("Scheduler push task channel size %d", len(chTasks))
+		log.Infof("Scheduler push task channel size %d", len(chTasks))
 	}
 }

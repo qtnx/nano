@@ -1,5 +1,7 @@
 package session
 
+import "sync"
+
 type (
 	// LifetimeHandler represents a callback
 	// that will be called when a session close or
@@ -7,6 +9,7 @@ type (
 	LifetimeHandler func(*Session)
 
 	lifetime struct {
+		mu sync.RWMutex
 		// callbacks that emitted on session closed
 		onClosed []LifetimeHandler
 	}
@@ -17,15 +20,22 @@ var Lifetime = &lifetime{}
 // OnClosed set the Callback which will be called
 // when session is closed Waring: session has closed.
 func (lt *lifetime) OnClosed(h LifetimeHandler) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
 	lt.onClosed = append(lt.onClosed, h)
 }
 
 func (lt *lifetime) Close(s *Session) {
+	lt.mu.RLock()
 	if len(lt.onClosed) < 1 {
+		lt.mu.RUnlock()
 		return
 	}
+	handlers := make([]LifetimeHandler, len(lt.onClosed))
+	copy(handlers, lt.onClosed)
+	lt.mu.RUnlock()
 
-	for _, h := range lt.onClosed {
+	for _, h := range handlers {
 		h(s)
 	}
 }

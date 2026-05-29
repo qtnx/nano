@@ -20,21 +20,32 @@
 
 package component
 
+import "sync"
+
 type CompWithOptions struct {
 	Comp Component
 	Opts []Option
 }
 
 type Components struct {
+	mu    sync.RWMutex
 	comps []CompWithOptions
 }
 
 // Register registers a component to hub with options
 func (cs *Components) Register(c Component, options ...Option) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	cs.comps = append(cs.comps, CompWithOptions{c, options})
 }
 
-// List returns all components with it's options
+// List returns all components with it's options. It returns a copy of the
+// backing slice so callers may iterate while Register runs concurrently and
+// cannot mutate the hub's internal state through the returned slice.
 func (cs *Components) List() []CompWithOptions {
-	return cs.comps
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	out := make([]CompWithOptions, len(cs.comps))
+	copy(out, cs.comps)
+	return out
 }

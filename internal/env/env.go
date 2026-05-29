@@ -24,6 +24,7 @@ package env
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/lonng/nano/session"
@@ -55,11 +56,45 @@ var (
 )
 
 func init() {
-	Die = make(chan bool)
+	resetDie()
 	Heartbeat = 30 * time.Second
 	Debug = false
 	CheckOrigin = func(_ *http.Request) bool { return true }
 	HandshakeValidator = func(s *session.Session, _ []byte) error { return nil }
 	MiddlewareHttp = func(s *session.Session, ctx *http.Request) error { return nil }
 	Serializer = protobuf.NewSerializer()
+}
+
+// dieMu guards Die so that closing it is idempotent and a new Listen run can
+// recreate it without racing or panicking on a double close.
+var (
+	dieMu     sync.Mutex
+	dieClosed bool
+)
+
+// resetDie creates a fresh, open shutdown channel. Not safe for concurrent use;
+// callers must hold dieMu (init runs before any goroutine exists).
+func resetDie() {
+	Die = make(chan bool)
+	dieClosed = false
+}
+
+// ResetDie recreates the shutdown channel so an in-process restart (a new
+// Listen) starts with a fresh, open channel instead of an already-closed one.
+func ResetDie() {
+	dieMu.Lock()
+	defer dieMu.Unlock()
+	resetDie()
+}
+
+// CloseDie closes the shutdown channel at most once, so repeated Shutdown calls
+// do not panic on a closed channel.
+func CloseDie() {
+	dieMu.Lock()
+	defer dieMu.Unlock()
+	if dieClosed {
+		return
+	}
+	close(Die)
+	dieClosed = true
 }

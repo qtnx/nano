@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/lonng/nano/internal/log"
 )
@@ -59,8 +60,9 @@ func (t Type) String() string {
 }
 
 var (
-	routes = make(map[string]uint16) // route map to code
-	codes  = make(map[uint16]string) // code map to route
+	routesMu sync.RWMutex              // guards routes and codes
+	routes   = make(map[string]uint16) // route map to code
+	codes    = make(map[uint16]string) // code map to route
 )
 
 // Errors that could be occurred in message codec
@@ -69,6 +71,7 @@ var (
 	ErrInvalidMessage    = errors.New("invalid message")
 	ErrRouteInfoNotFound = errors.New("route info not found in dictionary")
 	ErrWrongMessage      = errors.New("wrong message")
+	ErrRouteTooLong      = errors.New("route length exceeds 255 bytes")
 )
 
 // Message represents a unmarshaled message or a message which to be marshaled
@@ -122,10 +125,20 @@ func Encode(m *Message) ([]byte, error) {
 		return nil, ErrWrongMessageType
 	}
 
-	buf := make([]byte, 0)
+	routesMu.RLock()
+	code, compressed := routes[m.Route]
+	routesMu.RUnlock()
+
+	if routable(m.Type) && !compressed && len(m.Route) > msgRouteLengthMask {
+		return nil, ErrRouteTooLong
+	}
+
+	// Preallocate a single buffer big enough for header and payload to avoid
+	// repeated grow-and-copy: flag(1) + id varint(<=10) +
+	// route(<=2 when compressed, otherwise 1+len(route)) + data.
+	buf := make([]byte, 0, 1+10+2+len(m.Route)+len(m.Data))
 	flag := byte(m.Type) << 1
 
-	code, compressed := routes[m.Route]
 	if compressed {
 		flag |= msgRouteCompressMask
 	}
@@ -152,7 +165,7 @@ func Encode(m *Message) ([]byte, error) {
 			buf = append(buf, byte(code&0xFF))
 		} else {
 			buf = append(buf, byte(len(m.Route)))
-			buf = append(buf, []byte(m.Route)...)
+			buf = append(buf, m.Route...)
 		}
 	}
 
@@ -177,16 +190,29 @@ func Decode(data []byte) (*Message, error) {
 
 	if m.Type == Request || m.Type == Response {
 		id := uint64(0)
+		terminated := false
 		// little end byte order
 		// WARNING: must can be stored in 64 bits integer
 		// variant length encode
 		for i := offset; i < len(data); i++ {
 			b := data[i]
-			id += uint64(b&0x7F) << uint64(7*(i-offset))
+			n := i - offset
+			// A uint64 varint is at most 10 bytes; reject anything longer to
+			// avoid silent wraparound.
+			if n >= 10 {
+				return nil, ErrWrongMessage
+			}
+			id += uint64(b&0x7F) << uint64(7*n)
 			if b < 128 {
 				offset = i + 1
+				terminated = true
 				break
 			}
+		}
+		// A varint with no terminating byte leaves offset unchanged and would
+		// cause the remaining bytes to be misparsed as route/data.
+		if !terminated {
+			return nil, ErrWrongMessage
 		}
 		m.ID = id
 	}
@@ -197,9 +223,15 @@ func Decode(data []byte) (*Message, error) {
 
 	if routable(m.Type) {
 		if flag&msgRouteCompressMask == 1 {
+			// Need two bytes for the compressed route code.
+			if offset+2 > len(data) {
+				return nil, ErrWrongMessage
+			}
 			m.compressed = true
 			code := binary.BigEndian.Uint16(data[offset:(offset + 2)])
+			routesMu.RLock()
 			route, ok := codes[code]
+			routesMu.RUnlock()
 			if !ok {
 				return nil, ErrRouteInfoNotFound
 			}
@@ -227,6 +259,8 @@ func Decode(data []byte) (*Message, error) {
 // SetDictionary set routes map which be used to compress route.
 // TODO(warning): set dictionary in runtime would be a dangerous operation!!!!!!
 func SetDictionary(dict map[string]uint16) {
+	routesMu.Lock()
+	defer routesMu.Unlock()
 	for route, code := range dict {
 		r := strings.TrimSpace(route)
 
@@ -246,8 +280,16 @@ func SetDictionary(dict map[string]uint16) {
 }
 
 func GetDictionary() (map[string]uint16, bool) {
+	routesMu.RLock()
+	defer routesMu.RUnlock()
 	if len(routes) <= 0 {
 		return nil, false
 	}
-	return routes, true
+	// Return a copy so callers cannot mutate the live maps concurrently with
+	// Encode/Decode reads.
+	cp := make(map[string]uint16, len(routes))
+	for route, code := range routes {
+		cp[route] = code
+	}
+	return cp, true
 }

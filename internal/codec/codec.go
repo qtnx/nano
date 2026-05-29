@@ -53,18 +53,32 @@ func NewDecoder() *Decoder {
 
 func (c *Decoder) forward() error {
 	header := c.buf.Next(HeadLength)
-	c.typ = header[0]
-	log.Debug("forward header: %v, type=%v, size=%v", header, c.typ, c.size)
-	if c.typ < packet.Handshake || c.typ > packet.Kick {
+	typ := header[0]
+	log.Debugf("forward header: %v, type=%v, size=%v", header, typ, c.size)
+	if typ < packet.Handshake || typ > packet.Kick {
 		return packet.ErrWrongPacketType
 	}
-	c.size = bytesToInt(header[1:])
+	size := bytesToInt(header[1:])
 
 	// packet length limitation
-	if c.size > MaxPacketSize {
+	if size > MaxPacketSize {
 		return ErrPacketSizeExcced
 	}
+
+	// Commit the parsed frame only after validation so a failed forward never
+	// leaves stale type/size state behind (see L8).
+	c.typ = typ
+	c.size = size
 	return nil
+}
+
+// reset returns the decoder to its initial, packet-aligned state. A decode
+// error desynchronizes the stream, so buffered bytes are unrecoverable and are
+// dropped; the decoder is then reusable from a clean baseline.
+func (c *Decoder) reset() {
+	c.buf.Reset()
+	c.size = -1
+	c.typ = 0
 }
 
 // Decode decode the network bytes slice to packet.Packet(s)
@@ -84,6 +98,7 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 	// first time
 	if c.size < 0 {
 		if err = c.forward(); err != nil {
+			c.reset()
 			return nil, err
 		}
 	}
@@ -99,6 +114,7 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		}
 
 		if err = c.forward(); err != nil {
+			c.reset()
 			return packets, err
 		}
 	}
@@ -187,6 +203,12 @@ func Encode(typ packet.Type, data []byte) ([]byte, error) {
 		return nil, packet.ErrWrongPacketType
 	}
 
+	// Reject oversized payloads before allocating: the 3-byte length field would
+	// otherwise wrap for payloads > 0xFFFFFF, and large frames must be capped
+	// consistently with the decoder's MaxPacketSize check (see M1).
+	if len(data) > MaxPacketSize {
+		return nil, ErrPacketSizeExcced
+	}
 	p := &packet.Packet{Type: typ, Length: len(data)}
 	buf := make([]byte, p.Length+HeadLength)
 	buf[0] = byte(p.Type)

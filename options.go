@@ -37,7 +37,9 @@ func WithCustomerRemoteServiceRoute(route cluster.CustomerRemoteServiceRoute) Op
 func WithAdvertiseAddr(addr string, retryInterval ...time.Duration) Option {
 	return func(opt *cluster.Options) {
 		opt.AdvertiseAddr = addr
-		if len(retryInterval) > 0 {
+		// Ignore a non-positive retry interval; Listen falls back to the default
+		// (a negative interval would disable register backoff → tight retry storm).
+		if len(retryInterval) > 0 && retryInterval[0] > 0 {
 			opt.RetryInterval = retryInterval[0]
 		}
 	}
@@ -62,13 +64,23 @@ func WithMaster() Option {
 // WithGrpcOptions sets the grpc dial options
 func WithGrpcOptions(opts ...grpc.DialOption) Option {
 	return func(_ *cluster.Options) {
-		env.GrpcOptions = append(env.GrpcOptions, opts...)
+		for _, o := range opts {
+			if o == nil {
+				// A nil dial option would panic on the next cluster dial.
+				continue
+			}
+			env.GrpcOptions = append(env.GrpcOptions, o)
+		}
 	}
 }
 
 // WithComponents sets the Components
 func WithComponents(components *component.Components) Option {
 	return func(opt *cluster.Options) {
+		if components == nil {
+			// Keep the safe default; a nil value would nil-panic during Startup.
+			return
+		}
 		opt.Components = components
 	}
 }
@@ -76,6 +88,10 @@ func WithComponents(components *component.Components) Option {
 // WithHeartbeatInterval sets Heartbeat time interval
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(_ *cluster.Options) {
+		if d <= 0 {
+			// Keep the default; a non-positive interval panics time.NewTicker.
+			return
+		}
 		env.Heartbeat = d
 	}
 }
@@ -83,6 +99,10 @@ func WithHeartbeatInterval(d time.Duration) Option {
 // WithCheckOriginFunc sets the function that check `Origin` in http headers
 func WithCheckOriginFunc(fn func(*http.Request) bool) Option {
 	return func(opt *cluster.Options) {
+		if fn == nil {
+			// Keep the default; a nil checker would nil-call on the first upgrade.
+			return
+		}
 		env.CheckOrigin = fn
 	}
 }
@@ -103,6 +123,13 @@ func WithDictionary(dict map[string]uint16) Option {
 
 func WithWSPath(path string) Option {
 	return func(_ *cluster.Options) {
+		switch path {
+		case "/api", "/sse", "/health":
+			// Reserved by the HTTP listener; accepting it would silently shadow
+			// the WS route and make it unreachable.
+			log.Println("nano: ignoring reserved WithWSPath value: " + path)
+			return
+		}
 		env.WSPath = path
 	}
 }
@@ -123,6 +150,11 @@ func WithTimerPrecision(precision time.Duration) Option {
 // and UnMarshal handler payload
 func WithSerializer(serializer serialize.Serializer) Option {
 	return func(opt *cluster.Options) {
+		if serializer == nil {
+			// Keep the default; a nil serializer would nil-deref on the first
+			// non-raw request.
+			return
+		}
 		env.Serializer = serializer
 	}
 }
@@ -165,6 +197,11 @@ func WithLogger(l log.Logger) Option {
 // WithHandshakeValidator sets the function that Verify `handshake` data
 func WithHandshakeValidator(fn func(*session.Session, []byte) error) Option {
 	return func(opt *cluster.Options) {
+		if fn == nil {
+			// Keep the default; a nil validator would nil-call on the first
+			// handshake.
+			return
+		}
 		env.HandshakeValidator = fn
 	}
 }
