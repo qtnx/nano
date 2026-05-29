@@ -20,13 +20,17 @@ message UnregisterRequest { string serviceAddr = 1; }
 
 message UnregisterResponse {}
 
-message HeartbeatRequest { MemberInfo memberInfo = 1; }
+message HeartbeatRequest {
+  MemberInfo memberInfo = 1;
+  uint64 heartbeatSeq = 2;
+}
 
 message HeartbeatResponse {
   repeated MemberInfo members = 1;
   uint64 membershipVersion = 2;
   uint64 membershipEpoch = 3;
   repeated RemovedMember removedMembers = 4;
+  uint64 heartbeatSeq = 5;
 }
 
 message RemovedMember {

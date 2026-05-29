@@ -941,15 +941,22 @@ func (n *Node) keepalive() {
 			return
 		}
 		masterCli := clusterpb.NewMasterClient(pool.Get())
+		heartbeatSeq := n.cluster.nextMembershipSnapshotSeq()
 		resp, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
 			MemberInfo: &clusterpb.MemberInfo{
 				Label:       n.Label,
 				ServiceAddr: n.ServiceAddr,
 				Services:    n.handler.LocalService(),
 			},
+			HeartbeatSeq: heartbeatSeq,
 		})
 		if err != nil {
 			log.Println("Member send heartbeat error", err)
+			return
+		}
+		snapshotSeq, ok := heartbeatSnapshotSeq(heartbeatSeq, resp.GetHeartbeatSeq())
+		if !ok {
+			log.Infof("Member heartbeat sequence mismatch, sent: %d, received: %d", heartbeatSeq, resp.GetHeartbeatSeq())
 			return
 		}
 		// Self-heal any NewMember push missed during churn: the master
@@ -959,7 +966,7 @@ func (n *Node) keepalive() {
 		// view cannot prune live peers just because they are absent. Updated
 		// members must refresh existing routes so services no longer advertised
 		// by that member are removed.
-		added, updated, removed := n.cluster.reconcileMembers(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch())
+		added, updated, removed := n.cluster.reconcileMembersSnapshot(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch(), snapshotSeq)
 		for _, info := range updated {
 			n.handler.delMember(info.ServiceAddr)
 			n.handler.addRemoteService(info)
@@ -984,4 +991,14 @@ func (n *Node) keepalive() {
 			}
 		}
 	}()
+}
+
+func heartbeatSnapshotSeq(requestSeq, responseSeq uint64) (uint64, bool) {
+	if responseSeq == 0 {
+		return requestSeq, true
+	}
+	if responseSeq != requestSeq {
+		return responseSeq, false
+	}
+	return responseSeq, true
 }

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/lonng/nano/cluster/clusterpb"
 )
@@ -145,6 +146,31 @@ func TestReconcileMembersAcceptsLowerEpochFromRestartedMaster(t *testing.T) {
 	}
 	if c.membershipEpoch != 100 || c.membershipVersion != 1 {
 		t.Fatalf("membership state = epoch %d version %d, want epoch 100 version 1", c.membershipEpoch, c.membershipVersion)
+	}
+}
+
+func TestReconcileMembersSkipsOlderHeartbeatSnapshotAfterNewEpochAccepted(t *testing.T) {
+	newMember := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
+	oldMember := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: newMember, membershipVersion: 1, membershipEpoch: 200}}
+	c.membershipVersion = 1
+	c.membershipEpoch = 200
+	c.membershipSnapshotSeq = 2
+
+	added, updated, removed := c.reconcileMembersSnapshot([]*clusterpb.MemberInfo{oldMember}, nil, 10, 100, 1)
+
+	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("stale heartbeat snapshot changed membership: added=%v updated=%v removed=%v", added, updated, removed)
+	}
+	if c.membershipEpoch != 200 || c.membershipVersion != 1 {
+		t.Fatalf("membership state changed to epoch %d version %d", c.membershipEpoch, c.membershipVersion)
+	}
+	if countMemberAddr(c, oldMember.ServiceAddr) != 0 {
+		t.Fatalf("stale heartbeat snapshot added old member %s", oldMember.ServiceAddr)
+	}
+	if countMemberAddr(c, newMember.ServiceAddr) != 1 {
+		t.Fatalf("current member %s count = %d, want 1", newMember.ServiceAddr, countMemberAddr(c, newMember.ServiceAddr))
 	}
 }
 
@@ -416,8 +442,8 @@ func TestRegisterClearsRemovedMemberTombstoneForSameAddress(t *testing.T) {
 	restarted := mkMemberInfo("user-service", "user:8085", "UserService")
 	c := &cluster{
 		currentNode: &Node{ServiceAddr: "master:8085", handler: NewHandler(nil, nil)},
-		removedMembers: map[string]uint64{
-			restarted.ServiceAddr: 2,
+		removedMembers: map[string]removedMemberTombstone{
+			restarted.ServiceAddr: {membershipVersion: 2, removedAt: time.Now()},
 		},
 		membershipVersion: 2,
 		membershipEpoch:   10,
@@ -463,8 +489,8 @@ func TestUnregisterKeepsStateChangeWhenPeerNotificationsFail(t *testing.T) {
 	if countMemberAddr(c, removed.ServiceAddr) != 0 {
 		t.Fatalf("removed member %s still exists", removed.ServiceAddr)
 	}
-	if c.removedMembers[removed.ServiceAddr] != 5 {
-		t.Fatalf("removed member tombstone version = %d, want 5", c.removedMembers[removed.ServiceAddr])
+	if c.removedMembers[removed.ServiceAddr].membershipVersion != 5 {
+		t.Fatalf("removed member tombstone version = %d, want 5", c.removedMembers[removed.ServiceAddr].membershipVersion)
 	}
 	if members := h.findMembers("UserService"); len(members) != 0 {
 		t.Fatalf("removed member route still exists locally: %v", members)
@@ -539,7 +565,9 @@ func TestHeartbeatResponseIncludesCurrentMembers(t *testing.T) {
 	}
 	c.membershipVersion = 7
 	c.membershipEpoch = 10
-	c.removedMembers = map[string]uint64{"old:8085": 6}
+	c.removedMembers = map[string]removedMemberTombstone{
+		"old:8085": {membershipVersion: 6, removedAt: time.Now()},
+	}
 
 	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{MemberInfo: memberA})
 	if err != nil {
@@ -560,5 +588,55 @@ func TestHeartbeatResponseIncludesCurrentMembers(t *testing.T) {
 	}
 	if len(resp.GetRemovedMembers()) != 1 || resp.GetRemovedMembers()[0].GetServiceAddr() != "old:8085" || resp.GetRemovedMembers()[0].GetMembershipVersion() != 6 {
 		t.Fatalf("Heartbeat response removed members = %v, want old:8085 at version 6", resp.GetRemovedMembers())
+	}
+}
+
+func TestHeartbeatPrunesExpiredRemovedMemberTombstones(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	member := mkMemberInfo("user-service", "user:8085")
+	c.members = []*Member{{memberInfo: member, isMaster: false}}
+	c.membershipVersion = 7
+	c.membershipEpoch = 10
+	c.removedMembers = map[string]removedMemberTombstone{
+		"expired:8085": {membershipVersion: 5, removedAt: time.Now().Add(-removedMemberRetention() - time.Second)},
+		"recent:8085":  {membershipVersion: 6, removedAt: time.Now()},
+	}
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{MemberInfo: member})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if _, ok := c.removedMembers["expired:8085"]; ok {
+		t.Fatal("expired tombstone was not pruned")
+	}
+	if _, ok := c.removedMembers["recent:8085"]; !ok {
+		t.Fatal("recent tombstone was pruned")
+	}
+	if len(resp.GetRemovedMembers()) != 1 || resp.GetRemovedMembers()[0].GetServiceAddr() != "recent:8085" {
+		t.Fatalf("Heartbeat response removed members = %v, want only recent:8085", resp.GetRemovedMembers())
+	}
+}
+
+func TestRememberRemovedMemberPrunesExpiredTombstones(t *testing.T) {
+	c := &cluster{
+		removedMembers: map[string]removedMemberTombstone{
+			"expired:8085": {membershipVersion: 5, removedAt: time.Now().Add(-removedMemberRetention() - time.Second)},
+			"recent:8085":  {membershipVersion: 6, removedAt: time.Now()},
+		},
+	}
+
+	c.rememberRemovedMemberLocked("new:8085", 7)
+
+	if _, ok := c.removedMembers["expired:8085"]; ok {
+		t.Fatal("expired tombstone was not pruned while remembering a new removal")
+	}
+	if _, ok := c.removedMembers["recent:8085"]; !ok {
+		t.Fatal("recent tombstone was pruned while remembering a new removal")
+	}
+	if got := c.removedMembers["new:8085"].membershipVersion; got != 7 {
+		t.Fatalf("new tombstone version = %d, want 7", got)
 	}
 }

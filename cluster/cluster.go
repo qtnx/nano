@@ -41,11 +41,21 @@ type cluster struct {
 	currentNode *Node
 	rpcClient   *rpcClient
 
-	mu                sync.RWMutex
-	members           []*Member
-	removedMembers    map[string]uint64
-	membershipEpoch   uint64
+	mu                    sync.RWMutex
+	members               []*Member
+	removedMembers        map[string]removedMemberTombstone
+	membershipEpoch       uint64
+	membershipVersion     uint64
+	membershipSnapshotSeq uint64
+}
+
+type removedMemberTombstone struct {
 	membershipVersion uint64
+	removedAt         time.Time
+}
+
+func removedMemberRetention() time.Duration {
+	return 4 * env.Heartbeat
 }
 
 func newCluster(currentNode *Node) *cluster {
@@ -259,14 +269,15 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	// Return the authoritative member list so the requesting node can reconcile
 	// any NewMember push it missed during churn (see reconcileMembers).
 	// Mirrors RegisterResponse: include every member, master included.
-	resp := &clusterpb.HeartbeatResponse{MembershipVersion: c.membershipVersion, MembershipEpoch: membershipEpoch}
+	c.pruneRemovedMembersLocked(time.Now())
+	resp := &clusterpb.HeartbeatResponse{MembershipVersion: c.membershipVersion, MembershipEpoch: membershipEpoch, HeartbeatSeq: req.GetHeartbeatSeq()}
 	for _, m := range c.members {
 		resp.Members = append(resp.Members, m.MemberInfo())
 	}
-	for addr, version := range c.removedMembers {
+	for addr, tombstone := range c.removedMembers {
 		resp.RemovedMembers = append(resp.RemovedMembers, &clusterpb.RemovedMember{
 			ServiceAddr:       addr,
-			MembershipVersion: version,
+			MembershipVersion: tombstone.membershipVersion,
 		})
 	}
 	c.mu.Unlock()
@@ -379,7 +390,7 @@ func (c *cluster) remoteAddrs() []string {
 
 func (c *cluster) initMembers(members []*clusterpb.MemberInfo, membershipVersion, membershipEpoch uint64) {
 	c.mu.Lock()
-	c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch)
+	c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, 0)
 	for _, info := range members {
 		c.members = append(c.members, &Member{
 			memberInfo:        info,
@@ -437,6 +448,10 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membe
 // resolution only see c.members, so a member that registered after this node's
 // initial sync would otherwise stay invisible until a process restart.
 func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch uint64) (added, updated []*clusterpb.MemberInfo, removed []string) {
+	return c.reconcileMembersSnapshot(infos, removedInfos, membershipVersion, membershipEpoch, 0)
+}
+
+func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, removedInfos []*clusterpb.RemovedMember, membershipVersion, membershipEpoch, snapshotSeq uint64) (added, updated []*clusterpb.MemberInfo, removed []string) {
 	if len(infos) == 0 && len(removedInfos) == 0 && membershipVersion == 0 && membershipEpoch == 0 {
 		return nil, nil, nil
 	}
@@ -447,7 +462,7 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, removedInfos [
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch) {
+	if !c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, snapshotSeq) {
 		return nil, nil, nil
 	}
 
@@ -550,7 +565,25 @@ func (c *cluster) ensureMembershipEpochLocked() uint64 {
 	return c.membershipEpoch
 }
 
-func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch uint64) bool {
+func (c *cluster) nextMembershipSnapshotSeq() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.membershipSnapshotSeq++
+	if c.membershipSnapshotSeq == 0 {
+		c.membershipSnapshotSeq = 1
+	}
+	return c.membershipSnapshotSeq
+}
+
+func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, snapshotSeq uint64) bool {
+	if snapshotSeq > 0 {
+		if snapshotSeq < c.membershipSnapshotSeq {
+			return false
+		}
+		if snapshotSeq > c.membershipSnapshotSeq {
+			c.membershipSnapshotSeq = snapshotSeq
+		}
+	}
 	if membershipEpoch > 0 {
 		if membershipEpoch != c.membershipEpoch {
 			c.membershipEpoch = membershipEpoch
@@ -586,10 +619,15 @@ func (c *cluster) rememberRemovedMemberLocked(addr string, membershipVersion uin
 	if addr == "" {
 		return
 	}
+	now := time.Now()
+	c.pruneRemovedMembersLocked(now)
 	if c.removedMembers == nil {
-		c.removedMembers = make(map[string]uint64)
+		c.removedMembers = make(map[string]removedMemberTombstone)
 	}
-	c.removedMembers[addr] = membershipVersion
+	c.removedMembers[addr] = removedMemberTombstone{
+		membershipVersion: membershipVersion,
+		removedAt:         now,
+	}
 }
 
 func (c *cluster) clearRemovedMemberLocked(addr string) {
@@ -597,4 +635,19 @@ func (c *cluster) clearRemovedMemberLocked(addr string) {
 		return
 	}
 	delete(c.removedMembers, addr)
+}
+
+func (c *cluster) pruneRemovedMembersLocked(now time.Time) {
+	retention := removedMemberRetention()
+	if c.removedMembers == nil || retention <= 0 {
+		return
+	}
+	for addr, tombstone := range c.removedMembers {
+		if tombstone.removedAt.IsZero() {
+			continue
+		}
+		if now.Sub(tombstone.removedAt) > retention {
+			delete(c.removedMembers, addr)
+		}
+	}
 }
