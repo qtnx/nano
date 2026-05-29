@@ -36,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -540,6 +541,23 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
+	// Apply the same connection caps as the TCP/WS path so long-lived SSE
+	// streams are bounded too (H11): per-IP first, then the node-global cap.
+	// The matching decrements run in the stream-writer defer below.
+	remoteAddr := ctx.RemoteIP().String()
+	if err := n.increaseConnection(remoteAddr); err != nil {
+		ctx.Error("connection limit reached", fasthttp.StatusTooManyRequests)
+		return
+	}
+	if env.MaxConnections > 0 {
+		if atomic.AddInt64(&n.acceptedConns, 1) > int64(env.MaxConnections) {
+			atomic.AddInt64(&n.acceptedConns, -1)
+			n.decreaseConnection(remoteAddr)
+			metrics.ServerClosedConnections.Inc()
+			ctx.Error("server overloaded", fasthttp.StatusServiceUnavailable)
+			return
+		}
+	}
 	n.storeSession(agent.session)
 	n.registerSSEClient(sessionID, sseEventChan)
 
@@ -558,6 +576,11 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			// Remove only this stream's mapping/session; a reconnect that
 			// replaced it under the same id must survive (H19).
 			n.unregisterSSEClient(sessionID, sseEventChan)
+			// Release this stream's connection-cap accounting exactly once (H11).
+			n.decreaseConnection(remoteAddr)
+			if env.MaxConnections > 0 {
+				atomic.AddInt64(&n.acceptedConns, -1)
+			}
 			log.Debugf("SSE connection closed: %s", sessionID)
 		}()
 
@@ -1061,7 +1084,9 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 	if err != nil {
 		return nil, err
 	}
-	log.Println("[Node] HandleRequest old: ", req.Route, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
+	if env.Debug {
+		log.Println("[Node] HandleNotify:", req.Route, req.SessionId, fmt.Sprintf("session id: %v", s.ID()))
+	}
 	msg := &message.Message{
 		Type:  message.Notify,
 		Route: req.Route,
