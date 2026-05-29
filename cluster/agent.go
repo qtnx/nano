@@ -98,6 +98,20 @@ func newAgent(conn net.Conn, pipeline pipeline.Pipeline, rpcHandler rpcHandler) 
 	return a
 }
 
+// copyBytePayload defensively copies a []byte payload so a caller that reuses
+// or pools the buffer after Push/ResponseMid returns cannot corrupt the
+// outbound message: it is serialized later on the write goroutine, and
+// message.Serialize returns a []byte unchanged (no copy). Non-[]byte payloads
+// are returned as-is so other types are never double-copied (M27).
+func copyBytePayload(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok {
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		return cp
+	}
+	return v
+}
+
 func (a *agent) send(m pendingMessage) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
@@ -147,7 +161,7 @@ func (a *agent) Push(route string, v interface{}) error {
 		}
 	}
 
-	return a.send(pendingMessage{typ: message.Push, route: route, payload: v})
+	return a.send(pendingMessage{typ: message.Push, route: route, payload: copyBytePayload(v)})
 }
 
 // RPC, implementation for session.NetworkEntity interface
@@ -203,7 +217,7 @@ func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 		}
 	}
 
-	return a.send(pendingMessage{typ: message.Response, mid: mid, payload: v})
+	return a.send(pendingMessage{typ: message.Response, mid: mid, payload: copyBytePayload(v)})
 }
 
 // Close, implementation for session.NetworkEntity interface

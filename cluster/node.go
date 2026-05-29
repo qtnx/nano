@@ -53,6 +53,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -64,6 +65,10 @@ var (
 	// httpJSONSerializer decodes HTTP /api request bodies, which are always
 	// JSON, independent of the cluster-wide binary serializer (M35).
 	httpJSONSerializer = nanojson.NewSerializer()
+
+	// clusterAuthMetadataKey is the gRPC metadata key that carries the shared
+	// cluster auth token on inter-node RPCs (H9).
+	clusterAuthMetadataKey = "authorization"
 )
 
 // Options contains some configurations for current node
@@ -102,6 +107,10 @@ type Node struct {
 	sessions        map[int64]*session.Session
 	sseClients      map[string]chan []byte
 	connectionCount map[string]uint
+	// acceptedConns is the node-global count of currently accepted client
+	// connections, enforced against env.MaxConnections independently of the
+	// per-IP cap (H11). Accessed atomically.
+	acceptedConns int64
 
 	once          sync.Once
 	keepaliveExit chan struct{}
@@ -131,6 +140,13 @@ func (n *Node) Startup() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// Opt into the sharded task dispatcher when configured so distinct sessions
+	// run concurrently while a single session stays ordered (H1). EnableSharded
+	// is idempotent, so repeated node startups in one process enable it once.
+	if env.SchedulerShards > 0 {
+		scheduler.EnableSharded(env.SchedulerShards)
 	}
 
 	cache()
@@ -232,6 +248,12 @@ func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
 	case "/health":
 		ctx.SetStatusCode(fasthttp.StatusOK)
 	case "/" + strings.TrimPrefix(env.WSPath, "/"):
+		// Gate the WebSocket upgrade route on the IsWebsocket option so a node
+		// that did not opt into WS does not expose an upgrade endpoint (M30).
+		if !n.IsWebsocket {
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+			return
+		}
 		log.Println("Handling WebSocket request")
 		n.listenAndServeWS(ctx)
 	default:
@@ -431,6 +453,22 @@ func (n *Node) waitForHTTPResponse(ctx *fasthttp.RequestCtx, observe *fastHttpCo
 	}
 }
 
+// sseWriteTimeout bounds a single SSE Flush so a stalled client cannot pin the
+// stream goroutine/FD forever. It is applied per write and refreshed before
+// each event/keepalive, so a healthy long-lived stream is unaffected (H35).
+const sseWriteTimeout = 10 * time.Second
+
+// flushSSE sets a bounded write deadline on the underlying connection (when
+// available) and flushes the buffered SSE writer. A stalled write then fails
+// with a timeout instead of blocking forever, so the caller can return and let
+// the unregister defer reclaim the stream (H35).
+func flushSSE(conn net.Conn, w *bufio.Writer, timeout time.Duration) error {
+	if conn != nil && timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	return w.Flush()
+}
+
 // handleSSE handles Server-Sent Events to push events to clients
 func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	ctx.SetContentType("text/event-stream")
@@ -505,9 +543,13 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	n.storeSession(agent.session)
 	n.registerSSEClient(sessionID, sseEventChan)
 
+	// Capture the underlying connection before returning so the stream-writer
+	// goroutine (run by fasthttp after this handler returns) can bound each
+	// Flush with a write deadline (H35).
+	conn := ctx.Conn()
 	ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
-		w.Flush()
+		_ = flushSSE(conn, w, sseWriteTimeout)
 
 		// Keep the connection open with a ticker
 		ticker := time.NewTicker(1 * time.Second)
@@ -532,7 +574,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			case event := <-sseEventChan:
 				log.Debugf("Send SSE event: %s", event)
 				fmt.Fprintf(w, "data: %s\n\n", event)
-				if err := w.Flush(); err != nil {
+				if err := flushSSE(conn, w, sseWriteTimeout); err != nil {
 					log.Errorf("Error flushing SSE event: %v", err)
 					return
 				}
@@ -541,7 +583,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 				// detects a disconnected client within the tick interval so the
 				// unregister defer runs (H35).
 				fmt.Fprintf(w, ": keep-alive\n\n")
-				if err := w.Flush(); err != nil {
+				if err := flushSSE(conn, w, sseWriteTimeout); err != nil {
 					log.Errorf("Error flushing keep-alive: %v", err)
 					return
 				}
@@ -685,7 +727,17 @@ func (n *Node) initNode() error {
 	}
 
 	// Initialize the gRPC server and register service
-	n.server = grpc.NewServer(grpc.UnaryInterceptor(recoveryUnaryInterceptor))
+	// Chain the recovery interceptor (outermost, so it also covers a panic in
+	// auth) with the shared-token auth interceptor (H9). With no token set the
+	// auth interceptor is a pass-through.
+	n.server = grpc.NewServer(grpc.ChainUnaryInterceptor(recoveryUnaryInterceptor, n.authUnaryInterceptor))
+
+	// H9: a cluster gRPC server with no token accepts any peer that can reach
+	// the port (register fake backends, close arbitrary sessions). Warn loudly
+	// once at startup unless the operator explicitly acknowledged insecure mode.
+	if env.ClusterAuthToken == "" && !env.InsecureCluster {
+		log.Warn("cluster: SECURITY: gRPC server is running WITHOUT authentication (env.ClusterAuthToken is empty); any peer reaching this port can register backends or close sessions. Set env.ClusterAuthToken, or set env.InsecureCluster=true to acknowledge.")
+	}
 	n.rpcClient = newRPCClient()
 	clusterpb.RegisterMemberServer(n.server, n)
 
@@ -1065,7 +1117,15 @@ func (n *Node) purgeGateSessions(gateAddr string) {
 	}
 }
 
-// SessionClosed implements the MemberServer interface
+// SessionClosed implements the MemberServer interface.
+//
+// M11 (owner authorization): the request carries only a SessionId, not the
+// caller's gate identity, and the H9 shared-token interceptor authenticates the
+// peer but does not bind it to a specific gate. With no usable per-caller
+// identity available, we keep the existing behavior (reclaim local state by
+// id). Enforcing ownership would require threading the caller's gate address
+// (a clusterpb proto field) and comparing it with the session's owning
+// acceptor.gateAddr before delete; deferred as a wire change.
 func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequest) (*clusterpb.SessionClosedResponse, error) {
 	n.mu.Lock()
 	s, found := n.sessions[req.SessionId]
@@ -1077,7 +1137,10 @@ func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequ
 	return &clusterpb.SessionClosedResponse{}, nil
 }
 
-// CloseSession implements the MemberServer interface
+// CloseSession implements the MemberServer interface.
+//
+// M11: same caveat as SessionClosed — no caller/gate identity is available on
+// the request, so ownership is not verified before closing. See SessionClosed.
 func (n *Node) CloseSession(_ context.Context, req *clusterpb.CloseSessionRequest) (*clusterpb.CloseSessionResponse, error) {
 	n.mu.Lock()
 	s, found := n.sessions[req.SessionId]
@@ -1161,6 +1224,31 @@ func recoveryUnaryInterceptor(
 	return handler(ctx, req)
 }
 
+// authUnaryInterceptor enforces the shared-token check on inter-node cluster
+// RPCs when env.ClusterAuthToken is configured: the incoming `authorization`
+// metadata must carry a matching token, otherwise the call is rejected with
+// codes.Unauthenticated. With no token configured it is a pass-through
+// (insecure mode, warned about at startup) (H9).
+func (n *Node) authUnaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	token := env.ClusterAuthToken
+	if token == "" {
+		return handler(ctx, req)
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing cluster auth metadata")
+	}
+	vals := md.Get(clusterAuthMetadataKey)
+	if len(vals) == 0 || vals[0] != token {
+		return nil, status.Error(codes.Unauthenticated, "invalid cluster auth token")
+	}
+	return handler(ctx, req)
+}
 // runGRPCServer serves the gRPC listener. A post-startup Serve error is logged
 // rather than escalated to log.Fatalf, which would call os.Exit from this
 // background goroutine and bypass node/component shutdown.

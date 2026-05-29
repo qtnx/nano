@@ -2,17 +2,28 @@ package cluster
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
-	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/valyala/fasthttp"
 )
+
+// errNoRequestBound is returned by httpAgent.Response when no in-flight /api
+// request is bound to the calling goroutine. A bare session.Response is only
+// well-defined inside the synchronous handler call (runWithRequestMid binds the
+// mid); an async handler replying from a goroutine it spawned must capture
+// session.LastMid() at entry and reply with session.ResponseMID. Falling back
+// to the shared lastMid would let a later concurrent /api request cross-wire
+// this response (H34).
+var errNoRequestBound = errors.New("nano/cluster: no in-flight HTTP request bound to goroutine; capture session.LastMid() and use session.ResponseMID")
 
 type HttpObserveStatus uint
 
@@ -62,6 +73,7 @@ type httpAgent struct {
 	httpCtx               *fasthttp.RequestCtx
 	messageIDMapToRequest map[uint64]*fastHttpContextObserve
 	lastMid               uint64
+	reqMids               sync.Map      // goroutine id -> in-flight request mid, for Response routing (H34)
 	midCounter            uint64        // monotonic per-agent message-id source (H33)
 	closed                bool          // set by Close; rejects new attaches (H17)
 	sseDone               chan struct{} // closed by Close to stop the SSE stream goroutine (M31)
@@ -73,6 +85,35 @@ type httpAgent struct {
 // same timestamp, clobbering one in-flight request's context (H33).
 func (h *httpAgent) nextMid() uint64 {
 	return atomic.AddUint64(&h.midCounter, 1)
+}
+
+// goID returns the calling goroutine's id by parsing the runtime stack header
+// ("goroutine N [..."). Go exposes no public goroutine-local storage, so this
+// scopes an in-flight request's mid to the goroutine running its handler (see
+// runWithRequestMid). The cost is paid once per /api request/response.
+func goID() uint64 {
+	var buf [64]byte
+	b := buf[:runtime.Stack(buf[:], false)]
+	b = b[len("goroutine "):]
+	i := 0
+	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+		i++
+	}
+	id, _ := strconv.ParseUint(string(b[:i]), 10, 64)
+	return id
+}
+
+// runWithRequestMid binds mid to the calling goroutine for the duration of the
+// synchronous handler call fn and records it as the last-set mid. A handler's
+// session.Response (which carries no explicit mid) then resolves to THIS
+// request's mid, so concurrent /api requests sharing one agent cannot
+// cross-wire their responses via a shared field (H34).
+func (h *httpAgent) runWithRequestMid(mid uint64, fn func()) {
+	atomic.StoreUint64(&h.lastMid, mid)
+	gid := goID()
+	h.reqMids.Store(gid, mid)
+	defer h.reqMids.Delete(gid)
+	fn()
 }
 
 func NewHTTPAgent(
@@ -160,7 +201,13 @@ func (h *httpAgent) Close() error {
 
 // LastMid implements session.NetworkEntity.
 func (h *httpAgent) LastMid() uint64 {
-	return 0
+	// Return the mid bound to the calling goroutine while inside a handler so an
+	// async handler can capture session.LastMid() at entry and later reply with
+	// session.ResponseMID; fall back to the last-set mid otherwise (H34).
+	if raw, ok := h.reqMids.Load(goID()); ok {
+		return raw.(uint64)
+	}
+	return atomic.LoadUint64(&h.lastMid)
 }
 
 // OriginalSid implements session.NetworkEntity.
@@ -250,7 +297,18 @@ func (h *httpAgent) RemoteAddr() net.Addr {
 
 // Response implements session.NetworkEntity.
 func (h *httpAgent) Response(v interface{}) error {
-	return h.ResponseMid(h.lastMid, v)
+	// Route by the request mid bound to this goroutine (set by localProcess for
+	// the duration of the handler call) so concurrent /api requests sharing one
+	// agent cannot cross-wire their responses (H34). A bare Response is only
+	// well-defined inside the synchronous handler call; an async handler that
+	// replies from a goroutine it spawned must capture session.LastMid() at
+	// entry and reply with session.ResponseMID(mid, v). Falling back to the
+	// shared lastMid here would let a later concurrent /api request reassign it
+	// and cross-wire (or drop) this response, so reject instead (H34).
+	if raw, ok := h.reqMids.Load(goID()); ok {
+		return h.ResponseMid(raw.(uint64), v)
+	}
+	return errNoRequestBound
 }
 
 // ResponseMid implements session.NetworkEntity.
@@ -261,10 +319,23 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	if env.Debug {
 		log.Infof("[HTTP Agent] ResponseMid: %v", mid)
 	}
-	data, err := message.Serialize(v)
-	if err != nil {
-		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
-		return err
+	// HTTP responses are JSON end-to-end, independent of the cluster-wide
+	// (possibly binary) serializer: serialize with the HTTP JSON serializer
+	// here rather than message.Serialize/env.Serializer (M35). A []byte payload
+	// that is ALREADY valid JSON passes through unchanged so a handler returning
+	// pre-encoded JSON is not double-encoded (e.g. base64); any other value
+	// (including a []byte that is not valid JSON) is run through the HTTP JSON
+	// serializer so an application/json response is always valid JSON (M35).
+	var data []byte
+	if b, ok := v.([]byte); ok && json.Valid(b) {
+		data = b
+	} else {
+		var err error
+		data, err = httpJSONSerializer.Marshal(v)
+		if err != nil {
+			log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
+			return err
+		}
 	}
 
 	ctx, exists := h.messageIDMapToRequest[mid]
@@ -278,21 +349,11 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	// Publish the serialized body and let the owning /api request goroutine
 	// write the fasthttp RequestCtx (H16): fasthttp forbids touching a
 	// RequestCtx from a non-owner goroutine, and this method runs on the
-	// scheduler/RPC goroutine. The content type reflects the actual serializer
-	// rather than always claiming JSON (M35).
+	// scheduler/RPC goroutine. The body is JSON-encoded via the HTTP JSON
+	// serializer, so the content type is always application/json (M35).
 	ctx.body = data
-	ctx.contentType = httpContentType()
+	ctx.contentType = "application/json"
 	ctx.setStatus(HttpObserveSuccess)
 
 	return nil
-}
-
-// httpContentType reports the MIME type matching the active serializer so HTTP
-// responses are labelled by their actual encoding instead of always claiming
-// JSON (M35).
-func httpContentType() string {
-	if _, ok := env.Serializer.(*nanojson.Serializer); ok {
-		return "application/json"
-	}
-	return "application/octet-stream"
 }

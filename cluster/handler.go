@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -51,6 +52,12 @@ var (
 	// cached serialized data
 	hrd []byte // handshake response data
 	hbd []byte // heartbeat packet data
+
+	// emptyStateJSON is the canonical JSON encoding of an empty session state.
+	// Reusing it avoids a json.Marshal call + allocation on every remote
+	// request whose session carries no state, while keeping the wire contract
+	// identical to json.Marshal(map{}) (rank-3 perf).
+	emptyStateJSON = []byte("{}")
 )
 
 // rpcHandler dispatches a message to a remote member. It returns a non-nil
@@ -291,6 +298,21 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		return
 	}
 
+	// Enforce the node-global connection cap (independent of the per-IP cap)
+	// BEFORE storing the session so a rejected connection leaks neither an
+	// n.sessions entry nor goroutines (H11). The matching decrement runs in the
+	// cleanup defer below, which is registered only on this accepted path.
+	if env.MaxConnections > 0 {
+		if atomic.AddInt64(&h.currentNode.acceptedConns, 1) > int64(env.MaxConnections) {
+			atomic.AddInt64(&h.currentNode.acceptedConns, -1)
+			h.currentNode.decreaseConnection(remoteAddr)
+			metrics.ServerClosedConnections.Inc()
+			log.Warn(fmt.Sprintf("handle: global connection cap %d reached, rejecting %s", env.MaxConnections, remoteAddr))
+			_ = conn.Close()
+			return
+		}
+	}
+
 	h.currentNode.storeSession(agent.session)
 
 	// startup write goroutine
@@ -313,6 +335,9 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		sid := agent.session.ID()
 		uid := agent.session.UID()
 		h.currentNode.decreaseConnection(remoteAddr)
+		if env.MaxConnections > 0 {
+			atomic.AddInt64(&h.currentNode.acceptedConns, -1)
+		}
 
 		// Reclaim local state first so a slow or partitioned peer cannot pin
 		// this read goroutine (and the agent/write goroutines) during the
@@ -596,7 +621,15 @@ func (h *LocalHandler) remoteProcess(
 		gateAddr = v.gateAddr
 		sessionId = v.sid
 	}
-	sessionUserData, _ := json.Marshal(session.State())
+	// Marshal the session state at most once per request, and skip the
+	// json.Marshal allocation entirely when the state is empty (the common
+	// stateless case). The wire contract is unchanged: an empty state still
+	// sends "{}" so the receiver's applyClientState decodes an empty map, and a
+	// marshal failure still yields nil exactly as before (rank-3 perf).
+	sessionUserData := emptyStateJSON
+	if state := session.State(); len(state) > 0 {
+		sessionUserData, _ = json.Marshal(state)
+	}
 
 	client := clusterpb.NewMemberClient(pool.Get())
 
@@ -738,17 +771,27 @@ func (h *LocalHandler) localProcess(
 	startTime := time.Now()
 
 	task := func() {
-		// Set the last message ID
+		// Bind the request mid before invoking the handler. For agent/acceptor
+		// (one connection == one session, processed sequentially) writing the
+		// field is safe; for httpAgent (one session shared by concurrent /api
+		// requests) the mid is bound to this goroutine for the synchronous call
+		// so a handler's session.Response routes to THIS request rather than a
+		// racing one that overwrote a shared field (H34).
+		var result []reflect.Value
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
 			v.lastMid = lastMid
+			result = handler.Method.Func.Call(args)
 		case *acceptor:
 			v.lastMid = lastMid
+			result = handler.Method.Func.Call(args)
 		case *httpAgent:
-			v.lastMid = lastMid
+			v.runWithRequestMid(lastMid, func() {
+				result = handler.Method.Func.Call(args)
+			})
+		default:
+			result = handler.Method.Func.Call(args)
 		}
-
-		result := handler.Method.Func.Call(args)
 		if len(result) > 0 {
 			if err := result[0].Interface(); err != nil {
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
@@ -783,6 +826,13 @@ func (h *LocalHandler) localProcess(
 			return
 		}
 		local.Schedule(task)
+	} else if scheduler.Sharded() {
+		// Default path under sharding: route by session id so distinct sessions
+		// run concurrently while a single session stays strictly ordered. On
+		// backlog, shed the task (overload) instead of blocking the producer (H1).
+		if err := scheduler.PushTaskOnShard(uint64(session.ID()), task); err == scheduler.ErrSchedulerBacklog {
+			log.Errorf("nano/handler: scheduler shard backlog full, dropping task route=%s sid=%d", msg.Route, session.ID())
+		}
 	} else {
 		scheduler.PushTask(task)
 	}

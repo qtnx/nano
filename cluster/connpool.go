@@ -30,6 +30,7 @@ import (
 
 	"github.com/lonng/nano/internal/env"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 type connPool struct {
@@ -48,6 +49,23 @@ type rpcClient struct {
 	dialing map[string]*sync.Mutex
 }
 
+// clusterAuthClientInterceptor attaches the configured shared token to every
+// outbound cluster RPC as `authorization` metadata so an authenticated server
+// (env.ClusterAuthToken set) accepts it. It is a no-op when no token is set (H9).
+func clusterAuthClientInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	if token := env.ClusterAuthToken; token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, clusterAuthMetadataKey, token)
+	}
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
 func newConnArray(maxSize uint, addr string) (*connPool, error) {
 	a := &connPool{
 		index: 0,
@@ -60,12 +78,18 @@ func newConnArray(maxSize uint, addr string) (*connPool, error) {
 }
 
 func (a *connPool) init(addr string) error {
+	// Attach the cluster auth client interceptor so outbound RPCs carry the
+	// shared token when configured (H9). Copy env.GrpcOptions so the shared
+	// slice is never mutated.
+	opts := make([]grpc.DialOption, 0, len(env.GrpcOptions)+1)
+	opts = append(opts, env.GrpcOptions...)
+	opts = append(opts, grpc.WithChainUnaryInterceptor(clusterAuthClientInterceptor))
 	for i := range a.v {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		conn, err := grpc.DialContext(
 			ctx,
 			fmt.Sprintf("dns:///%s", addr),
-			env.GrpcOptions...,
+			opts...,
 		)
 		cancel()
 		if err != nil {

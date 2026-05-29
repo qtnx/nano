@@ -231,3 +231,44 @@ func WithLimitConnectionsPerIp(limit uint) Option {
 		opt.LimitConnectPerIp = limit
 	}
 }
+
+// WithScheduler enables the opt-in sharded task dispatcher. shards <= 0 keeps
+// the default single-scheduler (back-compat). Handlers for one session always
+// run on the same shard (per-session order preserved); different sessions may
+// run concurrently, so state shared across sessions must be synchronized.
+func WithScheduler(shards int) Option {
+	return func(_ *cluster.Options) {
+		if shards < 0 {
+			shards = 0
+		}
+		env.SchedulerShards = shards
+	}
+}
+
+// WithMaxConnections sets a global cap on concurrently accepted connections.
+// n <= 0 means unlimited (default).
+func WithMaxConnections(n int) Option {
+	return func(_ *cluster.Options) {
+		if n < 0 {
+			n = 0
+		}
+		env.MaxConnections = n
+	}
+}
+
+// WithClusterAuthToken sets a shared secret required on inter-node cluster gRPC
+// calls. Empty (default) disables auth and logs a loud insecure-mode warning at
+// startup unless WithInsecureCluster acknowledges it.
+func WithClusterAuthToken(token string) Option {
+	return func(_ *cluster.Options) {
+		env.ClusterAuthToken = token
+	}
+}
+
+// WithInsecureCluster acknowledges intentionally running the cluster gRPC server
+// without an auth token, silencing the insecure-mode warning.
+func WithInsecureCluster() Option {
+	return func(_ *cluster.Options) {
+		env.InsecureCluster = true
+	}
+}

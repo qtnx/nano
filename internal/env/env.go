@@ -53,6 +53,27 @@ var (
 	Serializer serialize.Serializer
 
 	GrpcOptions = []grpc.DialOption{grpc.WithInsecure()}
+
+	// SchedulerShards selects the opt-in sharded task dispatcher. 0 (default)
+	// keeps the single global scheduler; a value >0 starts that many shard
+	// workers and routes tasks by session id, so distinct sessions run
+	// concurrently while a single session stays strictly ordered (H1).
+	SchedulerShards int
+
+	// MaxConnections bounds the total number of concurrently accepted client
+	// connections per node. 0 (default) means unlimited. It is independent of
+	// the per-IP connection cap (H11).
+	MaxConnections int
+
+	// ClusterAuthToken is the shared secret required on inter-node cluster gRPC
+	// calls. "" (default) disables authentication; the server then logs one
+	// loud insecure-mode warning at startup unless InsecureCluster is set (H9).
+	ClusterAuthToken string
+
+	// InsecureCluster acknowledges intentionally running the cluster gRPC
+	// server without an auth token, silencing the insecure-mode startup
+	// warning (H9).
+	InsecureCluster bool
 )
 
 func init() {

@@ -164,3 +164,49 @@ func TestWithWSPath_Reserved(t *testing.T) {
 		t.Fatalf("valid WS path not applied: %q", env.WSPath)
 	}
 }
+
+// H1/H11/H9: the config setters must store into env (negatives clamp safely).
+func TestWithScheduler(t *testing.T) {
+	prev := env.SchedulerShards
+	defer func() { env.SchedulerShards = prev }()
+	WithScheduler(8)(&cluster.Options{})
+	if env.SchedulerShards != 8 {
+		t.Fatalf("want 8, got %d", env.SchedulerShards)
+	}
+	WithScheduler(-1)(&cluster.Options{})
+	if env.SchedulerShards != 0 {
+		t.Fatalf("negative must clamp to 0, got %d", env.SchedulerShards)
+	}
+}
+
+func TestWithMaxConnections(t *testing.T) {
+	prev := env.MaxConnections
+	defer func() { env.MaxConnections = prev }()
+	WithMaxConnections(100)(&cluster.Options{})
+	if env.MaxConnections != 100 {
+		t.Fatalf("want 100, got %d", env.MaxConnections)
+	}
+	WithMaxConnections(-5)(&cluster.Options{})
+	if env.MaxConnections != 0 {
+		t.Fatalf("negative must clamp to 0 (unlimited), got %d", env.MaxConnections)
+	}
+}
+
+func TestWithClusterAuthToken(t *testing.T) {
+	prev := env.ClusterAuthToken
+	defer func() { env.ClusterAuthToken = prev }()
+	WithClusterAuthToken("s3cret")(&cluster.Options{})
+	if env.ClusterAuthToken != "s3cret" {
+		t.Fatalf("got %q", env.ClusterAuthToken)
+	}
+}
+
+func TestWithInsecureCluster(t *testing.T) {
+	prev := env.InsecureCluster
+	defer func() { env.InsecureCluster = prev }()
+	env.InsecureCluster = false
+	WithInsecureCluster()(&cluster.Options{})
+	if !env.InsecureCluster {
+		t.Fatal("want true")
+	}
+}

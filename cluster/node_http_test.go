@@ -12,12 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lonng/nano/benchmark/testdata"
 	"github.com/lonng/nano/cluster"
 	"github.com/lonng/nano/component"
 	"github.com/lonng/nano/scheduler"
 	. "github.com/pingcap/check"
-	"google.golang.org/protobuf/proto"
 )
 
 var _ = Suite(&nodeSuite{})
@@ -29,6 +27,13 @@ func TestNodeHTTP(t *testing.T) {
 func (s *nodeSuite) TestNodeHTTP(c *C) {
 	go scheduler.Sched()
 	defer scheduler.Close()
+
+	// HTTP /api + SSE are JSON end-to-end for LOCAL routes only: handleHTTPRequest
+	// decodes the body with httpJSONSerializer and ResponseMid serializes with it,
+	// both independent of the cluster-wide (protobuf) serializer. Making a peer
+	// node decode a forwarded JSON body needs an explicit per-request JSON marker
+	// on the cluster RPC, so remote /api JSON is a documented partial (M35) and
+	// this test no longer mutates the global env.Serializer to fake it.
 
 	// Start the master node
 	masterComps := &component.Components{}
@@ -99,14 +104,19 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	// Wait for SSE to be ready
 	time.Sleep(100 * time.Millisecond)
 
-	pingData := &testdata.Ping{Content: "ping"}
-	pingDataBytes, err := proto.Marshal(pingData)
-	c.Assert(err, IsNil)
+	// The SSE handler emits an initial onConnected event before any push;
+	// drain it so the push/response assertions below line up with the actual
+	// handler messages instead of the handshake event.
+	select {
+	case <-messageChan:
+	case <-time.After(2 * time.Second):
+		c.Error("Timeout waiting for SSE onConnected event")
+	}
 
 	// --- Test Notify ---
 	notifyBody := map[string]interface{}{
 		"route": "GateComponent.Test",
-		"data":  string(pingDataBytes),
+		"data":  map[string]interface{}{"Content": "ping"},
 		"type":  1, // Notify
 	}
 	bodyBytes, err := json.Marshal(notifyBody)
@@ -134,7 +144,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	// --- Test Request/Response ---
 	requestBody := map[string]interface{}{
 		"route": "GateComponent.Test2",
-		"data":  pingDataBytes,
+		"data":  map[string]interface{}{"Content": "ping"},
 		"type":  0, // Request
 	}
 	bodyBytes, err = json.Marshal(requestBody)
