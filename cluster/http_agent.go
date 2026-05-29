@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
+	"sync/atomic"
 
+	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
+	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/valyala/fasthttp"
 )
@@ -22,6 +25,34 @@ const (
 type fastHttpContextObserve struct {
 	context       *fasthttp.RequestCtx
 	observeStatus HttpObserveStatus
+	// body and contentType hold the serialized response produced by a
+	// scheduler/RPC goroutine. The owning /api request goroutine (the only
+	// goroutine allowed to touch the fasthttp RequestCtx) reads them after it
+	// observes done closed and writes the ctx itself, so the ctx is never
+	// mutated from a non-owner goroutine (H16).
+	body        []byte
+	contentType string
+	// done is closed exactly once when observeStatus reaches a terminal value,
+	// so the HTTP request handler can wait on a signal instead of busy-polling
+	// the status under the agent mutex (M37).
+	done chan struct{}
+	once sync.Once
+}
+
+// setStatus records a terminal observe status and signals any waiter exactly
+// once. Callers must hold the owning httpAgent's mutex.
+func (o *fastHttpContextObserve) setStatus(status HttpObserveStatus) {
+	o.observeStatus = status
+	if o.done != nil {
+		o.once.Do(func() { close(o.done) })
+	}
+}
+
+// status returns the recorded observe status. It is safe to call after the
+// done channel has been observed closed: setStatus writes the status before
+// closing done, and the channel close establishes the happens-before edge.
+func (o *fastHttpContextObserve) status() HttpObserveStatus {
+	return o.observeStatus
 }
 
 type httpAgent struct {
@@ -30,9 +61,18 @@ type httpAgent struct {
 	session               *session.Session
 	httpCtx               *fasthttp.RequestCtx
 	messageIDMapToRequest map[uint64]*fastHttpContextObserve
-	responseChan          chan []byte
 	lastMid               uint64
+	midCounter            uint64        // monotonic per-agent message-id source (H33)
+	closed                bool          // set by Close; rejects new attaches (H17)
+	sseDone               chan struct{} // closed by Close to stop the SSE stream goroutine (M31)
 	mu                    sync.Mutex
+}
+
+// nextMid returns a process-unique-per-agent message id. The previous wall
+// clock (time.Now().UnixNano()) source collided when two requests observed the
+// same timestamp, clobbering one in-flight request's context (H33).
+func (h *httpAgent) nextMid() uint64 {
+	return atomic.AddUint64(&h.midCounter, 1)
 }
 
 func NewHTTPAgent(
@@ -47,6 +87,7 @@ func NewHTTPAgent(
 		rpcHandler:            rpcHandler,
 		httpCtx:               httpCtx,
 		messageIDMapToRequest: make(map[uint64]*fastHttpContextObserve),
+		sseDone:               make(chan struct{}),
 	}
 
 	if s == nil {
@@ -60,9 +101,15 @@ func NewHTTPAgent(
 func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCtx) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Reject new attaches once closed so a request racing teardown does not
+	// repopulate a map Close is tearing down (H17).
+	if h.closed || h.messageIDMapToRequest == nil {
+		return
+	}
 	h.messageIDMapToRequest[mid] = &fastHttpContextObserve{
 		context:       httpCtx,
 		observeStatus: HttpObserveWaiting,
+		done:          make(chan struct{}),
 	}
 }
 
@@ -84,24 +131,30 @@ func (h *httpAgent) GetFastHttpContextObserve(mid uint64) *fastHttpContextObserv
 	return nil
 }
 
-func (h *httpAgent) AttachResponseChan(responseChan chan []byte) {
-	h.session.NetworkEntity().(*httpAgent).responseChan = responseChan
-	h.responseChan = responseChan
-}
-
-func (h *httpAgent) DeAttachResponseChan() {
-	h.responseChan = nil
-	h.session.NetworkEntity().(*httpAgent).responseChan = nil
-}
-
-// Close implements session.NetworkEntity.
+// Close implements session.NetworkEntity. It is idempotent and synchronized so
+// it can race in-flight /api requests and SSE teardown without
+// nil-dereferencing shared state (H17). It marks the agent closed, wakes any
+// in-flight request waiters, and releases the SSE channel, but it does not nil
+// the session/ctx/map that concurrent lock-holding accessors still read.
 func (h *httpAgent) Close() error {
-	h.httpCtx = nil
-	h.rpcHandler = nil
-	h.session = nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	// Wake any in-flight request waiters so they fail fast instead of blocking
+	// until their timeout.
+	for _, o := range h.messageIDMapToRequest {
+		o.setStatus(HttpObserveError)
+	}
 	h.sseChan = nil
-	h.responseChan = nil
-	h.messageIDMapToRequest = nil
+	// Signal the SSE stream-writer goroutine (if any) to stop so a
+	// backend-initiated close (CloseSession) doesn't leak the stream/goroutine
+	// (M31). Guarded by the closed flag above, so it closes exactly once.
+	if h.sseDone != nil {
+		close(h.sseDone)
+	}
 	return nil
 }
 
@@ -145,18 +198,32 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 		log.Errorf("[HTTP Agent] Failed to marshal event: %v error: %v", v, err)
 		return err
 	}
-	log.Infof("[HTTP Agent] Push event: %s", data)
-
-	// Use a select statement with a default case to avoid blocking
-	select {
-	case h.sseChan <- data:
-		// Data sent successfully
-		log.Infof("[HTTP Agent] SSE event sent: %s", data)
-	default:
-		// Channel is full, log a warning
-		log.Infof("[HTTP Agent] SSE channel is full, dropping event: %s", data)
+	if env.Debug {
+		log.Infof("[HTTP Agent] Push event: %s", data)
 	}
-	return nil
+
+	// Snapshot the channel under the lock so a concurrent Close (which nils it)
+	// cannot race this read (H17).
+	h.mu.Lock()
+	ch, closed := h.sseChan, h.closed
+	h.mu.Unlock()
+	if closed || ch == nil {
+		return ErrBrokenPipe
+	}
+
+	select {
+	case ch <- data:
+		if env.Debug {
+			log.Infof("[HTTP Agent] SSE event sent: %s", data)
+		}
+		return nil
+	default:
+		// Surface an explicit error when the SSE buffer is full instead of
+		// silently dropping the event while reporting success, so the
+		// application sees the loss (matches agent.Push semantics) (H32).
+		log.Warn("[HTTP Agent] SSE channel full, dropping event for route ", route)
+		return ErrBufferExceed
+	}
 }
 
 // RPC implements session.NetworkEntity.
@@ -170,9 +237,10 @@ func (h *httpAgent) RPC(route string, v interface{}) error {
 		Route: route,
 		Data:  data,
 	}
-	log.Infof("[HTTP Agent] RPC event: %s", data)
-	h.rpcHandler(h.session, msg, true)
-	return nil
+	if env.Debug {
+		log.Infof("[HTTP Agent] RPC event: %s", data)
+	}
+	return h.rpcHandler(h.session, msg, true)
 }
 
 // RemoteAddr implements session.NetworkEntity.
@@ -190,7 +258,9 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	log.Infof("[HTTP Agent] ResponseMid: %v", mid)
+	if env.Debug {
+		log.Infof("[HTTP Agent] ResponseMid: %v", mid)
+	}
 	data, err := message.Serialize(v)
 	if err != nil {
 		log.Errorf("[HTTP Agent] Failed to serialize response: %v error: %v", v, err)
@@ -199,16 +269,30 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 
 	ctx, exists := h.messageIDMapToRequest[mid]
 	if !exists {
-		log.Infof("[HTTP Agent] No context found for messageID: %d, response might have timed out", mid)
+		if env.Debug {
+			log.Infof("[HTTP Agent] No context found for messageID: %d, response might have timed out", mid)
+		}
 		return nil
 	}
 
-	log.Infof("ss ptr after insert %v", h.session.ID())
-	ctx.context.SetContentType("application/json")
-	ctx.context.SetBody(data)
-	ctx.context.SetStatusCode(fasthttp.StatusOK)
-
-	h.messageIDMapToRequest[mid].observeStatus = HttpObserveSuccess
+	// Publish the serialized body and let the owning /api request goroutine
+	// write the fasthttp RequestCtx (H16): fasthttp forbids touching a
+	// RequestCtx from a non-owner goroutine, and this method runs on the
+	// scheduler/RPC goroutine. The content type reflects the actual serializer
+	// rather than always claiming JSON (M35).
+	ctx.body = data
+	ctx.contentType = httpContentType()
+	ctx.setStatus(HttpObserveSuccess)
 
 	return nil
+}
+
+// httpContentType reports the MIME type matching the active serializer so HTTP
+// responses are labelled by their actual encoding instead of always claiming
+// JSON (M35).
+func httpContentType() string {
+	if _, ok := env.Serializer.(*nanojson.Serializer); ok {
+		return "application/json"
+	}
+	return "application/octet-stream"
 }

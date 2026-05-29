@@ -33,7 +33,9 @@ func (a *acceptor) Push(route string, v interface{}) error {
 		Route:     route,
 		Data:      data,
 	}
-	_, err = a.gateClient.HandlePush(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err = a.gateClient.HandlePush(ctx, request)
 	return err
 }
 
@@ -49,8 +51,7 @@ func (a *acceptor) RPC(route string, v interface{}) error {
 		Route: route,
 		Data:  data,
 	}
-	a.rpcHandler(a.session, msg, true)
-	return nil
+	return a.rpcHandler(a.session, msg, true)
 }
 
 // RPC with response
@@ -81,7 +82,7 @@ func (a *acceptor) Response(v interface{}) error {
 // ResponseMid implements the session.NetworkEntity interface
 func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 
-	log.Infof("[Acceptor] ResponseMid: %d", mid)
+	log.Debugf("[Acceptor] ResponseMid: %d", mid)
 	// TODO: buffer
 	data, err := message.Serialize(v)
 	if err != nil {
@@ -93,7 +94,9 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 		Data:      data,
 	}
 
-	_, err = a.gateClient.HandleResponse(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err = a.gateClient.HandleResponse(ctx, request)
 	if err != nil {
 		log.Errorf("[Acceptor] Failed to response message: %v", err)
 	}
@@ -111,7 +114,9 @@ func (a *acceptor) Close() error {
 	request := &clusterpb.CloseSessionRequest{
 		SessionId: a.sid,
 	}
-	_, err := a.gateClient.CloseSession(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err := a.gateClient.CloseSession(ctx, request)
 	return err
 }
 

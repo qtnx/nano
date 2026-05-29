@@ -42,6 +42,7 @@ import (
 	"github.com/lonng/nano/internal/packet"
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
+	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
 )
@@ -52,7 +53,15 @@ var (
 	hbd []byte // heartbeat packet data
 )
 
-type rpcHandler func(session *session.Session, msg *message.Message, noCopy bool)
+// rpcHandler dispatches a message to a remote member. It returns a non-nil
+// error when the message could not be routed/delivered so HTTP and RPC callers
+// can surface the failure instead of silently succeeding (M7).
+type rpcHandler func(session *session.Session, msg *message.Message, noCopy bool) error
+
+// remoteRPCTimeout bounds a single forwarded request/notify so a slow or
+// partitioned backend cannot pin the calling (client read / scheduler)
+// goroutine indefinitely (H5).
+const remoteRPCTimeout = 10 * time.Second
 
 // CustomerRemoteServiceRoute customer remote service route
 type CustomerRemoteServiceRoute func(service string, session *session.Session, members []*clusterpb.MemberInfo) *clusterpb.MemberInfo
@@ -107,7 +116,21 @@ func encodeSessionId(sessionId int64) []byte {
 		log.Error("Encode session id error", err)
 		return nil
 	}
-	dat, err := codec.Encode(packet.Data, data)
+	// Wrap the payload in a valid nano message frame (Push) before the packet
+	// frame. Clients decode a Data packet body via message.Decode, which
+	// rejects a bare JSON blob (its first byte would be parsed as a message
+	// flag and fail type validation); emitting a proper Push lets clients
+	// parse the session id (M16).
+	em, err := message.Encode(&message.Message{
+		Type:  message.Push,
+		Route: "onSessionId",
+		Data:  data,
+	})
+	if err != nil {
+		log.Error("Encode session id error", err)
+		return nil
+	}
+	dat, err := codec.Encode(packet.Data, em)
 	if err != nil {
 		log.Error("Encode session id error", err)
 		return nil
@@ -155,6 +178,10 @@ func (h *LocalHandler) register(comp component.Component, opts []component.Optio
 		n := fmt.Sprintf("%s.%s", s.Name, name)
 		log.Println("Register local handler", n)
 		h.localHandlers[n] = handler
+		// Mark the route as known so its Prometheus histogram series is
+		// recorded under its real name; unregistered (client-fabricated)
+		// routes collapse to a bounded sentinel label (H28).
+		metrics.RegisterRoute(n)
 	}
 	return nil
 }
@@ -170,8 +197,17 @@ func (h *LocalHandler) addRemoteService(member *clusterpb.MemberInfo) {
 	defer h.mu.Unlock()
 
 	for _, s := range member.Services {
+		// Purge any stale entry for this service address before re-adding so a
+		// node restart/redeploy cannot accumulate duplicate or dangling routes
+		// (M12). Routing therefore stays idempotent across rejoins.
+		var filtered []*clusterpb.MemberInfo
+		for _, m := range h.remoteServices[s] {
+			if m.ServiceAddr != member.ServiceAddr {
+				filtered = append(filtered, m)
+			}
+		}
 		log.Println("Register remote service", s)
-		h.remoteServices[s] = append(h.remoteServices[s], member)
+		h.remoteServices[s] = append(filtered, member)
 	}
 }
 
@@ -219,6 +255,14 @@ func (h *LocalHandler) RemoteService() []string {
 }
 
 func (h *LocalHandler) handle(conn net.Conn) {
+	// A panic while servicing one connection must never take down the read
+	// goroutine (and with it the whole process). Recover here so the deferred
+	// cleanup below still runs and the server keeps serving everyone else.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error(fmt.Sprintf("cluster: recovered panic in client read loop: %v", r))
+		}
+	}()
 	if conn == nil {
 		log.Error("handle: conn is nil")
 		return
@@ -231,19 +275,24 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		return
 	}
 
-	h.currentNode.storeSession(agent.session)
-
 	remoteAddr := agent.RemoteAddrWithoutPortStr()
 	if remoteAddr == "" {
 		log.Error("handle: RemoteAddrWithoutPortStr returned empty string")
+		_ = conn.Close()
 		return
 	}
 
-	err := h.currentNode.increaseConnection(remoteAddr)
-	if err != nil {
+	// Enforce the per-IP connection limit BEFORE storing the session or
+	// starting goroutines so a rejected connection leaks neither an n.sessions
+	// entry nor the upgraded connection (M18).
+	if err := h.currentNode.increaseConnection(remoteAddr); err != nil {
 		log.Errorf("handle: increaseConnection error: %v", err)
+		_ = conn.Close()
 		return
 	}
+
+	h.currentNode.storeSession(agent.session)
+
 	// startup write goroutine
 	go agent.write()
 
@@ -260,35 +309,20 @@ func (h *LocalHandler) handle(conn net.Conn) {
 
 	// guarantee agent related resource be destroyed
 	defer func() {
-		log.Println("Closing session")
-		request := &clusterpb.SessionClosedRequest{
-			SessionId: agent.session.ID(),
-		}
-		h.currentNode.decreaseConnection(agent.RemoteAddrWithoutPortStr())
+		log.Debug("Closing session")
+		sid := agent.session.ID()
+		uid := agent.session.UID()
+		h.currentNode.decreaseConnection(remoteAddr)
 
-		members := h.currentNode.cluster.remoteAddrs()
-		for _, remote := range members {
-			log.Debug("Notify remote server", remote)
-			pool, err := h.currentNode.rpcClient.getConnPool(remote)
-			if err != nil {
-				log.Println("Cannot retrieve connection pool for address", remote, err)
-				continue
-			}
-			client := clusterpb.NewMemberClient(pool.Get())
-			_, err = client.SessionClosed(context.Background(), request)
-			if err != nil {
-				log.Error("Cannot closed session in remote address", remote, err)
-				continue
-			}
-			if env.Debug {
-				log.Debug("Notify remote server success", remote)
-			}
-		}
-
+		// Reclaim local state first so a slow or partitioned peer cannot pin
+		// this read goroutine (and the agent/write goroutines) during the
+		// close fan-out (H6). The per-session SessionClosed notifications are
+		// then issued asynchronously, each bounded by a timeout (H5).
+		h.currentNode.deleteSession(sid)
 		agent.Close()
 		if env.Debug {
 			log.Println(
-				fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", agent.session.ID(), agent.session.UID()),
+				fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", sid, uid),
 			)
 		}
 
@@ -296,11 +330,22 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		duration := time.Since(startTime).Seconds()
 		metrics.ConnectionDuration.Observe(duration)
 		metrics.CurrentConnections.Dec()
+
+		if members := h.currentNode.cluster.remoteAddrs(); len(members) > 0 {
+			go h.notifySessionClosed(sid, members)
+		}
 	}()
 
 	// read loop
 	buf := make([]byte, 2048)
 	for {
+		// Refresh the read deadline so a connection that opens then stalls
+		// (slowloris) is closed instead of pinning a goroutine/FD outside the
+		// heartbeat path (H11). The window matches the write goroutine's
+		// heartbeat-timeout policy (2x the interval).
+		if env.Heartbeat > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * env.Heartbeat))
+		}
 		n, err := conn.Read(buf)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -382,7 +427,41 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	//}
 }
 
-func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) error {
+// notifySessionClosed informs every remote member that the given session has
+// disconnected. It runs off the read goroutine (H6) and bounds each RPC with a
+// timeout so one slow or partitioned peer cannot stall the fan-out (H5).
+func (h *LocalHandler) notifySessionClosed(sid int64, members []string) {
+	request := &clusterpb.SessionClosedRequest{SessionId: sid}
+	for _, remote := range members {
+		pool, err := h.currentNode.rpcClient.getConnPool(remote)
+		if err != nil {
+			log.Println("Cannot retrieve connection pool for address", remote, err)
+			continue
+		}
+		client := clusterpb.NewMemberClient(pool.Get())
+		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+		_, err = client.SessionClosed(ctx, request)
+		cancel()
+		if err != nil {
+			log.Error("Cannot closed session in remote address", remote, err)
+			continue
+		}
+		if env.Debug {
+			log.Debug("Notify remote server success", remote)
+		}
+	}
+}
+
+func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error) {
+	// A single malformed packet must never crash the read goroutine. Recover
+	// and surface a normal error so the caller closes only this connection.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error(fmt.Sprintf("cluster: recovered panic while processing packet (type=%d): %v", p.Type, r))
+			err = ErrBrokenPipe
+		}
+	}()
+
 	switch p.Type {
 	case packet.Handshake:
 
@@ -401,6 +480,14 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) error {
 		}
 
 	case packet.HandshakeAck:
+		// Only a connection that completed a validated Handshake may transition
+		// to working. Accepting HandshakeAck from any other state lets a client
+		// reach statusWorking (and send Data) without ever passing
+		// env.HandshakeValidator (H26).
+		if agent.status() != statusHandshake {
+			return fmt.Errorf("receive HandshakeAck before a validated handshake, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
+		}
 		agent.setStatus(statusWorking)
 		if env.Debug {
 			log.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
@@ -428,33 +515,41 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) error {
 		// expected
 	}
 
-	agent.lastAt = time.Now().Unix()
+	agent.touch()
 	return nil
 }
 
 func (h *LocalHandler) findMembers(service string) []*clusterpb.MemberInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.remoteServices[service]
+	src := h.remoteServices[service]
+	if len(src) == 0 {
+		return nil
+	}
+	// Return a copy: routing callers iterate the result without the lock while
+	// register/unregister mutate the backing array (H4).
+	members := make([]*clusterpb.MemberInfo, len(src))
+	copy(members, src)
+	return members
 }
 
 func (h *LocalHandler) remoteProcess(
 	session *session.Session,
 	msg *message.Message,
 	noCopy bool,
-) {
+) error {
 	log.Debugf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d", session.ID(), msg, session.ID())
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {
 		log.Println(fmt.Sprintf("nano/handler: invalid route %s", msg.Route))
-		return
+		return fmt.Errorf("nano/handler: invalid route %s", msg.Route)
 	}
 
 	service := msg.Route[:index]
 	members := h.findMembers(service)
 	if len(members) == 0 {
 		log.Println(fmt.Sprintf("nano/handler: %s not found(forgot registered?)", msg.Route))
-		return
+		return fmt.Errorf("nano/handler: %s not found(forgot registered?)", msg.Route)
 	}
 
 	// Select a remote service address
@@ -469,7 +564,7 @@ func (h *LocalHandler) remoteProcess(
 			member := h.currentNode.Options.RemoteServiceRoute(service, session, members)
 			if member == nil {
 				log.Println(fmt.Sprintf("customize remoteServiceRoute handler: %s is not found", msg.Route))
-				return
+				return fmt.Errorf("nano/handler: customize remoteServiceRoute handler: %s is not found", msg.Route)
 			}
 			remoteAddr = member.ServiceAddr
 			session.Router().Bind(service, remoteAddr)
@@ -485,7 +580,7 @@ func (h *LocalHandler) remoteProcess(
 	pool, err := h.currentNode.rpcClient.getConnPool(remoteAddr)
 	if err != nil {
 		log.Println(err)
-		return
+		return err
 	}
 	data := msg.Data
 	if !noCopy && len(msg.Data) > 0 {
@@ -505,6 +600,12 @@ func (h *LocalHandler) remoteProcess(
 
 	client := clusterpb.NewMemberClient(pool.Get())
 
+	// Bound the forwarded RPC: context.Background() never times out, so a slow
+	// or partitioned backend would otherwise pin the calling (client read /
+	// scheduler) goroutine and head-of-line block that client (H5).
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+
 	// Start timing before making the RPC call
 	startTime := time.Now()
 
@@ -520,11 +621,8 @@ func (h *LocalHandler) remoteProcess(
 			Data:           data,
 		}
 		log.Debugf("[RemoteProcess] start request remoteProcess ssid: %v msg: %v msgId: %d, request %v", session.ID(), msg, session.ID(), request)
-		_, err = client.HandleRequest(context.Background(), request)
+		_, err = client.HandleRequest(ctx, request)
 		log.Debugf("[RemoteProcess] request process msg %v completed", msg)
-		if err != nil {
-			log.Errorf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d Error: %v", session.ID(), msg, session.ID(), err)
-		}
 
 	case message.Notify:
 		request := &clusterpb.NotifyMessage{
@@ -535,20 +633,21 @@ func (h *LocalHandler) remoteProcess(
 			Route:          msg.Route,
 			Data:           data,
 		}
-		_, err = client.HandleNotify(context.Background(), request)
-		if err != nil {
-			log.Errorf("[RemoteProcess] request process (notify) remoteProcess ssid: %v msg: %v msgId: %d Error: %v", session.ID(), msg, session.ID(), err)
-		}
+		_, err = client.HandleNotify(ctx, request)
 	}
 
-	// Record the duration after the RPC call
+	// Record the duration after the RPC call under a bounded route label so a
+	// client cannot mint unbounded histogram series by varying the method
+	// suffix of a known service (H28).
 	duration := time.Since(startTime).Seconds()
-	metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "remote").Observe(duration)
+	metrics.ObserveRouteRequestDuration(msg.Route, msg.Type.String(), "remote", duration)
 
 	if err != nil {
 		log.Error(fmt.Sprintf("Process remote message (%d:%s) error: %+v", msg.ID, msg.Route, err))
+		return err
 	}
 	log.Debugf("[RemoteProcess] request process remoteProcess ssid: %v msg: %v msgId: %d COMPLETED", session.ID(), msg, session.ID())
+	return nil
 }
 
 func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
@@ -565,7 +664,9 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 
 	handler, found := h.localHandlers[msg.Route]
 	if !found {
-		h.remoteProcess(agent.session, msg, false)
+		if err := h.remoteProcess(agent.session, msg, false); err != nil {
+			log.Errorf("nano/handler: remote process route %s failed: %v", msg.Route, err)
+		}
 	} else {
 		h.localProcess(handler, lastMid, agent.session, msg, nil)
 	}
@@ -575,6 +676,10 @@ func (h *LocalHandler) handleWS(conn *websocket.Conn) {
 	c, err := newWSConn(conn)
 	if err != nil {
 		log.Println(err)
+		// The upgrader handed FD ownership to this handler; close the upgraded
+		// connection on the error path so a bad/slow first frame doesn't leak
+		// it (H27).
+		_ = conn.Close()
 		return
 	}
 	h.handle(c)
@@ -585,8 +690,15 @@ func (h *LocalHandler) localProcess(
 	lastMid uint64,
 	session *session.Session,
 	msg *message.Message,
-	responseChan chan<- []byte,
+	serializer serialize.Serializer,
 ) {
+	// HTTP requests carry a JSON body while the cluster-wide env.Serializer may
+	// be binary (protobuf). Callers pass an explicit serializer for the inbound
+	// payload; nil falls back to the global serializer (M35).
+	if serializer == nil {
+		serializer = env.Serializer
+	}
+
 	if pipe := h.pipeline; pipe != nil {
 		err := pipe.Inbound().Process(session, msg)
 		if err != nil {
@@ -598,11 +710,19 @@ func (h *LocalHandler) localProcess(
 	payload := msg.Data
 	var data interface{}
 	if handler.IsRawArg {
+		// Copy the raw payload before the task (dispatched on a scheduler) can
+		// capture it: msg.Data aliases the decoder's internal buffer, which is
+		// reused/compacted on the next Decode and would corrupt a raw-arg
+		// handler reading it asynchronously (H10).
+		if len(payload) > 0 {
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			payload = cp
+		}
 		data = payload
 	} else {
 		data = reflect.New(handler.Type.Elem()).Interface()
-		err := env.Serializer.Unmarshal(payload, data)
-		if err != nil {
+		if err := serializer.Unmarshal(payload, data); err != nil {
 			log.Println(fmt.Sprintf("Deserialize to %T failed: %+v (%v)", data, err, payload))
 			return
 		}
@@ -618,7 +738,6 @@ func (h *LocalHandler) localProcess(
 	startTime := time.Now()
 
 	task := func() {
-
 		// Set the last message ID
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
@@ -630,35 +749,17 @@ func (h *LocalHandler) localProcess(
 		}
 
 		result := handler.Method.Func.Call(args)
-		log.Infof("Local process task completed: %v", msg.Route)
 		if len(result) > 0 {
 			if err := result[0].Interface(); err != nil {
 				log.Println(fmt.Sprintf("Service %s error: %+v", msg.Route, err))
-				if responseChan != nil {
-					responseChan <- []byte(fmt.Sprintf(`{"error": "%v"}`, err))
-				}
 				return
 			}
 		}
 
-		// Record the duration after processing
+		// Record the duration after processing under a bounded route label so a
+		// client cannot mint unbounded histogram series (H28).
 		duration := time.Since(startTime).Seconds()
-		metrics.RouteRequestDuration.WithLabelValues(msg.Route, msg.Type.String(), "local").Observe(duration)
-
-		if responseChan != nil {
-			// Assuming the last return value is the response
-			if len(result) > 1 {
-				response, err := json.Marshal(result[len(result)-1].Interface())
-				if err != nil {
-					log.Println(fmt.Sprintf("Failed to marshal response: %v", err))
-					responseChan <- []byte(`{"error": "Internal server error"}`)
-					return
-				}
-				responseChan <- response
-			} else {
-				responseChan <- []byte(`{"status": "ok"}`)
-			}
-		}
+		metrics.ObserveRouteRequestDuration(msg.Route, msg.Type.String(), "local", duration)
 	}
 
 	index := strings.LastIndex(msg.Route, ".")
@@ -681,10 +782,8 @@ func (h *LocalHandler) localProcess(
 			log.Println(fmt.Sprintf("nano/handler: Type %T does not implement the `scheduler.LocalScheduler` interface", sched))
 			return
 		}
-		log.Infof("Schedule task: %v", task)
 		local.Schedule(task)
 	} else {
-		log.Infof("Push task: %v", task)
 		scheduler.PushTask(task)
 	}
 }

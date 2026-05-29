@@ -41,6 +41,11 @@ type rpcClient struct {
 	sync.RWMutex
 	isClosed bool
 	pools    map[string]*connPool
+	// dialing serializes pool construction per address so only one goroutine
+	// dials a given address and, crucially, the heavy newConnArray runs without
+	// the global lock held — otherwise one slow address stalls every concurrent
+	// getConnPool caller (routing / heartbeat / session-close) (M15).
+	dialing map[string]*sync.Mutex
 }
 
 func newConnArray(maxSize uint, addr string) (*connPool, error) {
@@ -93,7 +98,8 @@ func (a *connPool) Close() {
 
 func newRPCClient() *rpcClient {
 	return &rpcClient{
-		pools: make(map[string]*connPool),
+		pools:   make(map[string]*connPool),
+		dialing: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -116,18 +122,51 @@ func (c *rpcClient) getConnPool(addr string) (*connPool, error) {
 }
 
 func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
+	// Grab (or create) the per-address dial lock under the global lock, then
+	// release the global lock before dialing so concurrent getConnPool callers
+	// for other addresses are never blocked by a slow dial (M15).
 	c.Lock()
-	defer c.Unlock()
-	array, ok := c.pools[addr]
-	if !ok {
-		var err error
-		// TODO: make conn count configurable
-		array, err = newConnArray(10, addr)
-		if err != nil {
-			return nil, err
-		}
-		c.pools[addr] = array
+	if c.isClosed {
+		c.Unlock()
+		return nil, errors.New("rpc client is closed")
 	}
+	if array, ok := c.pools[addr]; ok {
+		c.Unlock()
+		return array, nil
+	}
+	dm, ok := c.dialing[addr]
+	if !ok {
+		dm = &sync.Mutex{}
+		c.dialing[addr] = dm
+	}
+	c.Unlock()
+
+	// Only one goroutine dials a given address at a time.
+	dm.Lock()
+	defer dm.Unlock()
+
+	// Re-check: another goroutine may have built the pool while we waited.
+	c.RLock()
+	array, ok := c.pools[addr]
+	c.RUnlock()
+	if ok {
+		return array, nil
+	}
+
+	// TODO: make conn count configurable
+	array, err := newConnArray(10, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	c.Lock()
+	if c.isClosed {
+		c.Unlock()
+		array.Close()
+		return nil, errors.New("rpc client is closed")
+	}
+	c.pools[addr] = array
+	c.Unlock()
 	return array, nil
 }
 
@@ -141,4 +180,21 @@ func (c *rpcClient) closePool() {
 		}
 	}
 	c.Unlock()
+}
+
+// removePool closes and removes the connection pool for a single address. It is
+// called when a member departs the cluster so its gRPC ClientConns/goroutines
+// and the map entry are reclaimed instead of being retained for the process
+// lifetime (M3). The connections are closed outside the lock so a slow
+// Close cannot stall concurrent getConnPool callers.
+func (c *rpcClient) removePool(addr string) {
+	c.Lock()
+	pool, ok := c.pools[addr]
+	if ok {
+		delete(c.pools, addr)
+	}
+	c.Unlock()
+	if ok {
+		pool.Close()
+	}
 }

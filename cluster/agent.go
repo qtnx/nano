@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"net"
 	"reflect"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -106,8 +105,19 @@ func (a *agent) send(m pendingMessage) (err error) {
 			err = ErrBrokenPipe
 		}
 	}()
-	a.chSend <- m
-	return
+	// Non-blocking enqueue: the len()>=backlog pre-checks in Push/ResponseMid
+	// are not synchronized with the send itself, so concurrent producers can
+	// all observe space and then block forever here once the buffer fills (H7).
+	// A select with a default returns ErrBufferExceed instead of pinning the
+	// calling goroutine; the chDie case unblocks a send racing a close.
+	select {
+	case a.chSend <- m:
+		return nil
+	case <-a.chDie:
+		return ErrBrokenPipe
+	default:
+		return ErrBufferExceed
+	}
 }
 
 // LastMid implements the session.NetworkEntity interface
@@ -157,8 +167,7 @@ func (a *agent) RPC(route string, v interface{}) error {
 		Route: route,
 		Data:  data,
 	}
-	a.rpcHandler(a.session, msg, true)
-	return nil
+	return a.rpcHandler(a.session, msg, true)
 }
 
 // Response, implementation for session.NetworkEntity interface
@@ -201,24 +210,29 @@ func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 // Close closes the agent, clean inner state and close low-level connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (a *agent) Close() error {
-	if a.status() == statusClosed {
-		return ErrCloseClosedSession
+	// Atomically transition to the closed state so that exactly one caller
+	// performs teardown. The previous check-then-close was racy: two goroutines
+	// (e.g. Session.Close racing the write-loop defer) could both observe a
+	// non-closed state and both close(a.chDie), panicking the process.
+	for {
+		s := a.status()
+		if s == statusClosed {
+			return ErrCloseClosedSession
+		}
+		if atomic.CompareAndSwapInt32(&a.state, s, statusClosed) {
+			break
+		}
 	}
-	a.setStatus(statusClosed)
 
 	if env.Debug {
 		log.Println(fmt.Sprintf("Session closed, ID=%d, UID=%d, IP=%s",
 			a.session.ID(), a.session.UID(), a.conn.RemoteAddr()))
 	}
 
-	// prevent closing closed channel
-	select {
-	case <-a.chDie:
-		// expect
-	default:
-		close(a.chDie)
-		scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
-	}
+	// Only the winner of the CAS reaches here, so the channel is closed and the
+	// lifetime hook is scheduled exactly once.
+	close(a.chDie)
+	scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
 
 	metrics.ServerClosedConnections.Inc()
 	metrics.AgentClose.Inc()
@@ -247,7 +261,14 @@ func (a *agent) RemoteAddrWithoutPortStr() string {
 		log.Error("RemoteAddrWithoutPortStr: RemoteAddr() returned nil")
 		return ""
 	}
-	return strings.Split(remoteAddr.String(), ":")[0]
+	addr := remoteAddr.String()
+	// net.SplitHostPort handles IPv6 (e.g. "[2001:db8::1]:1234" -> "2001:db8::1")
+	// where a naive strings.Split(":") would corrupt the host (M17).
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
 
 // String, implementation for Stringer interface
@@ -271,14 +292,19 @@ func (a *agent) setStatus(state int32) {
 	atomic.StoreInt32(&a.state, state)
 }
 
+// touch records the most recent activity timestamp. Every write to lastAt must
+// go through here because the heartbeat-timeout loop reads it with
+// atomic.LoadInt64; a plain assignment would race those reads.
+func (a *agent) touch() {
+	atomic.StoreInt64(&a.lastAt, time.Now().Unix())
+}
+
 func (a *agent) write() {
 	ticker := time.NewTicker(env.Heartbeat)
-	chWrite := make(chan []byte, agentWriteBacklog)
 	// clean func
 	defer func() {
 		ticker.Stop()
 		close(a.chSend)
-		close(chWrite)
 		a.Close()
 		if env.Debug {
 			log.Println(fmt.Sprintf("Session write goroutine exit, SessionID=%d, UID=%d", a.session.ID(), a.session.UID()))
@@ -295,11 +321,17 @@ func (a *agent) write() {
 				)
 				return
 			}
-			chWrite <- hbd
-
-		case data := <-chWrite:
-			// close agent while low-level conn broken
-			if _, err := a.conn.Write(data); err != nil {
+			// Write the heartbeat straight to the connection. The previous
+			// implementation funnelled every frame through an intermediate
+			// chWrite channel that this same goroutine both fed and drained,
+			// which self-deadlocked once that buffer filled.
+			// Bound the blocking write so a stalled/slow peer cannot pin this
+			// goroutine (and its FD) indefinitely outside the heartbeat path
+			// (H11). The window matches the heartbeat-timeout policy.
+			if env.Heartbeat > 0 {
+				_ = a.conn.SetWriteDeadline(time.Now().Add(2 * env.Heartbeat))
+			}
+			if _, err := a.conn.Write(hbd); err != nil {
 				log.Println(err.Error())
 				return
 			}
@@ -330,9 +362,6 @@ func (a *agent) write() {
 				ID:    data.mid,
 			}
 
-			//log.Debug(fmt.Sprintf("Send message, Type=%d, ID=%d, Route=%s, Data=%+v",
-			//	m.Type, m.ID, m.Route, m.Data))
-
 			if pipe := a.pipeline; pipe != nil {
 				err := pipe.Outbound().Process(a.session, m)
 				if err != nil {
@@ -353,8 +382,18 @@ func (a *agent) write() {
 				log.Println(err)
 				break
 			}
-			log.Println("push encoded t chWrite")
-			chWrite <- p
+
+			// Write the encoded packet directly to the connection rather than
+			// queueing it on a self-fed channel.
+			// Bound the blocking write so a stalled/slow peer cannot pin this
+			// goroutine (and its FD) indefinitely (H11).
+			if env.Heartbeat > 0 {
+				_ = a.conn.SetWriteDeadline(time.Now().Add(2 * env.Heartbeat))
+			}
+			if _, err := a.conn.Write(p); err != nil {
+				log.Println(err.Error())
+				return
+			}
 
 		case <-a.chDie: // agent closed signal
 			return
