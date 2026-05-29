@@ -38,6 +38,7 @@ message RequestMessage {
   uint64 id = 5;
   string route = 6;
   bytes data = 7;
+  bool jsonPayload = 8;
 }
 
 message NotifyMessage {
@@ -47,6 +48,7 @@ message NotifyMessage {
   bytes clientUserData = 4;
   string route = 5;
   bytes data = 6;
+  bool jsonPayload = 7;
 }
 
 message ResponseMessage {
@@ -71,7 +73,10 @@ message DelMemberRequest { string serviceAddr = 1; }
 
 message DelMemberResponse {}
 
-message SessionClosedRequest { int64 sessionId = 1; }
+message SessionClosedRequest {
+  int64 sessionId = 1;
+  string gateAddr = 2;
+}
 
 message SessionClosedResponse {}
 

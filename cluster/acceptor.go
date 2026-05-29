@@ -18,13 +18,14 @@ type acceptor struct {
 	session    *session.Session
 	lastMid    uint64
 	rpcHandler rpcHandler
-	gateAddr   string
+	gateAddr    string
+	jsonPayload bool
 }
 
 // Push implements the session.NetworkEntity interface
 func (a *acceptor) Push(route string, v interface{}) error {
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
@@ -84,7 +85,7 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 
 	log.Debugf("[Acceptor] ResponseMid: %d", mid)
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
@@ -123,4 +124,15 @@ func (a *acceptor) Close() error {
 // RemoteAddr implements the session.NetworkEntity interface
 func (*acceptor) RemoteAddr() net.Addr {
 	return mock.NetAddr{}
+}
+
+// serialize encodes an outbound payload for this remote session. HTTP/SSE-backed
+// sessions (jsonPayload) use the JSON codec so a binary cluster-wide serializer
+// does not produce a body the HTTP client cannot read (M35); a raw []byte is
+// passed through unchanged in both paths.
+func (a *acceptor) serialize(v interface{}) ([]byte, error) {
+	if a.jsonPayload {
+		return serializeHTTPJSON(v)
+	}
+	return message.Serialize(v)
 }

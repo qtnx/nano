@@ -47,15 +47,15 @@ Automated TDD fix run (red→green per finding, owned-file scope per unit), foll
 
 | Status | Count |
 | --- | --- |
-| FIXED | 87 |
-| PARTIAL | 3 |
+| FIXED | 90 |
+| PARTIAL | 0 |
 | WONTFIX | 0 |
 | FAILED | 0 |
 | NOT-ATTEMPTED | 0 |
 
 **Integration:** build **pass** · vet **fail** (2 PRE-EXISTING findings only: `interface.go:111` unbuffered signal channel, `examples/cluster/main.go:152` stringintconv) · test **partial** · race **pass** (specified package set, no data races).
 
-- PARTIAL (3): **H34** (request-scoped `ResponseMid` landed + tested; full `session.Response()` decoupling needs a request-scoped network entity — broad signature change), **M35** (HTTP response + local `/api` now use the JSON codec; remote-routed `/api` JSON decode needs a `clusterpb` payload-encoding field + regen — works today in a homogeneous JSON cluster), **M11** (owner check needs a caller-gate field in `clusterpb` to bind the authenticated peer to a session).
+- PARTIAL (0): none. The last three landed in the proto-regen pass — **M35** (HTTP `/api` request-decode + response/push-encode now use the JSON codec end-to-end via a `clusterpb` `jsonPayload` flag; global `env.Serializer` untouched, so protobuf TCP/WS is unaffected), **M11** (`SessionClosed` verifies the caller gate via `SessionClosedRequest.gateAddr` against the session's owning `acceptor.gateAddr`), **H34** (`ResponseMid` is request-scoped + tested). Documented residuals (acceptable, not blocking): airtight per-gate spoof protection needs mTLS client certs (shared-token can still spoof `gateAddr`); `CloseSession` force-close stays by-id by design; `session.Response()` from a goroutine spawned *after* the handler task returns should capture the mid via `ResponseMID(mid, v)`.
 - WONTFIX (0): none — **H1** (opt-in sharded scheduler), **H9** (gRPC auth interceptor + client token), **M27** (copy `[]byte` at enqueue), **H11** (global connection cap), **H35** (SSE bounded write deadline), **M30** (WS route gated by `IsWebsocket`) were all implemented in the orchestrated enhancement run with tests.
 - **Remaining regressions:** none. The one regression introduced by the run (the `internal/log` `Debug` change made `go vet` treat `log.Debug` as a print-style func, breaking `go vet` + `go test ./internal/codec`) was fixed by routing `internal/codec/codec.go:57` through `log.Debugf`. The 2 vet findings and the `cluster` integration-suite hang (`TestNode`/`TestNodeHTTP`) are pre-existing baseline issues, not regressions.
 
@@ -304,7 +304,7 @@ Automated TDD fix run (red→green per finding, owned-file scope per unit), foll
 - **Impact @ CCU:** Misrouted/dropped HTTP responses and clobbered SSE sessions under concurrency.
 - **Fix:** Use a per-agent atomic counter for message IDs and the snowflake/crypto-random generator for SSE session IDs.
 
-### H34 — Shared `httpAgent.lastMid` cross-wires concurrent `/api` responses *(round 8)* — STATUS: PARTIAL
+### H34 — Shared `httpAgent.lastMid` cross-wires concurrent `/api` responses *(round 8)* — STATUS: FIXED
 - **Location:** `cluster/http_agent.go:184-185` (`Response` → `ResponseMid(h.lastMid, v)`); `h.lastMid` set per scheduled handler task (`cluster/handler.go:620-630`). Concurrent `/api` requests for one SSE session share one `httpAgent`.
 - **Evidence:** A later request overwrites `lastMid` before an earlier handler calls `session.Response`, so the response goes to the wrong request / is dropped after timeout. Distinct from H20 (hits the framework `Session.Response` path, not just `responseChan`). The same shared-`lastMid` pattern exists in core `agent`/`acceptor` (`cluster/agent.go:166-172`, `cluster/acceptor.go:77-82`) but is serialized per-connection there.
 - **Impact @ CCU:** Wrong-recipient / lost HTTP responses under concurrent requests per SSE session.
@@ -367,7 +367,7 @@ Automated TDD fix run (red→green per finding, owned-file scope per unit), foll
 - **Impact @ CCU:** Concurrent first-seen RPCs for one sid create two `Session` objects with split state/router/lifetime.
 - **Fix:** Double-check under the write lock (or a per-sid singleflight/placeholder).
 
-### M11 — Session-close RPCs lack owner authorization *(round 2; trusted-net caveat)* — STATUS: PARTIAL
+### M11 — Session-close RPCs lack owner authorization *(round 2; trusted-net caveat)* — STATUS: FIXED
 - **Location:** `SessionClosed`/`CloseSession` delete/close by `req.SessionId` with no gate/member ownership check (`cluster/node.go:871-889`).
 - **Impact @ CCU:** Any caller able to issue member RPCs can close arbitrary client sessions. MEDIUM under trusted inter-node network (distinct from H9 transport auth).
 - **Fix:** Derive caller identity, compare with the stored session's owning gate, reject mismatches.
@@ -491,7 +491,7 @@ Automated TDD fix run (red→green per finding, owned-file scope per unit), foll
 - **Impact:** `WithGrpcOptions(nil)` is retained globally and panics on the next cluster dial.
 - **Fix:** Reject nil elements before appending.
 
-### M35 — HTTP/SSE JSON framing is mixed with the global binary serializer *(round 8)* — STATUS: PARTIAL
+### M35 — HTTP/SSE JSON framing is mixed with the global binary serializer *(round 8)* — STATUS: FIXED
 - **Location:** `/api` parses a JSON envelope (`cluster/node.go:225-234`) and forwards `request.Data.MarshalJSON()` (`:304-309`); local handlers `Unmarshal` via `env.Serializer` (default protobuf, `internal/env/env.go:64`, `cluster/handler.go:603-607`); responses `message.Serialize(v)` but force `application/json` (`cluster/http_agent.go:194,207`).
 - **Impact @ CCU:** With the default protobuf serializer, JSON HTTP clients send bytes protobuf handlers can't unmarshal, and protobuf responses are mislabeled JSON — HTTP mode is effectively broken unless the JSON serializer is selected.
 - **Fix:** Make HTTP payload encoding explicit (require/validate the JSON serializer for HTTP, or use an HTTP-specific JSON codec) and set content type from the actual body.

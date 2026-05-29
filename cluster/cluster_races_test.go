@@ -411,7 +411,7 @@ func TestFindOrCreateSessionRejectsUnknownGate(t *testing.T) {
 	n.cluster.setRpcClient(n.rpcClient)
 	n.cluster.addMember(memberInfo("known-gate:1"))
 
-	_, err := n.findOrCreateSession(7, 0, "evil.example.com:1", []byte("{}"))
+	_, err := n.findOrCreateSession(7, 0, "evil.example.com:1", []byte("{}"), false)
 	if err == nil {
 		t.Fatal("expected findOrCreateSession to reject an unknown gate address")
 	}
@@ -442,7 +442,7 @@ func TestFindOrCreateSessionNoDuplicate(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				<-start
-				s, err := n.findOrCreateSession(sid, 0, gate, []byte("{}"))
+				s, err := n.findOrCreateSession(sid, 0, gate, []byte("{}"), false)
 				if err != nil {
 					t.Errorf("findOrCreateSession: %v", err)
 					return

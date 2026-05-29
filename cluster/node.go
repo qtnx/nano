@@ -907,7 +907,7 @@ func applyClientState(s *session.Session, clientUid int64, clientUserData []byte
 	return nil
 }
 
-func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, clientUserData []byte) (*session.Session, error) {
+func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, clientUserData []byte, jsonPayload bool) (*session.Session, error) {
 	n.mu.RLock()
 	s, found := n.sessions[sid]
 	n.mu.RUnlock()
@@ -940,7 +940,8 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		sid:        sid,
 		gateClient: clusterpb.NewMemberClient(conns.Get()),
 		rpcHandler: n.handler.remoteProcess,
-		gateAddr:   gateAddr,
+		gateAddr:    gateAddr,
+		jsonPayload: jsonPayload,
 	}
 	s = session.New(ac)
 	ac.session = s
@@ -1020,7 +1021,7 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData, req.JsonPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -1033,7 +1034,11 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, req.Id, s, msg, nil)
+	if req.JsonPayload {
+		n.handler.localProcess(handler, req.Id, s, msg, httpJSONSerializer)
+	} else {
+		n.handler.localProcess(handler, req.Id, s, msg, nil)
+	}
 	log.Debug("[Node] End handle HandleRequest", req.String())
 	return &clusterpb.MemberHandleResponse{}, nil
 }
@@ -1052,7 +1057,7 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData, req.JsonPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,7 +1067,11 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, 0, s, msg, nil)
+	if req.JsonPayload {
+		n.handler.localProcess(handler, 0, s, msg, httpJSONSerializer)
+	} else {
+		n.handler.localProcess(handler, 0, s, msg, nil)
+	}
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
@@ -1119,16 +1128,21 @@ func (n *Node) purgeGateSessions(gateAddr string) {
 
 // SessionClosed implements the MemberServer interface.
 //
-// M11 (owner authorization): the request carries only a SessionId, not the
-// caller's gate identity, and the H9 shared-token interceptor authenticates the
-// peer but does not bind it to a specific gate. With no usable per-caller
-// identity available, we keep the existing behavior (reclaim local state by
-// id). Enforcing ownership would require threading the caller's gate address
-// (a clusterpb proto field) and comparing it with the session's owning
-// acceptor.gateAddr before delete; deferred as a wire change.
+// M11 (owner authorization): a session is only reclaimed when the caller is its
+// owning gate. When req.GateAddr is set and does not match the session's owning
+// acceptor.gateAddr, the request is ignored so a non-owning peer cannot drop
+// another gate's session. An empty GateAddr keeps legacy behavior; note a
+// shared-token peer could still spoof GateAddr — full per-gate identity needs
+// mTLS client certificates.
 func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequest) (*clusterpb.SessionClosedResponse, error) {
 	n.mu.Lock()
 	s, found := n.sessions[req.SessionId]
+	if found && req.GateAddr != "" {
+		if ac, ok := s.NetworkEntity().(*acceptor); ok && ac.gateAddr != req.GateAddr {
+			n.mu.Unlock()
+			return &clusterpb.SessionClosedResponse{}, nil
+		}
+	}
 	delete(n.sessions, req.SessionId)
 	n.mu.Unlock()
 	if found {
@@ -1284,4 +1298,14 @@ func (n *Node) startPrometheus() error {
 		}
 	}()
 	return nil
+}
+
+// serializeHTTPJSON marshals an outbound payload with the HTTP JSON serializer,
+// passing a raw []byte through unchanged (matching message.Serialize semantics)
+// so an already-encoded payload is not double-encoded (M35).
+func serializeHTTPJSON(v interface{}) ([]byte, error) {
+	if b, ok := v.([]byte); ok {
+		return b, nil
+	}
+	return httpJSONSerializer.Marshal(v)
 }

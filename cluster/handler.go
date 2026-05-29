@@ -456,7 +456,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 // disconnected. It runs off the read goroutine (H6) and bounds each RPC with a
 // timeout so one slow or partitioned peer cannot stall the fan-out (H5).
 func (h *LocalHandler) notifySessionClosed(sid int64, members []string) {
-	request := &clusterpb.SessionClosedRequest{SessionId: sid}
+	request := &clusterpb.SessionClosedRequest{SessionId: sid, GateAddr: h.currentNode.ServiceAddr}
 	for _, remote := range members {
 		pool, err := h.currentNode.rpcClient.getConnPool(remote)
 		if err != nil {
@@ -616,10 +616,14 @@ func (h *LocalHandler) remoteProcess(
 	// Retrieve gate address and session id
 	gateAddr := h.currentNode.ServiceAddr
 	sessionId := session.ID()
+	jsonPayload := false
 	switch v := session.NetworkEntity().(type) {
 	case *acceptor:
 		gateAddr = v.gateAddr
 		sessionId = v.sid
+		jsonPayload = v.jsonPayload
+	case *httpAgent:
+		jsonPayload = true
 	}
 	// Marshal the session state at most once per request, and skip the
 	// json.Marshal allocation entirely when the state is empty (the common
@@ -652,6 +656,7 @@ func (h *LocalHandler) remoteProcess(
 			Id:             msg.ID,
 			Route:          msg.Route,
 			Data:           data,
+			JsonPayload:    jsonPayload,
 		}
 		log.Debugf("[RemoteProcess] start request remoteProcess ssid: %v msg: %v msgId: %d, request %v", session.ID(), msg, session.ID(), request)
 		_, err = client.HandleRequest(ctx, request)
@@ -665,6 +670,7 @@ func (h *LocalHandler) remoteProcess(
 			ClientUserData: sessionUserData,
 			Route:          msg.Route,
 			Data:           data,
+			JsonPayload:    jsonPayload,
 		}
 		_, err = client.HandleNotify(ctx, request)
 	}
