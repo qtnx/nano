@@ -255,7 +255,7 @@ func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
 			ctx.SetStatusCode(fasthttp.StatusNotFound)
 			return
 		}
-		log.Println("Handling WebSocket request")
+		log.Debug("Handling WebSocket request")
 		n.listenAndServeWS(ctx)
 	default:
 		// Unmatched routes must not be forwarded to http.DefaultServeMux: that
@@ -618,7 +618,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 }
 
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
-	log.Infof("Register SSE client: %s", sessionID)
+	log.Debugf("Register SSE client: %s", sessionID)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.sseClients[sessionID] = eventChan
@@ -640,7 +640,7 @@ func (n *Node) sseClient(sessionID string) chan []byte {
 // session and closes the entity too, so a stream exit fully reclaims state; it
 // is the single teardown path shared with backend-initiated closes (M31).
 func (n *Node) unregisterSSEClient(sessionID string, ch chan []byte) {
-	log.Infof("Unregister SSE client: %s", sessionID)
+	log.Debugf("Unregister SSE client: %s", sessionID)
 	n.mu.Lock()
 	cur, ok := n.sseClients[sessionID]
 	if ok && ch != nil && cur != ch {
@@ -899,7 +899,7 @@ EXIT:
 func (n *Node) storeSession(s *session.Session) {
 	n.mu.Lock()
 	n.sessions[s.ID()] = s
-	log.Infof("session %d stored", s.ID())
+	log.Debugf("session %d stored", s.ID())
 	n.mu.Unlock()
 }
 
