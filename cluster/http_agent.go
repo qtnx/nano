@@ -12,6 +12,7 @@ import (
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
+	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
 	"github.com/valyala/fasthttp"
 )
@@ -195,6 +196,14 @@ func (h *httpAgent) Close() error {
 	// (M31). Guarded by the closed flag above, so it closes exactly once.
 	if h.sseDone != nil {
 		close(h.sseDone)
+	}
+	// Run the application close hooks exactly once (the closed guard above), on
+	// the logic goroutine — TCP/WS agents do the same, so HTTP/SSE sessions get
+	// the same Lifetime.OnClosed cleanup (rooms/presence/groups) instead of
+	// leaking that state on disconnect/backend-close.
+	if h.session != nil {
+		s := h.session
+		scheduler.PushTask(func() { session.Lifetime.Close(s) })
 	}
 	return nil
 }
