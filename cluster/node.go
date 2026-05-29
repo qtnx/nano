@@ -949,13 +949,18 @@ func (n *Node) keepalive() {
 			log.Println("Member send heartbeat error", err)
 			return
 		}
-		// Self-heal any NewMember/DelMember push missed during churn: the master
+		// Self-heal any NewMember push missed during churn: the master
 		// returns its authoritative member list, so a member that registered after
-		// our initial sync is re-learned here instead of staying invisible (which
-		// otherwise wedged gateway readiness until a restart). Add-only; we register
-		// remote services only for genuinely new members (addRemoteService has no
-		// dedup, so re-registering a known member would duplicate its routes).
-		for _, info := range n.cluster.reconcileMembers(resp.GetMembers()) {
+		// our initial sync is re-learned here instead of staying invisible. Member
+		// removal remains with DelMember/heartbeat-timeout so an incomplete master
+		// view cannot prune live peers. Updated members must refresh existing routes
+		// because addRemoteService appends without dedup.
+		added, updated := n.cluster.reconcileMembers(resp.GetMembers())
+		for _, info := range updated {
+			n.handler.delMember(info.ServiceAddr)
+			n.handler.addRemoteService(info)
+		}
+		for _, info := range added {
 			n.handler.addRemoteService(info)
 		}
 	}

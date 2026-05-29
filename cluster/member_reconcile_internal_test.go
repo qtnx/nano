@@ -32,10 +32,13 @@ func TestReconcileMembersAddsMembersMissedByPush(t *testing.T) {
 	c.members = []*Member{{memberInfo: known}}
 
 	missed := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
-	added := c.reconcileMembers([]*clusterpb.MemberInfo{self, known, missed})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{self, known, missed})
 
 	if len(added) != 1 || added[0].ServiceAddr != missed.ServiceAddr {
 		t.Fatalf("added = %v, want exactly [%s]", added, missed.ServiceAddr)
+	}
+	if len(updated) != 0 {
+		t.Fatalf("updated = %v, want none", updated)
 	}
 	if countMemberAddr(c, missed.ServiceAddr) != 1 {
 		t.Fatalf("missed member %s not added exactly once: count=%d", missed.ServiceAddr, countMemberAddr(c, missed.ServiceAddr))
@@ -59,7 +62,10 @@ func TestReconcileMembersNeverRemovesLivePeers(t *testing.T) {
 	c.members = []*Member{{memberInfo: a}, {memberInfo: b}}
 
 	// Authoritative list omits b (incomplete master view).
-	c.reconcileMembers([]*clusterpb.MemberInfo{a})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{a})
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("reconcile reported added=%v updated=%v, want no route changes", added, updated)
+	}
 
 	if countMemberAddr(c, b.ServiceAddr) != 1 {
 		t.Fatalf("add-only reconcile removed live peer %s", b.ServiceAddr)
@@ -77,16 +83,68 @@ func TestReconcileMembersIdempotentNoDuplicates(t *testing.T) {
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.members = []*Member{{memberInfo: known}}
 
-	if added := c.reconcileMembers([]*clusterpb.MemberInfo{known}); len(added) != 0 {
-		t.Fatalf("re-reconciling a known member reported additions: %v", added)
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{known})
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("re-reconciling a known member reported changes: added=%v updated=%v", added, updated)
 	}
 	if countMemberAddr(c, known.ServiceAddr) != 1 {
 		t.Fatalf("known member duplicated: count=%d", countMemberAddr(c, known.ServiceAddr))
 	}
 }
 
+// Reconcile must refresh same-address metadata. This handles a node restarting
+// or redeploying at the same service address with a changed service list after a
+// peer missed the NewMember push.
+func TestReconcileMembersUpdatesSameAddressMetadata(t *testing.T) {
+	oldInfo := mkMemberInfo("user-service", "user:8085", "UserService")
+	newInfo := mkMemberInfo("user-service-v2", "user:8085", "UserServiceV2")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: oldInfo}}
+
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo})
+	if len(added) != 0 {
+		t.Fatalf("added = %v, want none for same address", added)
+	}
+	if len(updated) != 1 || updated[0].ServiceAddr != newInfo.ServiceAddr {
+		t.Fatalf("updated = %v, want exactly [%s]", updated, newInfo.ServiceAddr)
+	}
+	if countMemberAddr(c, newInfo.ServiceAddr) != 1 {
+		t.Fatalf("member %s duplicated during update: count=%d", newInfo.ServiceAddr, countMemberAddr(c, newInfo.ServiceAddr))
+	}
+	got := c.members[0].memberInfo
+	if got.Label != newInfo.Label || len(got.Services) != 1 || got.Services[0] != newInfo.Services[0] {
+		t.Fatalf("member metadata = %+v, want %+v", got, newInfo)
+	}
+}
+
+func TestUpdatedMemberRefreshesRemoteServiceRoutesWithoutDuplicates(t *testing.T) {
+	oldInfo := mkMemberInfo("user-service", "user:8085", "UserService")
+	newInfo := mkMemberInfo("user-service", "user:8085", "UserServiceV2")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: oldInfo}}
+	h := NewHandler(nil, nil)
+	h.addRemoteService(oldInfo)
+
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo})
+	for _, info := range updated {
+		h.delMember(info.ServiceAddr)
+		h.addRemoteService(info)
+	}
+	for _, info := range added {
+		h.addRemoteService(info)
+	}
+
+	if members := h.findMembers("UserService"); len(members) != 0 {
+		t.Fatalf("old service route still exists: %v", members)
+	}
+	members := h.findMembers("UserServiceV2")
+	if len(members) != 1 || members[0].ServiceAddr != newInfo.ServiceAddr {
+		t.Fatalf("new service route members = %v, want one %s", members, newInfo.ServiceAddr)
+	}
+}
+
 // The master's Heartbeat response must carry its authoritative member list so
-// members can reconcile missed NewMember/DelMember pushes each heartbeat.
+// members can reconcile missed NewMember pushes each heartbeat.
 func TestHeartbeatResponseIncludesCurrentMembers(t *testing.T) {
 	master := &Node{ServiceAddr: "master:8085"}
 	master.IsMaster = true

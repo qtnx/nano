@@ -201,7 +201,7 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	}
 
 	// Return the authoritative member list so the requesting node can reconcile
-	// any NewMember/DelMember push it missed during churn (see reconcileMembers).
+	// any NewMember push it missed during churn (see reconcileMembers).
 	// Mirrors RegisterResponse: include every member, master included.
 	resp := &clusterpb.HeartbeatResponse{}
 	for _, m := range c.members {
@@ -338,22 +338,23 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo) {
 	c.mu.Unlock()
 }
 
-// reconcileMembers ADDS any members reported by the master (e.g. in a heartbeat
-// response) that this node does not already know about, and returns the members
-// that were newly added so the caller can register their remote services exactly
-// once (addRemoteService appends without dedup, so it must only run for new ones).
+// reconcileMembers adds or updates any members reported by the master (e.g. in
+// a heartbeat response), and returns the members that need remote-service route
+// refreshes. Newly added members can be registered directly; updated members
+// must replace existing remote-service routes because addRemoteService appends
+// without dedup.
 //
-// It is intentionally ADD-ONLY and never removes members: removal stays with the
-// heartbeat-timeout / DelMember path. Pruning here would let a transient or
+// It intentionally never removes members: removal stays with the heartbeat-timeout
+// / DelMember path. Pruning here would let a transient or
 // incomplete master view (for example right after a master restart, before every
 // member has re-heartbeated) drop a live peer and break routing.
 //
 // This is what lets a node self-heal a missed NewMember push: pingNodes and route
 // resolution only see c.members, so a member that registered after this node's
 // initial sync would otherwise stay invisible until a process restart.
-func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) []*clusterpb.MemberInfo {
+func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) (added, updated []*clusterpb.MemberInfo) {
 	if len(infos) == 0 {
-		return nil
+		return nil, nil
 	}
 	var selfAddr string
 	if c.currentNode != nil {
@@ -363,26 +364,50 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) []*clusterpb.M
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	known := make(map[string]struct{}, len(c.members))
+	known := make(map[string]*Member, len(c.members))
 	for _, m := range c.members {
 		if m.memberInfo != nil {
-			known[m.memberInfo.ServiceAddr] = struct{}{}
+			known[m.memberInfo.ServiceAddr] = m
 		}
 	}
 
-	var added []*clusterpb.MemberInfo
 	for _, info := range infos {
 		if info == nil || info.ServiceAddr == "" || info.ServiceAddr == selfAddr {
 			continue
 		}
-		if _, ok := known[info.ServiceAddr]; ok {
+		if member, ok := known[info.ServiceAddr]; ok {
+			if !memberInfoEqual(member.memberInfo, info) {
+				member.memberInfo = info
+				updated = append(updated, info)
+			}
 			continue
 		}
-		c.members = append(c.members, &Member{memberInfo: info})
-		known[info.ServiceAddr] = struct{}{}
+		member := &Member{memberInfo: info}
+		c.members = append(c.members, member)
+		known[info.ServiceAddr] = member
 		added = append(added, info)
 	}
-	return added
+	return added, updated
+}
+
+func memberInfoEqual(a, b *clusterpb.MemberInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.GetLabel() != b.GetLabel() || a.GetServiceAddr() != b.GetServiceAddr() {
+		return false
+	}
+	aServices := a.GetServices()
+	bServices := b.GetServices()
+	if len(aServices) != len(bServices) {
+		return false
+	}
+	for i := range aServices {
+		if aServices[i] != bServices[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *cluster) delMember(addr string) {
