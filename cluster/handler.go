@@ -581,26 +581,32 @@ func (h *LocalHandler) remoteProcess(
 	// 1. if exist customer remote service route ,use it, otherwise use default strategy
 	// 2. Use the service address directly if the router contains binding item
 	// 3. Select a remote service address randomly and bind to router
-	var remoteAddr string
-	if h.currentNode.Options.RemoteServiceRoute != nil {
-		if addr, found := session.Router().Find(service); found {
-			remoteAddr = addr
-		} else {
-			member := h.currentNode.Options.RemoteServiceRoute(service, session, members)
-			if member == nil {
-				log.Println(fmt.Sprintf("customize remoteServiceRoute handler: %s is not found", msg.Route))
-				return fmt.Errorf("nano/handler: customize remoteServiceRoute handler: %s is not found", msg.Route)
+	// A session can pin a service to a remote address. If that address has since
+	// left the cluster (member departure / rollout), drop the stale binding and
+	// re-select rather than dialing a gone node (otherwise getConnPool would
+	// even recreate a pool for the departed address).
+	inMembers := func(addr string) bool {
+		for _, m := range members {
+			if m.ServiceAddr == addr {
+				return true
 			}
-			remoteAddr = member.ServiceAddr
-			session.Router().Bind(service, remoteAddr)
 		}
+		return false
+	}
+	var remoteAddr string
+	if addr, found := session.Router().Find(service); found && inMembers(addr) {
+		remoteAddr = addr
+	} else if h.currentNode.Options.RemoteServiceRoute != nil {
+		member := h.currentNode.Options.RemoteServiceRoute(service, session, members)
+		if member == nil {
+			log.Println(fmt.Sprintf("customize remoteServiceRoute handler: %s is not found", msg.Route))
+			return fmt.Errorf("nano/handler: customize remoteServiceRoute handler: %s is not found", msg.Route)
+		}
+		remoteAddr = member.ServiceAddr
+		session.Router().Bind(service, remoteAddr)
 	} else {
-		if addr, found := session.Router().Find(service); found {
-			remoteAddr = addr
-		} else {
-			remoteAddr = members[rand.Intn(len(members))].ServiceAddr
-			session.Router().Bind(service, remoteAddr)
-		}
+		remoteAddr = members[rand.Intn(len(members))].ServiceAddr
+		session.Router().Bind(service, remoteAddr)
 	}
 	pool, err := h.currentNode.rpcClient.getConnPool(remoteAddr)
 	if err != nil {

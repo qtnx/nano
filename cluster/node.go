@@ -693,7 +693,9 @@ func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
 				r.Header.Add(string(key), string(value))
 			})
 			ok := env.CheckOrigin(r)
-			log.Println(fmt.Sprintf("CheckOrigin ok: %v", ok))
+			if env.Debug {
+				log.Debugf("CheckOrigin ok: %v", ok)
+			}
 			return ok
 		},
 	}
@@ -1038,7 +1040,9 @@ func (n *Node) Ping(_ context.Context, _ *clusterpb.PingRequest) (*clusterpb.Pin
 }
 
 func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Debug("[Node] Start handle HandleRequest", req.String())
+	if env.Debug {
+		log.Debug("[Node] Start handle HandleRequest", req.String())
+	}
 	handler, found := n.handler.localHandlers[req.Route]
 
 	if !found {
@@ -1062,7 +1066,9 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 	} else {
 		n.handler.localProcess(handler, req.Id, s, msg, nil)
 	}
-	log.Debug("[Node] End handle HandleRequest", req.String())
+	if env.Debug {
+		log.Debug("[Node] End handle HandleRequest", req.String())
+	}
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
@@ -1075,7 +1081,9 @@ func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage)
 }
 
 func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Debug("[Node] Start handle HandleNotify", req.String())
+	if env.Debug {
+		log.Debug("[Node] Start handle HandleNotify", req.String())
+	}
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)

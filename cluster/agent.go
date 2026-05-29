@@ -364,9 +364,8 @@ func (a *agent) write() {
 				break
 			}
 
-			if data.route == "" {
-				log.Println("empty route")
-			}
+			// Response/Notify-style frames legitimately carry no route, so the
+			// previous unconditional "empty route" log fired on every response.
 
 			// construct message and encode
 			m := &message.Message{

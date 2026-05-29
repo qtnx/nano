@@ -124,9 +124,10 @@ func WithDictionary(dict map[string]uint16) Option {
 func WithWSPath(path string) Option {
 	return func(_ *cluster.Options) {
 		switch path {
-		case "/api", "/sse", "/health":
-			// Reserved by the HTTP listener; accepting it would silently shadow
-			// the WS route and make it unreachable.
+		case "/api", "/sse", "/health", "api", "sse", "health":
+			// Reserved by the HTTP listener (with or without a leading slash,
+			// since the router normalizes the path); accepting it would silently
+			// shadow the WS route and make it unreachable (L10).
 			log.Println("nano: ignoring reserved WithWSPath value: " + path)
 			return
 		}
