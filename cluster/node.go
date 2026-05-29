@@ -558,8 +558,24 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
-	n.storeSession(agent.session)
-	n.registerSSEClient(sessionID, sseEventChan)
+	// Atomically publish the new SSE session + channel and capture any HTTP/SSE
+	// session it displaces (a client reconnecting / a second tab reusing the same
+	// id). The displaced session is closed after the lock so its
+	// Lifetime.OnClosed cleanup runs and its old stream goroutine stops — a
+	// plain overwrite would leak both on a normal EventSource reconnect. The
+	// stale-channel guard in unregisterSSEClient keeps the old stream's defer
+	// from tearing down this replacement (H19).
+	n.mu.Lock()
+	var displaced *httpAgent
+	if old := n.sessions[sidInt]; old != nil {
+		displaced, _ = old.NetworkEntity().(*httpAgent)
+	}
+	n.sessions[sidInt] = agent.session
+	n.sseClients[sessionID] = sseEventChan
+	n.mu.Unlock()
+	if displaced != nil {
+		displaced.Close()
+	}
 
 	// Capture the underlying connection before returning so the stream-writer
 	// goroutine (run by fasthttp after this handler returns) can bound each
