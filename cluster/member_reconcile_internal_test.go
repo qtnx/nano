@@ -127,6 +127,27 @@ func TestReconcileMembersAcceptsLowerVersionFromNewMasterEpoch(t *testing.T) {
 	}
 }
 
+func TestReconcileMembersAcceptsLowerEpochFromRestartedMaster(t *testing.T) {
+	known := mkMemberInfo("user-service", "user:8085", "UserService")
+	missed := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: known}}
+	c.membershipVersion = 10
+	c.membershipEpoch = 200
+
+	added, updated, removed := c.reconcileMembers([]*clusterpb.MemberInfo{known, missed}, nil, 1, 100)
+
+	if len(added) != 1 || added[0].ServiceAddr != missed.ServiceAddr {
+		t.Fatalf("lower restarted master epoch did not add missed member: added=%v", added)
+	}
+	if len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("updated=%v removed=%v, want none", updated, removed)
+	}
+	if c.membershipEpoch != 100 || c.membershipVersion != 1 {
+		t.Fatalf("membership state = epoch %d version %d, want epoch 100 version 1", c.membershipEpoch, c.membershipVersion)
+	}
+}
+
 func TestReconcileMembersAcceptsFirstEpochWhenLocalVersionIsHigher(t *testing.T) {
 	missed := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
@@ -145,19 +166,32 @@ func TestReconcileMembersAcceptsFirstEpochWhenLocalVersionIsHigher(t *testing.T)
 	}
 }
 
-func TestReconcileMembersSkipsOlderMasterEpochAfterRestart(t *testing.T) {
-	oldEpochMember := mkMemberInfo("old-service", "old:8085", "OldService")
+func TestNewMemberSkipsDifferentEpochEventUntilHeartbeatReconcile(t *testing.T) {
+	newInfo := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.membershipVersion = 1
 	c.membershipEpoch = 200
 
-	added, updated, removed := c.reconcileMembers([]*clusterpb.MemberInfo{oldEpochMember}, nil, 10, 100)
-
-	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
-		t.Fatalf("older master epoch changed membership: added=%v updated=%v removed=%v", added, updated, removed)
+	if c.addMember(newInfo, 1, 100) {
+		t.Fatal("different-epoch NewMember event was applied before heartbeat reconciliation")
 	}
-	if countMemberAddr(c, oldEpochMember.ServiceAddr) != 0 {
-		t.Fatalf("older master epoch added %s", oldEpochMember.ServiceAddr)
+	if countMemberAddr(c, newInfo.ServiceAddr) != 0 {
+		t.Fatalf("different-epoch NewMember added %s before heartbeat reconciliation", newInfo.ServiceAddr)
+	}
+}
+
+func TestDelMemberSkipsDifferentEpochEventUntilHeartbeatReconcile(t *testing.T) {
+	known := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: known, membershipVersion: 1, membershipEpoch: 200}}
+	c.membershipVersion = 1
+	c.membershipEpoch = 200
+
+	if c.delMember(known.ServiceAddr, 1, 100) {
+		t.Fatal("different-epoch DelMember event was applied before heartbeat reconciliation")
+	}
+	if countMemberAddr(c, known.ServiceAddr) != 1 {
+		t.Fatalf("different-epoch DelMember removed %s before heartbeat reconciliation", known.ServiceAddr)
 	}
 }
 

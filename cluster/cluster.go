@@ -22,6 +22,8 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -56,6 +58,13 @@ func newCluster(currentNode *Node) *cluster {
 }
 
 func newMembershipEpoch() uint64 {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		epoch := binary.LittleEndian.Uint64(buf[:])
+		if epoch != 0 {
+			return epoch
+		}
+	}
 	epoch := uint64(time.Now().UnixNano())
 	if epoch == 0 {
 		return 1
@@ -368,7 +377,7 @@ func (c *cluster) remoteAddrs() []string {
 
 func (c *cluster) initMembers(members []*clusterpb.MemberInfo, membershipVersion, membershipEpoch uint64) {
 	c.mu.Lock()
-	c.acceptMembershipStateLocked(membershipVersion, membershipEpoch)
+	c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch)
 	for _, info := range members {
 		c.members = append(c.members, &Member{
 			memberInfo:        info,
@@ -385,7 +394,7 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membe
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
+	if !c.acceptMembershipEventLocked(membershipVersion, membershipEpoch) {
 		return false
 	}
 	c.clearRemovedMemberLocked(info.GetServiceAddr())
@@ -420,7 +429,7 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membe
 // live list: pruning here would let a transient or incomplete master view (for
 // example right after a master restart, before every member has re-heartbeated)
 // drop a live peer and break routing. Removals self-heal via explicit
-// RemovedMember tombstones, which are ordered by membership version/epoch.
+// RemovedMember tombstones, which are scoped by membership epoch/version.
 //
 // This is what lets a node self-heal a missed NewMember push: pingNodes and route
 // resolution only see c.members, so a member that registered after this node's
@@ -436,7 +445,7 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo, removedInfos [
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
+	if !c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch) {
 		return nil, nil, nil
 	}
 
@@ -508,7 +517,7 @@ func memberInfoEqual(a, b *clusterpb.MemberInfo) bool {
 func (c *cluster) delMember(addr string, membershipVersion, membershipEpoch uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.acceptMembershipStateLocked(membershipVersion, membershipEpoch) {
+	if !c.acceptMembershipEventLocked(membershipVersion, membershipEpoch) {
 		return false
 	}
 	return c.delMemberLocked(addr)
@@ -539,21 +548,29 @@ func (c *cluster) ensureMembershipEpochLocked() uint64 {
 	return c.membershipEpoch
 }
 
-func (c *cluster) acceptMembershipStateLocked(membershipVersion, membershipEpoch uint64) bool {
+func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch uint64) bool {
 	if membershipEpoch > 0 {
-		if c.membershipEpoch > 0 {
-			if membershipEpoch < c.membershipEpoch {
-				return false
-			}
-			if membershipEpoch > c.membershipEpoch {
-				c.membershipEpoch = membershipEpoch
-				c.membershipVersion = 0
-			}
-		} else {
+		if membershipEpoch != c.membershipEpoch {
 			c.membershipEpoch = membershipEpoch
 			c.membershipVersion = 0
 		}
 	}
+	return c.acceptMembershipVersionLocked(membershipVersion)
+}
+
+func (c *cluster) acceptMembershipEventLocked(membershipVersion, membershipEpoch uint64) bool {
+	if membershipEpoch > 0 {
+		if c.membershipEpoch == 0 {
+			c.membershipEpoch = membershipEpoch
+			c.membershipVersion = 0
+		} else if membershipEpoch != c.membershipEpoch {
+			return false
+		}
+	}
+	return c.acceptMembershipVersionLocked(membershipVersion)
+}
+
+func (c *cluster) acceptMembershipVersionLocked(membershipVersion uint64) bool {
 	if membershipVersion > 0 && membershipVersion < c.membershipVersion {
 		return false
 	}
