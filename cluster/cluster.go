@@ -79,14 +79,20 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		if m.isMaster {
 			continue
 		}
+		// Best-effort notification: a peer that is briefly unreachable during
+		// churn must NOT abort the registration (which would also skip notifying
+		// every remaining peer and fail the registering node). The member→master
+		// heartbeat carries the authoritative member list, so any missed
+		// NewMember push self-heals on the next heartbeat via reconcileMembers.
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if err != nil {
-			return nil, err
+			log.Println("Notify peer of new member failed (best-effort), get conn pool", m.memberInfo.ServiceAddr, err)
+			continue
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
-		_, err = client.NewMember(context.Background(), newMember)
-		if err != nil {
-			return nil, err
+		if _, err := client.NewMember(context.Background(), newMember); err != nil {
+			log.Println("Notify peer of new member failed (best-effort)", m.memberInfo.ServiceAddr, err)
+			continue
 		}
 	}
 
@@ -193,7 +199,15 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 		c.currentNode.handler.addRemoteService(req.MemberInfo)
 		log.Println("Heartbeat peer register to cluster", req.MemberInfo.ServiceAddr)
 	}
-	return &clusterpb.HeartbeatResponse{}, nil
+
+	// Return the authoritative member list so the requesting node can reconcile
+	// any NewMember/DelMember push it missed during churn (see reconcileMembers).
+	// Mirrors RegisterResponse: include every member, master included.
+	resp := &clusterpb.HeartbeatResponse{}
+	for _, m := range c.members {
+		resp.Members = append(resp.Members, m.MemberInfo())
+	}
+	return resp, nil
 }
 
 func (c *cluster) checkMemberHeartbeat() {
@@ -322,6 +336,53 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo) {
 		})
 	}
 	c.mu.Unlock()
+}
+
+// reconcileMembers ADDS any members reported by the master (e.g. in a heartbeat
+// response) that this node does not already know about, and returns the members
+// that were newly added so the caller can register their remote services exactly
+// once (addRemoteService appends without dedup, so it must only run for new ones).
+//
+// It is intentionally ADD-ONLY and never removes members: removal stays with the
+// heartbeat-timeout / DelMember path. Pruning here would let a transient or
+// incomplete master view (for example right after a master restart, before every
+// member has re-heartbeated) drop a live peer and break routing.
+//
+// This is what lets a node self-heal a missed NewMember push: pingNodes and route
+// resolution only see c.members, so a member that registered after this node's
+// initial sync would otherwise stay invisible until a process restart.
+func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) []*clusterpb.MemberInfo {
+	if len(infos) == 0 {
+		return nil
+	}
+	var selfAddr string
+	if c.currentNode != nil {
+		selfAddr = c.currentNode.ServiceAddr
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	known := make(map[string]struct{}, len(c.members))
+	for _, m := range c.members {
+		if m.memberInfo != nil {
+			known[m.memberInfo.ServiceAddr] = struct{}{}
+		}
+	}
+
+	var added []*clusterpb.MemberInfo
+	for _, info := range infos {
+		if info == nil || info.ServiceAddr == "" || info.ServiceAddr == selfAddr {
+			continue
+		}
+		if _, ok := known[info.ServiceAddr]; ok {
+			continue
+		}
+		c.members = append(c.members, &Member{memberInfo: info})
+		known[info.ServiceAddr] = struct{}{}
+		added = append(added, info)
+	}
+	return added
 }
 
 func (c *cluster) delMember(addr string) {

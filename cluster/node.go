@@ -938,14 +938,25 @@ func (n *Node) keepalive() {
 			return
 		}
 		masterCli := clusterpb.NewMasterClient(pool.Get())
-		if _, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		resp, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
 			MemberInfo: &clusterpb.MemberInfo{
 				Label:       n.Label,
 				ServiceAddr: n.ServiceAddr,
 				Services:    n.handler.LocalService(),
 			},
-		}); err != nil {
+		})
+		if err != nil {
 			log.Println("Member send heartbeat error", err)
+			return
+		}
+		// Self-heal any NewMember/DelMember push missed during churn: the master
+		// returns its authoritative member list, so a member that registered after
+		// our initial sync is re-learned here instead of staying invisible (which
+		// otherwise wedged gateway readiness until a restart). Add-only; we register
+		// remote services only for genuinely new members (addRemoteService has no
+		// dedup, so re-registering a known member would duplicate its routes).
+		for _, info := range n.cluster.reconcileMembers(resp.GetMembers()) {
+			n.handler.addRemoteService(info)
 		}
 	}
 	go func() {

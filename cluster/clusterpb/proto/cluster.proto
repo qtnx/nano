@@ -18,7 +18,7 @@ message UnregisterResponse {}
 
 message HeartbeatRequest { MemberInfo memberInfo = 1; }
 
-message HeartbeatResponse {}
+message HeartbeatResponse { repeated MemberInfo members = 1; }
 
 message PingRequest {}
 
