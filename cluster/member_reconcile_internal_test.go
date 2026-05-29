@@ -75,9 +75,43 @@ func TestReconcileMembersNeverRemovesLivePeers(t *testing.T) {
 	}
 }
 
+// A heartbeat response built before DelMember can arrive after DelMember was
+// already applied locally. That stale snapshot must not re-add the deleted peer.
+func TestReconcileMembersSkipsRecentlyDeletedMemberFromStaleHeartbeat(t *testing.T) {
+	deleted := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: deleted}}
+
+	c.delMember(deleted.ServiceAddr)
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{deleted})
+
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("stale heartbeat resurrected deleted member: added=%v updated=%v", added, updated)
+	}
+	if countMemberAddr(c, deleted.ServiceAddr) != 0 {
+		t.Fatalf("deleted member %s was re-added", deleted.ServiceAddr)
+	}
+}
+
+func TestAddMemberClearsRecentDeleteTombstoneForNewMemberPush(t *testing.T) {
+	restarted := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: restarted}}
+
+	c.delMember(restarted.ServiceAddr)
+	c.addMember(restarted)
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{restarted})
+
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("restarted member reported reconcile changes: added=%v updated=%v", added, updated)
+	}
+	if countMemberAddr(c, restarted.ServiceAddr) != 1 {
+		t.Fatalf("restarted member count = %d, want 1", countMemberAddr(c, restarted.ServiceAddr))
+	}
+}
+
 // Reconcile must be idempotent: a member already known is not duplicated, and a
-// repeat reconcile reports nothing newly added (so callers never re-register an
-// already-known member's routes — addRemoteService appends without dedup).
+// repeat reconcile reports nothing newly added.
 func TestReconcileMembersIdempotentNoDuplicates(t *testing.T) {
 	known := mkMemberInfo("user-service", "user:8085")
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
@@ -140,6 +174,57 @@ func TestUpdatedMemberRefreshesRemoteServiceRoutesWithoutDuplicates(t *testing.T
 	members := h.findMembers("UserServiceV2")
 	if len(members) != 1 || members[0].ServiceAddr != newInfo.ServiceAddr {
 		t.Fatalf("new service route members = %v, want one %s", members, newInfo.ServiceAddr)
+	}
+}
+
+func TestNewMemberRefreshesExistingRemoteServiceRoutes(t *testing.T) {
+	oldInfo := mkMemberInfo("user-service", "user:8085", "UserService")
+	newInfo := mkMemberInfo("user-service", "user:8085", "UserServiceV2")
+	n := &Node{
+		cluster: &cluster{},
+		handler: NewHandler(nil, nil),
+	}
+	n.cluster.addMember(oldInfo)
+	n.handler.addRemoteService(oldInfo)
+
+	if _, err := n.NewMember(context.Background(), &clusterpb.NewMemberRequest{MemberInfo: newInfo}); err != nil {
+		t.Fatalf("NewMember returned error: %v", err)
+	}
+
+	if members := n.handler.findMembers("UserService"); len(members) != 0 {
+		t.Fatalf("old service route still exists after NewMember refresh: %v", members)
+	}
+	members := n.handler.findMembers("UserServiceV2")
+	if len(members) != 1 || members[0].ServiceAddr != newInfo.ServiceAddr {
+		t.Fatalf("new service route members = %v, want one %s", members, newInfo.ServiceAddr)
+	}
+	if countMemberAddr(n.cluster, newInfo.ServiceAddr) != 1 {
+		t.Fatalf("member %s duplicated during NewMember refresh", newInfo.ServiceAddr)
+	}
+}
+
+func TestAddRemoteServiceIsIdempotentByServiceAddr(t *testing.T) {
+	h := NewHandler(nil, nil)
+	info := mkMemberInfo("user-service", "user:8085", "UserService")
+
+	h.addRemoteService(info)
+	h.addRemoteService(info)
+
+	members := h.findMembers("UserService")
+	if len(members) != 1 || members[0].ServiceAddr != info.ServiceAddr {
+		t.Fatalf("remote service members = %v, want one %s", members, info.ServiceAddr)
+	}
+}
+
+func TestDelMemberRemovesDuplicateRemoteServiceRoutes(t *testing.T) {
+	h := NewHandler(nil, nil)
+	info := mkMemberInfo("user-service", "user:8085", "UserService")
+	h.remoteServices["UserService"] = []*clusterpb.MemberInfo{info, info}
+
+	h.delMember(info.ServiceAddr)
+
+	if members := h.findMembers("UserService"); len(members) != 0 {
+		t.Fatalf("duplicate remote service routes were not removed: %v", members)
 	}
 }
 

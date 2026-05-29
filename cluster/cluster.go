@@ -39,8 +39,9 @@ type cluster struct {
 	currentNode *Node
 	rpcClient   *rpcClient
 
-	mu      sync.RWMutex
-	members []*Member
+	mu             sync.RWMutex
+	members        []*Member
+	deletedMembers map[string]time.Time
 }
 
 func newCluster(currentNode *Node) *cluster {
@@ -99,6 +100,7 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
 	// Register services to current node
+	c.currentNode.handler.delMember(req.MemberInfo.ServiceAddr)
 	c.currentNode.handler.addRemoteService(req.MemberInfo)
 	c.mu.Lock()
 	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
@@ -321,7 +323,11 @@ func (c *cluster) initMembers(members []*clusterpb.MemberInfo) {
 }
 
 func (c *cluster) addMember(info *clusterpb.MemberInfo) {
+	if info == nil {
+		return
+	}
 	c.mu.Lock()
+	c.clearDeletedMemberLocked(info.GetServiceAddr())
 	var found bool
 	for _, member := range c.members {
 		if member.memberInfo.ServiceAddr == info.ServiceAddr {
@@ -341,8 +347,8 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo) {
 // reconcileMembers adds or updates any members reported by the master (e.g. in
 // a heartbeat response), and returns the members that need remote-service route
 // refreshes. Newly added members can be registered directly; updated members
-// must replace existing remote-service routes because addRemoteService appends
-// without dedup.
+// must replace existing remote-service routes because addRemoteService cannot
+// remove routes for services the member no longer advertises.
 //
 // It intentionally never removes members: removal stays with the heartbeat-timeout
 // / DelMember path. Pruning here would let a transient or
@@ -363,6 +369,7 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) (added, update
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
 
 	known := make(map[string]*Member, len(c.members))
 	for _, m := range c.members {
@@ -373,6 +380,9 @@ func (c *cluster) reconcileMembers(infos []*clusterpb.MemberInfo) (added, update
 
 	for _, info := range infos {
 		if info == nil || info.ServiceAddr == "" || info.ServiceAddr == selfAddr {
+			continue
+		}
+		if c.isRecentlyDeletedLocked(info.ServiceAddr, now) {
 			continue
 		}
 		if member, ok := known[info.ServiceAddr]; ok {
@@ -412,6 +422,7 @@ func memberInfoEqual(a, b *clusterpb.MemberInfo) bool {
 
 func (c *cluster) delMember(addr string) {
 	c.mu.Lock()
+	c.rememberDeletedMemberLocked(addr, time.Now())
 	var index = -1
 	for i, member := range c.members {
 		if member.memberInfo.ServiceAddr == addr {
@@ -427,4 +438,36 @@ func (c *cluster) delMember(addr string) {
 		}
 	}
 	c.mu.Unlock()
+}
+
+func (c *cluster) rememberDeletedMemberLocked(addr string, deletedAt time.Time) {
+	if addr == "" {
+		return
+	}
+	if c.deletedMembers == nil {
+		c.deletedMembers = make(map[string]time.Time)
+	}
+	c.deletedMembers[addr] = deletedAt
+}
+
+func (c *cluster) clearDeletedMemberLocked(addr string) {
+	if c.deletedMembers == nil || addr == "" {
+		return
+	}
+	delete(c.deletedMembers, addr)
+}
+
+func (c *cluster) isRecentlyDeletedLocked(addr string, now time.Time) bool {
+	if c.deletedMembers == nil || addr == "" {
+		return false
+	}
+	deletedAt, ok := c.deletedMembers[addr]
+	if !ok {
+		return false
+	}
+	if now.Sub(deletedAt) > 4*env.Heartbeat {
+		delete(c.deletedMembers, addr)
+		return false
+	}
+	return true
 }

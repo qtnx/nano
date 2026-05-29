@@ -166,11 +166,26 @@ func (h *LocalHandler) initRemoteService(members []*clusterpb.MemberInfo) {
 }
 
 func (h *LocalHandler) addRemoteService(member *clusterpb.MemberInfo) {
+	if member == nil {
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	for _, s := range member.Services {
 		log.Println("Register remote service", s)
+		replaced := false
+		for i, existing := range h.remoteServices[s] {
+			if existing != nil && existing.ServiceAddr == member.ServiceAddr {
+				h.remoteServices[s][i] = member
+				replaced = true
+				break
+			}
+		}
+		if replaced {
+			continue
+		}
 		h.remoteServices[s] = append(h.remoteServices[s], member)
 	}
 }
@@ -180,19 +195,17 @@ func (h *LocalHandler) delMember(addr string) {
 	defer h.mu.Unlock()
 
 	for name, members := range h.remoteServices {
-		for i, maddr := range members {
-			if addr == maddr.ServiceAddr {
-				if i >= len(members)-1 {
-					members = members[:i]
-				} else {
-					members = append(members[:i], members[i+1:]...)
-				}
+		kept := members[:0]
+		for _, maddr := range members {
+			if maddr != nil && addr == maddr.ServiceAddr {
+				continue
 			}
+			kept = append(kept, maddr)
 		}
-		if len(members) == 0 {
+		if len(kept) == 0 {
 			delete(h.remoteServices, name)
 		} else {
-			h.remoteServices[name] = members
+			h.remoteServices[name] = kept
 		}
 	}
 }

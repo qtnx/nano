@@ -878,8 +878,9 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
-	n.handler.addRemoteService(req.MemberInfo)
 	n.cluster.addMember(req.MemberInfo)
+	n.handler.delMember(req.MemberInfo.GetServiceAddr())
+	n.handler.addRemoteService(req.MemberInfo)
 	return &clusterpb.NewMemberResponse{}, nil
 }
 
@@ -954,7 +955,7 @@ func (n *Node) keepalive() {
 		// our initial sync is re-learned here instead of staying invisible. Member
 		// removal remains with DelMember/heartbeat-timeout so an incomplete master
 		// view cannot prune live peers. Updated members must refresh existing routes
-		// because addRemoteService appends without dedup.
+		// so services no longer advertised by that member are removed.
 		added, updated := n.cluster.reconcileMembers(resp.GetMembers())
 		for _, info := range updated {
 			n.handler.delMember(info.ServiceAddr)
