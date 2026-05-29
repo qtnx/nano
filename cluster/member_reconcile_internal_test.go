@@ -32,7 +32,7 @@ func TestReconcileMembersAddsMembersMissedByPush(t *testing.T) {
 	c.members = []*Member{{memberInfo: known}}
 
 	missed := mkMemberInfo("world-map-service", "worldmap:8088", "MapService")
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{self, known, missed})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{self, known, missed}, 0)
 
 	if len(added) != 1 || added[0].ServiceAddr != missed.ServiceAddr {
 		t.Fatalf("added = %v, want exactly [%s]", added, missed.ServiceAddr)
@@ -62,7 +62,7 @@ func TestReconcileMembersNeverRemovesLivePeers(t *testing.T) {
 	c.members = []*Member{{memberInfo: a}, {memberInfo: b}}
 
 	// Authoritative list omits b (incomplete master view).
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{a})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{a}, 0)
 	if len(added) != 0 || len(updated) != 0 {
 		t.Fatalf("reconcile reported added=%v updated=%v, want no route changes", added, updated)
 	}
@@ -76,14 +76,17 @@ func TestReconcileMembersNeverRemovesLivePeers(t *testing.T) {
 }
 
 // A heartbeat response built before DelMember can arrive after DelMember was
-// already applied locally. That stale snapshot must not re-add the deleted peer.
-func TestReconcileMembersSkipsRecentlyDeletedMemberFromStaleHeartbeat(t *testing.T) {
+// already applied locally. That older snapshot must not re-add the deleted peer.
+func TestReconcileMembersSkipsStaleHeartbeatAfterVersionedDelMember(t *testing.T) {
 	deleted := mkMemberInfo("user-service", "user:8085", "UserService")
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.members = []*Member{{memberInfo: deleted}}
+	c.membershipVersion = 1
 
-	c.delMember(deleted.ServiceAddr)
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{deleted})
+	if !c.delMember(deleted.ServiceAddr, 2) {
+		t.Fatal("versioned DelMember was not applied")
+	}
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{deleted}, 1)
 
 	if len(added) != 0 || len(updated) != 0 {
 		t.Fatalf("stale heartbeat resurrected deleted member: added=%v updated=%v", added, updated)
@@ -93,20 +96,57 @@ func TestReconcileMembersSkipsRecentlyDeletedMemberFromStaleHeartbeat(t *testing
 	}
 }
 
-func TestAddMemberClearsRecentDeleteTombstoneForNewMemberPush(t *testing.T) {
+func TestReconcileMembersAllowsNewerHeartbeatAfterMissedReRegister(t *testing.T) {
 	restarted := mkMemberInfo("user-service", "user:8085", "UserService")
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.members = []*Member{{memberInfo: restarted}}
+	c.membershipVersion = 1
 
-	c.delMember(restarted.ServiceAddr)
-	c.addMember(restarted)
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{restarted})
+	if !c.delMember(restarted.ServiceAddr, 2) {
+		t.Fatal("versioned DelMember was not applied")
+	}
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{restarted}, 3)
 
-	if len(added) != 0 || len(updated) != 0 {
-		t.Fatalf("restarted member reported reconcile changes: added=%v updated=%v", added, updated)
+	if len(added) != 1 || added[0].ServiceAddr != restarted.ServiceAddr {
+		t.Fatalf("newer heartbeat did not re-add restarted member: added=%v", added)
+	}
+	if len(updated) != 0 {
+		t.Fatalf("updated = %v, want none", updated)
 	}
 	if countMemberAddr(c, restarted.ServiceAddr) != 1 {
 		t.Fatalf("restarted member count = %d, want 1", countMemberAddr(c, restarted.ServiceAddr))
+	}
+}
+
+func TestAddMemberAppliesNewerReRegisterAfterDelete(t *testing.T) {
+	restarted := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: restarted}}
+	c.membershipVersion = 1
+
+	if !c.delMember(restarted.ServiceAddr, 2) {
+		t.Fatal("versioned DelMember was not applied")
+	}
+	if !c.addMember(restarted, 3) {
+		t.Fatal("newer NewMember was not applied")
+	}
+
+	if countMemberAddr(c, restarted.ServiceAddr) != 1 {
+		t.Fatalf("restarted member count = %d, want 1", countMemberAddr(c, restarted.ServiceAddr))
+	}
+}
+
+func TestDelMemberSkipsStaleDeleteAfterReRegister(t *testing.T) {
+	restarted := mkMemberInfo("user-service", "user:8085", "UserService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{memberInfo: restarted}}
+	c.membershipVersion = 3
+
+	if c.delMember(restarted.ServiceAddr, 2) {
+		t.Fatal("stale DelMember was applied")
+	}
+	if countMemberAddr(c, restarted.ServiceAddr) != 1 {
+		t.Fatalf("member count after stale delete = %d, want 1", countMemberAddr(c, restarted.ServiceAddr))
 	}
 }
 
@@ -117,7 +157,7 @@ func TestReconcileMembersIdempotentNoDuplicates(t *testing.T) {
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.members = []*Member{{memberInfo: known}}
 
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{known})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{known}, 0)
 	if len(added) != 0 || len(updated) != 0 {
 		t.Fatalf("re-reconciling a known member reported changes: added=%v updated=%v", added, updated)
 	}
@@ -135,7 +175,7 @@ func TestReconcileMembersUpdatesSameAddressMetadata(t *testing.T) {
 	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
 	c.members = []*Member{{memberInfo: oldInfo}}
 
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo}, 0)
 	if len(added) != 0 {
 		t.Fatalf("added = %v, want none for same address", added)
 	}
@@ -159,7 +199,7 @@ func TestUpdatedMemberRefreshesRemoteServiceRoutesWithoutDuplicates(t *testing.T
 	h := NewHandler(nil, nil)
 	h.addRemoteService(oldInfo)
 
-	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo})
+	added, updated := c.reconcileMembers([]*clusterpb.MemberInfo{newInfo}, 0)
 	for _, info := range updated {
 		h.delMember(info.ServiceAddr)
 		h.addRemoteService(info)
@@ -184,10 +224,10 @@ func TestNewMemberRefreshesExistingRemoteServiceRoutes(t *testing.T) {
 		cluster: &cluster{},
 		handler: NewHandler(nil, nil),
 	}
-	n.cluster.addMember(oldInfo)
+	n.cluster.addMember(oldInfo, 1)
 	n.handler.addRemoteService(oldInfo)
 
-	if _, err := n.NewMember(context.Background(), &clusterpb.NewMemberRequest{MemberInfo: newInfo}); err != nil {
+	if _, err := n.NewMember(context.Background(), &clusterpb.NewMemberRequest{MemberInfo: newInfo, MembershipVersion: 2}); err != nil {
 		t.Fatalf("NewMember returned error: %v", err)
 	}
 
@@ -240,10 +280,14 @@ func TestHeartbeatResponseIncludesCurrentMembers(t *testing.T) {
 		{memberInfo: memberA, isMaster: false},
 		{memberInfo: memberB, isMaster: false},
 	}
+	c.membershipVersion = 7
 
 	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{MemberInfo: memberA})
 	if err != nil {
 		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+	if resp.GetMembershipVersion() != 7 {
+		t.Fatalf("Heartbeat response membershipVersion = %d, want 7", resp.GetMembershipVersion())
 	}
 	got := map[string]bool{}
 	for _, m := range resp.GetMembers() {

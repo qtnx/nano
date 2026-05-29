@@ -650,7 +650,7 @@ func (n *Node) initNode() error {
 			resp, err := client.Register(context.Background(), request)
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
-				n.cluster.initMembers(resp.Members)
+				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion())
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
@@ -878,16 +878,18 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
-	n.cluster.addMember(req.MemberInfo)
-	n.handler.delMember(req.MemberInfo.GetServiceAddr())
-	n.handler.addRemoteService(req.MemberInfo)
+	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion()) {
+		n.handler.delMember(req.MemberInfo.GetServiceAddr())
+		n.handler.addRemoteService(req.MemberInfo)
+	}
 	return &clusterpb.NewMemberResponse{}, nil
 }
 
 func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*clusterpb.DelMemberResponse, error) {
 	log.Println("[Node] DelMember member", req.String())
-	n.handler.delMember(req.ServiceAddr)
-	n.cluster.delMember(req.ServiceAddr)
+	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion()) {
+		n.handler.delMember(req.ServiceAddr)
+	}
 	return &clusterpb.DelMemberResponse{}, nil
 }
 
@@ -956,7 +958,7 @@ func (n *Node) keepalive() {
 		// removal remains with DelMember/heartbeat-timeout so an incomplete master
 		// view cannot prune live peers. Updated members must refresh existing routes
 		// so services no longer advertised by that member are removed.
-		added, updated := n.cluster.reconcileMembers(resp.GetMembers())
+		added, updated := n.cluster.reconcileMembers(resp.GetMembers(), resp.GetMembershipVersion())
 		for _, info := range updated {
 			n.handler.delMember(info.ServiceAddr)
 			n.handler.addRemoteService(info)

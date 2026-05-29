@@ -10,7 +10,10 @@ message MemberInfo {
 
 message RegisterRequest { MemberInfo memberInfo = 1; }
 
-message RegisterResponse { repeated MemberInfo members = 1; }
+message RegisterResponse {
+  repeated MemberInfo members = 1;
+  uint64 membershipVersion = 2;
+}
 
 message UnregisterRequest { string serviceAddr = 1; }
 
@@ -18,7 +21,10 @@ message UnregisterResponse {}
 
 message HeartbeatRequest { MemberInfo memberInfo = 1; }
 
-message HeartbeatResponse { repeated MemberInfo members = 1; }
+message HeartbeatResponse {
+  repeated MemberInfo members = 1;
+  uint64 membershipVersion = 2;
+}
 
 message PingRequest {}
 
@@ -63,11 +69,17 @@ message PushMessage {
 
 message MemberHandleResponse {}
 
-message NewMemberRequest { MemberInfo memberInfo = 1; }
+message NewMemberRequest {
+  MemberInfo memberInfo = 1;
+  uint64 membershipVersion = 2;
+}
 
 message NewMemberResponse {}
 
-message DelMemberRequest { string serviceAddr = 1; }
+message DelMemberRequest {
+  string serviceAddr = 1;
+  uint64 membershipVersion = 2;
+}
 
 message DelMemberResponse {}
 
