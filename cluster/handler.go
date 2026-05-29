@@ -837,7 +837,15 @@ func (h *LocalHandler) localProcess(
 		// run concurrently while a single session stays strictly ordered. On
 		// backlog, shed the task (overload) instead of blocking the producer (H1).
 		if err := scheduler.PushTaskOnShard(uint64(session.ID()), task); err == scheduler.ErrSchedulerBacklog {
-			log.Errorf("nano/handler: scheduler shard backlog full, dropping task route=%s sid=%d", msg.Route, session.ID())
+			if msg.Type == message.Request {
+				// Never silently drop a Request: the client waits for a response
+				// and would otherwise hang until timeout. Fall back to the
+				// blocking enqueue so it still runs (backpressure under overload)
+				// rather than being lost (H1).
+				scheduler.PushTask(task)
+			} else {
+				log.Errorf("nano/handler: scheduler shard backlog full, dropping %s task route=%s sid=%d", msg.Type, msg.Route, session.ID())
+			}
 		}
 	} else {
 		scheduler.PushTask(task)

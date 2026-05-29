@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/lonng/nano/cluster/clusterpb"
+	"github.com/lonng/nano/internal/message"
 	"github.com/lonng/nano/session"
 )
 
@@ -98,5 +99,41 @@ func TestSerializeHTTPJSONBytePassthrough(t *testing.T) {
 	}
 	if string(got) != `{"x":1}` {
 		t.Fatalf("want passthrough, got %q", got)
+	}
+}
+
+// M35: a JSON-payload acceptor's RPC must JSON-encode the payload so it matches
+// the JsonPayload flag remoteProcess sets on the forwarded cluster message.
+func TestAcceptorRPCUsesJSON(t *testing.T) {
+	var captured *message.Message
+	ac := &acceptor{jsonPayload: true, rpcHandler: func(_ *session.Session, m *message.Message, _ bool) error {
+		captured = m
+		return nil
+	}}
+	ac.session = session.New(ac)
+	if err := ac.RPC("svc.method", map[string]int{"a": 1}); err != nil {
+		t.Fatalf("RPC: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("rpcHandler not invoked")
+	}
+	if string(captured.Data) != `{"a":1}` {
+		t.Fatalf("M35: jsonPayload acceptor RPC must JSON-encode, got %q", captured.Data)
+	}
+}
+
+// M35: an httpAgent's RPC always JSON-encodes (HTTP clients are JSON).
+func TestHTTPAgentRPCUsesJSON(t *testing.T) {
+	var captured *message.Message
+	h := &httpAgent{rpcHandler: func(_ *session.Session, m *message.Message, _ bool) error {
+		captured = m
+		return nil
+	}}
+	h.session = session.New(h)
+	if err := h.RPC("svc.method", map[string]int{"b": 2}); err != nil {
+		t.Fatalf("RPC: %v", err)
+	}
+	if captured == nil || string(captured.Data) != `{"b":2}` {
+		t.Fatalf("M35: httpAgent RPC must JSON-encode, got %v", captured)
 	}
 }

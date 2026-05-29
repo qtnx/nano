@@ -275,7 +275,7 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 
 // RPC implements session.NetworkEntity.
 func (h *httpAgent) RPC(route string, v interface{}) error {
-	data, err := message.Serialize(v)
+	data, err := serializeHTTPJSON(v)
 	if err != nil {
 		return err
 	}

@@ -64,6 +64,7 @@ func TestShardedDispatchPreservesOrderAndConcurrency(t *testing.T) {
 	log.SetLogger(&noopLogger{})
 	const nShards = 8
 	scheduler.EnableSharded(nShards)
+	defer scheduler.DisableSharded()
 	if !scheduler.Sharded() {
 		t.Fatal("expected sharded mode after EnableSharded")
 	}

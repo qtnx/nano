@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/metrics"
 )
 
@@ -75,6 +76,13 @@ func EnableSharded(n int) {
 		return // stay single-scheduler
 	}
 
+	// Per-session ordering only holds across the legacy→shard cutover when no
+	// work was enqueued before sharding was turned on. The framework enables
+	// sharding in Node.Startup, before nano.Listen starts the dispatcher, so the
+	// normal path is safe; warn if a caller flips it on after the fact.
+	if atomic.LoadInt32(&started) != 0 {
+		log.Println("[Nano] EnableSharded called after the scheduler started; enable sharding before nano.Listen to preserve per-session ordering")
+	}
 	shardMu.Lock()
 	defer shardMu.Unlock()
 
@@ -192,4 +200,11 @@ func stopSharded() {
 	close(shardDie)
 	shardWG.Wait()
 	shardDie = nil
+}
+
+// DisableSharded returns the scheduler to single-scheduler mode, draining all
+// shard workers. It is the inverse of EnableSharded — intended for clean
+// shutdown and for tests that must not leave global sharding enabled.
+func DisableSharded() {
+	stopSharded()
 }

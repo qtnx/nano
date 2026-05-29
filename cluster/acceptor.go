@@ -43,7 +43,7 @@ func (a *acceptor) Push(route string, v interface{}) error {
 // RPC implements the session.NetworkEntity interface
 func (a *acceptor) RPC(route string, v interface{}) error {
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
