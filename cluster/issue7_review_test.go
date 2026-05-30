@@ -301,3 +301,74 @@ func TestUnregisterClearsRouteAndPool(t *testing.T) {
 		t.Fatal("departing member's conn pool was not closed/removed")
 	}
 }
+
+// warnCaptureLogger counts Warn calls (matching noopLogger's method set) so a
+// test can assert the bound-overflow warning fires instead of a silent drop.
+type warnCaptureLogger struct {
+	mu    sync.Mutex
+	warns int
+}
+
+func (l *warnCaptureLogger) Warn(...interface{})         { l.mu.Lock(); l.warns++; l.mu.Unlock() }
+func (l *warnCaptureLogger) warnCount() int              { l.mu.Lock(); defer l.mu.Unlock(); return l.warns }
+func (*warnCaptureLogger) Debug(...interface{})          {}
+func (*warnCaptureLogger) Println(...interface{})        {}
+func (*warnCaptureLogger) Infof(string, ...interface{})  {}
+func (*warnCaptureLogger) Error(...interface{})          {}
+func (*warnCaptureLogger) Errorf(string, ...interface{}) {}
+func (*warnCaptureLogger) Fatal(...interface{})          {}
+func (*warnCaptureLogger) Fatalf(string, ...interface{}) {}
+
+// 4c. Overflowing the ledger bound must log a warning, not drop the repair
+// silently (issue #7 review round 1 changed silent-drop -> warn).
+func TestRecordPendingDeleteBoundLogsWarning(t *testing.T) {
+	capLog := &warnCaptureLogger{}
+	log.SetLogger(capLog)
+	defer log.SetLogger(&noopLogger{})
+	c, _ := newMasterCluster(t)
+
+	for i := 0; i < maxPendingDeletePeers; i++ {
+		c.recordPendingDelete(fmt.Sprintf("peer:%d", i), "dead:x")
+	}
+	if capLog.warnCount() != 0 {
+		t.Fatalf("no warning expected before the bound is exceeded, got %d", capLog.warnCount())
+	}
+	// One more distinct peer overflows the bound -> must warn.
+	c.recordPendingDelete("overflow-peer", "dead:x")
+	if capLog.warnCount() == 0 {
+		t.Fatal("recordPendingDelete dropped a retry at the bound without logging a warning")
+	}
+}
+
+// 5b. Stress the unknown-heartbeat vs Unregister interleaving for the same
+// address. Invariant after every round: if the address is not a known member,
+// it must not be routable (a removed member's route must never be reinstalled by
+// a racing heartbeat). Run under -race to exercise the c.mu critical section.
+func TestUnknownHeartbeatRaceUnregisterNoStaleRoute(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	const addr = "127.0.0.1:9007"
+	for iter := 0; iter < 200; iter++ {
+		c, _ := newMasterCluster(t)
+		c.notifyDelMember = (&delSpy{failPeers: map[string]bool{}}).notify
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{MemberInfo: memberInfo(addr, "World")})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = c.Unregister(context.Background(), &clusterpb.UnregisterRequest{ServiceAddr: addr})
+		}()
+		close(start)
+		wg.Wait()
+
+		if !c.isKnownAddr(addr) && routable(c, "World", addr) {
+			t.Fatalf("iter %d: %s routable but not a member -> stale route reinstalled after removal", iter, addr)
+		}
+	}
+}

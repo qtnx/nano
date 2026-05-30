@@ -111,12 +111,12 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 	c.currentNode.handler.replaceRemoteService(req.MemberInfo)
 	c.mu.Lock()
 	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
+	// Cancel any queued delete-propagation for this address WHILE holding c.mu,
+	// atomically with making the member live again. Cancelling after unlocking
+	// raced a concurrent Unregister that could re-queue a legitimate delete in
+	// the gap, which the late cancel would then erase (issue #7, review round 2).
+	c.cancelPendingDeleteLocked(req.MemberInfo.ServiceAddr)
 	c.mu.Unlock()
-
-	// A node that just (re)registered is alive again: cancel any queued
-	// delete-propagation for its address so peers are not later taught to drop a
-	// member that came back (issue #7).
-	c.cancelPendingDelete(req.MemberInfo.ServiceAddr)
 
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
@@ -255,22 +255,21 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 			memberInfo:      req.MemberInfo,
 			lastHeartbeatAt: time.Now(),
 		})
-		// Install the recovered member's routes while still holding c.mu so a
-		// concurrent Unregister for the same address cannot remove the member and
-		// then have this heartbeat reinstall its routes afterwards (issue #7,
-		// review round 1). c.mu -> h.mu order is safe: no handler method acquires
-		// c.mu.
+		// Install the recovered member's routes AND cancel any stale delete for
+		// it while still holding c.mu, atomically with making it live again.
+		// Doing either after unlocking raced a concurrent Unregister: the route
+		// could be reinstalled after removal, or a freshly re-queued delete could
+		// be erased by a late cancel (issue #7, review rounds 1 & 2). c.mu -> h.mu
+		// order is safe: no handler method acquires c.mu.
 		c.currentNode.handler.replaceRemoteService(req.MemberInfo)
+		c.cancelPendingDeleteLocked(addr)
 	}
 	c.mu.Unlock()
 
 	if !isHit {
-		// The master did not know this member (e.g. it restarted and lost its
-		// in-memory registry); its services were re-learned above. Drop any stale
-		// delete still queued for it. A *stable* heartbeat skips all of this and
-		// only refreshes the timestamp, so steady-state heartbeats stay O(1) with
-		// no route sync or broadcast (issue #7, fixes 5 & 7).
-		c.cancelPendingDelete(addr)
+		// A *stable* heartbeat skips all of the above and only refreshes the
+		// timestamp, so steady-state heartbeats stay O(1) with no route sync or
+		// broadcast (issue #7, fixes 5 & 7).
 		log.Println("Heartbeat peer register to cluster", addr)
 	}
 
@@ -573,12 +572,13 @@ func (c *cluster) flushPendingDeletes(peerAddr string) {
 	}
 }
 
-// cancelPendingDelete removes deletedAddr from every peer's retry set, used when
-// a node (re)registers so peers are not later taught to drop a member that has
-// returned under the same address (issue #7).
-func (c *cluster) cancelPendingDelete(deletedAddr string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// cancelPendingDeleteLocked removes deletedAddr from every peer's retry set, used
+// when a node (re)registers so peers are not later taught to drop a member that
+// has returned under the same address (issue #7). The caller must hold c.mu so
+// the cancel runs atomically with the membership change that justifies it,
+// instead of in a post-unlock window where a concurrent Unregister could have
+// queued a fresh, legitimate delete (issue #7, review round 2).
+func (c *cluster) cancelPendingDeleteLocked(deletedAddr string) {
 	for peer, set := range c.pendingDeletes {
 		delete(set, deletedAddr)
 		if len(set) == 0 {
