@@ -307,6 +307,12 @@ func (c *cluster) checkMemberHeartbeat() {
 				log.Println("Heartbeat unregister error", err)
 			}
 		}
+
+		// Reconcile the ledger against current membership so retries queued for a
+		// peer that has since left (e.g. a peer removed during another
+		// Unregister's snapshot-based fan-out window) cannot linger forever and
+		// fill the bound under churn (issue #7, review round 5).
+		c.pruneStalePendingDeletes()
 	}
 	go func() {
 		defer close(c.heartbeatDone)
@@ -600,6 +606,28 @@ func (c *cluster) dropPendingDeletesForPeer(peerAddr string) {
 	c.mu.Lock()
 	delete(c.pendingDeletes, peerAddr)
 	c.mu.Unlock()
+}
+
+// pruneStalePendingDeletes drops queued delete-retries for peers that are no
+// longer members. Such a peer never heartbeats to flush its entry, so without
+// periodic pruning the ledger could accumulate dead keys (e.g. a peer removed
+// during another Unregister's snapshot-based fan-out) and fill its bound under
+// churn (issue #7, review round 5). Runs on the master heartbeat tick.
+func (c *cluster) pruneStalePendingDeletes() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pendingDeletes) == 0 {
+		return
+	}
+	alive := make(map[string]struct{}, len(c.members))
+	for _, m := range c.members {
+		alive[m.memberInfo.ServiceAddr] = struct{}{}
+	}
+	for peer := range c.pendingDeletes {
+		if _, ok := alive[peer]; !ok {
+			delete(c.pendingDeletes, peer)
+		}
+	}
 }
 
 // sendDelMember delivers one DelMember RPC; it is the production implementation

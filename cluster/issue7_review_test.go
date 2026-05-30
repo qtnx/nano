@@ -462,3 +462,24 @@ func TestPeerNewMemberDelMemberRaceConsistent(t *testing.T) {
 		}
 	}
 }
+
+// 4d. The master heartbeat tick prunes ledger entries for peers that have left
+// (they never heartbeat to flush), so a snapshot-fan-out race cannot accumulate
+// dead keys and fill the bound (issue #7, review round 5).
+func TestPruneStalePendingDeletesDropsDepartedPeers(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	c, _ := newMasterCluster(t)
+
+	c.addMember(memberInfo("live-peer:1", "Svc")) // a live member peer
+	c.recordPendingDelete("live-peer:1", "dead-target:1")
+	c.recordPendingDelete("gone-peer:1", "dead-target:1") // never registered as a member
+
+	c.pruneStalePendingDeletes()
+
+	if pendingCount(c, "live-peer:1") != 1 {
+		t.Fatal("prune dropped a queued delete for a still-live member peer")
+	}
+	if pendingCount(c, "gone-peer:1") != 0 {
+		t.Fatal("prune did not drop the queued delete for a departed (non-member) peer")
+	}
+}
