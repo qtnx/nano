@@ -131,10 +131,15 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		membershipEpoch:   membershipEpoch,
 		membershipVersion: c.membershipVersion,
 	})
-	c.mu.Unlock()
-
+	// Update the master's own route table while still holding c.mu, atomically
+	// with the membership append. The master does not self-reconcile its route
+	// cache (only peers do, via heartbeat responses), so doing this after unlock
+	// let a concurrent same-address Unregister interleave and leave the master
+	// routing to a removed member (issue #7 follow-up). c.mu -> h.mu is the global
+	// order; handler route methods take only h.mu and do no network I/O.
 	c.currentNode.handler.delMember(req.MemberInfo.ServiceAddr)
 	c.currentNode.handler.addRemoteService(req.MemberInfo)
+	c.mu.Unlock()
 
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
@@ -208,6 +213,15 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	} else {
 		c.members = append(c.members[:index], c.members[index+1:]...)
 	}
+	// Remove from the master's own route table while still holding c.mu,
+	// atomically with the membership removal (the master does not self-reconcile
+	// its route cache), so a concurrent same-address Register cannot leave the
+	// master routing to a removed member (issue #7 follow-up). removeRemoteMember
+	// below repeats handler.delMember (a harmless no-op) plus the session/pool
+	// teardown that must stay outside the lock.
+	if c.currentNode != nil {
+		c.currentNode.handler.delMember(req.ServiceAddr)
+	}
 	c.mu.Unlock()
 
 	if c.currentNode != nil {
@@ -262,7 +276,6 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	}
 	log.Println("Receive Heartbeat from: ", req.MemberInfo.Label)
 
-	var addedMember *clusterpb.MemberInfo
 	c.mu.Lock()
 	membershipEpoch := c.ensureMembershipEpochLocked()
 
@@ -286,7 +299,7 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 		c.membershipVersion++
 		m.membershipVersion = c.membershipVersion
 		c.clearRemovedMemberLocked(req.GetMemberInfo().GetServiceAddr())
-		addedMember = req.MemberInfo
+		c.currentNode.handler.addRemoteService(req.MemberInfo)
 		log.Println("Heartbeat peer register to cluster", req.MemberInfo.ServiceAddr)
 	}
 
@@ -320,9 +333,6 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	}
 	c.mu.Unlock()
 
-	if addedMember != nil {
-		c.currentNode.handler.addRemoteService(addedMember)
-	}
 	return resp, nil
 }
 
