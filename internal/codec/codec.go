@@ -29,8 +29,10 @@ import (
 
 // Codec constants.
 const (
-	HeadLength    = 4
-	MaxPacketSize = 64 * 1024
+	HeadLength = 4
+	// 512KB leaves headroom for large response payloads while staying well below
+	// the protocol's 3-byte length ceiling (0xFFFFFF, roughly 16MB).
+	MaxPacketSize = 512 * 1024
 )
 
 // ErrPacketSizeExcced is the error used for encode/decode.
