@@ -59,7 +59,7 @@ func NewService(comp Component, opts []Option) *Service {
 	}
 	if name := s.Options.name; name != "" {
 		s.Name = name
-	} else {
+	} else if !isNilReceiver(s.Receiver) {
 		s.Name = reflect.Indirect(s.Receiver).Type().Name()
 	}
 	s.SchedName = s.Options.schedName
@@ -67,8 +67,10 @@ func NewService(comp Component, opts []Option) *Service {
 	return s
 }
 
-// suitableMethods returns suitable methods of typ
-func (s *Service) suitableHandlerMethods(typ reflect.Type) map[string]*Handler {
+// suitableHandlerMethods returns suitable methods of typ. It returns an error
+// when two handler methods resolve to the same route name (e.g. after a
+// WithNameFunc rename), which would otherwise silently overwrite a handler.
+func (s *Service) suitableHandlerMethods(typ reflect.Type) (map[string]*Handler, error) {
 	methods := make(map[string]*Handler)
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
@@ -83,10 +85,20 @@ func (s *Service) suitableHandlerMethods(typ reflect.Type) map[string]*Handler {
 			if s.Options.nameFunc != nil {
 				mn = s.Options.nameFunc(mn)
 			}
+			if _, ok := methods[mn]; ok {
+				return methods, errors.New("nano/component: duplicate handler route name: " + mn)
+			}
 			methods[mn] = &Handler{Method: method, Type: mt.In(2), IsRawArg: raw}
 		}
 	}
-	return methods
+	return methods, nil
+}
+
+// isNilReceiver reports whether the service receiver is unusable: an untyped
+// nil or a typed-nil pointer. Dereferencing such a value via
+// reflect.Indirect(...).Type() would panic, so callers must guard with this.
+func isNilReceiver(v reflect.Value) bool {
+	return !v.IsValid() || (v.Kind() == reflect.Ptr && v.IsNil())
 }
 
 // ExtractHandler extract the set of methods from the
@@ -96,6 +108,9 @@ func (s *Service) suitableHandlerMethods(typ reflect.Type) map[string]*Handler {
 // - the first argument is *session.Session
 // - the second argument is []byte or a pointer
 func (s *Service) ExtractHandler() error {
+	if isNilReceiver(s.Receiver) {
+		return errors.New("nano/component: nil or invalid receiver for service")
+	}
 	typeName := reflect.Indirect(s.Receiver).Type().Name()
 	if typeName == "" {
 		return errors.New("no service name for type " + s.Type.String())
@@ -105,13 +120,17 @@ func (s *Service) ExtractHandler() error {
 	}
 
 	// Install the methods
-	s.Handlers = s.suitableHandlerMethods(s.Type)
+	handlers, err := s.suitableHandlerMethods(s.Type)
+	if err != nil {
+		return err
+	}
+	s.Handlers = handlers
 
 	if len(s.Handlers) == 0 {
 		str := ""
 		// To help the user, see if a pointer receiver would work.
-		method := s.suitableHandlerMethods(reflect.PtrTo(s.Type))
-		if len(method) != 0 {
+		methods, _ := s.suitableHandlerMethods(reflect.PtrTo(s.Type))
+		if len(methods) != 0 {
 			str = "type " + s.Name + " has no exported methods of suitable type (hint: pass a pointer to value of that type)"
 		} else {
 			str = "type " + s.Name + " has no exported methods of suitable type"

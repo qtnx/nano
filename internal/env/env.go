@@ -24,6 +24,7 @@ package env
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/lonng/nano/session"
@@ -52,14 +53,69 @@ var (
 	Serializer serialize.Serializer
 
 	GrpcOptions = []grpc.DialOption{grpc.WithInsecure()}
+
+	// SchedulerShards selects the opt-in sharded task dispatcher. 0 (default)
+	// keeps the single global scheduler; a value >0 starts that many shard
+	// workers and routes tasks by session id, so distinct sessions run
+	// concurrently while a single session stays strictly ordered (H1).
+	SchedulerShards int
+
+	// MaxConnections bounds the total number of concurrently accepted client
+	// connections per node. 0 (default) means unlimited. It is independent of
+	// the per-IP connection cap (H11).
+	MaxConnections int
+
+	// ClusterAuthToken is the shared secret required on inter-node cluster gRPC
+	// calls. "" (default) disables authentication; the server then logs one
+	// loud insecure-mode warning at startup unless InsecureCluster is set (H9).
+	ClusterAuthToken string
+
+	// InsecureCluster acknowledges intentionally running the cluster gRPC
+	// server without an auth token, silencing the insecure-mode startup
+	// warning (H9).
+	InsecureCluster bool
 )
 
 func init() {
-	Die = make(chan bool)
+	resetDie()
 	Heartbeat = 30 * time.Second
 	Debug = false
 	CheckOrigin = func(_ *http.Request) bool { return true }
 	HandshakeValidator = func(s *session.Session, _ []byte) error { return nil }
 	MiddlewareHttp = func(s *session.Session, ctx *http.Request) error { return nil }
 	Serializer = protobuf.NewSerializer()
+}
+
+// dieMu guards Die so that closing it is idempotent and a new Listen run can
+// recreate it without racing or panicking on a double close.
+var (
+	dieMu     sync.Mutex
+	dieClosed bool
+)
+
+// resetDie creates a fresh, open shutdown channel. Not safe for concurrent use;
+// callers must hold dieMu (init runs before any goroutine exists).
+func resetDie() {
+	Die = make(chan bool)
+	dieClosed = false
+}
+
+// ResetDie recreates the shutdown channel so an in-process restart (a new
+// Listen) starts with a fresh, open channel instead of an already-closed one.
+func ResetDie() {
+	dieMu.Lock()
+	defer dieMu.Unlock()
+	resetDie()
+}
+
+// CloseDie closes the shutdown channel at most once, so repeated Shutdown calls
+// do not panic on a closed channel.
+func CloseDie() {
+	dieMu.Lock()
+	defer dieMu.Unlock()
+	if dieClosed {
+		return
+	}
+	close(Die)
+	dieClosed = true
 }

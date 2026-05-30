@@ -71,12 +71,11 @@ func Listen(addr string, opts ...Option) {
 		env.Wd, _ = filepath.Abs(wd)
 	}
 
-	opt := cluster.Options{
-		Components: &component.Components{},
-	}
-	for _, option := range opts {
-		option(&opt)
-	}
+	// Recreate the shutdown channel so an in-process restart starts with a
+	// fresh, open channel (Shutdown closes it).
+	env.ResetDie()
+
+	opt := applyOptions(opts)
 
 	// Use listen address as client address in non-cluster mode
 	if !opt.IsMaster && opt.AdvertiseAddr == "" && opt.ClientAddr == "" {
@@ -97,7 +96,7 @@ func Listen(addr string, opts ...Option) {
 	if err != nil {
 		log.Fatalf("Node startup failed: %v", err)
 	}
-	runtime.CurrentNode = node
+	runtime.SetCurrentNode(node)
 
 	if node.ClientAddr != "" {
 		log.Println(fmt.Sprintf("Startup *Nano gate server* %s, client address: %v, service address: %s",
@@ -121,19 +120,34 @@ func Listen(addr string, opts ...Option) {
 	log.Println("Nano server is stopping...")
 
 	node.Shutdown()
-	runtime.CurrentNode = nil
+	runtime.SetCurrentNode(nil)
 	scheduler.Close()
 	atomic.StoreInt32(&running, 0)
 }
 
+// applyOptions builds the cluster options from the provided functional options.
+func applyOptions(opts []Option) cluster.Options {
+	opt := cluster.Options{
+		Components: &component.Components{},
+	}
+	for _, option := range opts {
+		if option == nil {
+			// Skip a nil option so a stray nil cannot panic at startup.
+			continue
+		}
+		option(&opt)
+	}
+	return opt
+}
+
 // Shutdown send a signal to let 'nano' shutdown itself.
 func Shutdown() {
-	close(env.Die)
+	env.CloseDie()
 }
 
 // Ping nodes in the cluster
 func PingNodes(nodeLabels []string) (lives []string, dies []string, err error) {
-	node := runtime.CurrentNode
+	node := runtime.CurrentNode()
 	if node == nil {
 		return nil, nil, fmt.Errorf("Node is not initialized")
 	}

@@ -18,13 +18,14 @@ type acceptor struct {
 	session    *session.Session
 	lastMid    uint64
 	rpcHandler rpcHandler
-	gateAddr   string
+	gateAddr    string
+	jsonPayload bool
 }
 
 // Push implements the session.NetworkEntity interface
 func (a *acceptor) Push(route string, v interface{}) error {
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
@@ -33,14 +34,16 @@ func (a *acceptor) Push(route string, v interface{}) error {
 		Route:     route,
 		Data:      data,
 	}
-	_, err = a.gateClient.HandlePush(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err = a.gateClient.HandlePush(ctx, request)
 	return err
 }
 
 // RPC implements the session.NetworkEntity interface
 func (a *acceptor) RPC(route string, v interface{}) error {
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
@@ -49,8 +52,7 @@ func (a *acceptor) RPC(route string, v interface{}) error {
 		Route: route,
 		Data:  data,
 	}
-	a.rpcHandler(a.session, msg, true)
-	return nil
+	return a.rpcHandler(a.session, msg, true)
 }
 
 // RPC with response
@@ -81,9 +83,9 @@ func (a *acceptor) Response(v interface{}) error {
 // ResponseMid implements the session.NetworkEntity interface
 func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 
-	log.Infof("[Acceptor] ResponseMid: %d", mid)
+	log.Debugf("[Acceptor] ResponseMid: %d", mid)
 	// TODO: buffer
-	data, err := message.Serialize(v)
+	data, err := a.serialize(v)
 	if err != nil {
 		return err
 	}
@@ -93,7 +95,9 @@ func (a *acceptor) ResponseMid(mid uint64, v interface{}) error {
 		Data:      data,
 	}
 
-	_, err = a.gateClient.HandleResponse(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err = a.gateClient.HandleResponse(ctx, request)
 	if err != nil {
 		log.Errorf("[Acceptor] Failed to response message: %v", err)
 	}
@@ -111,11 +115,24 @@ func (a *acceptor) Close() error {
 	request := &clusterpb.CloseSessionRequest{
 		SessionId: a.sid,
 	}
-	_, err := a.gateClient.CloseSession(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err := a.gateClient.CloseSession(ctx, request)
 	return err
 }
 
 // RemoteAddr implements the session.NetworkEntity interface
 func (*acceptor) RemoteAddr() net.Addr {
 	return mock.NetAddr{}
+}
+
+// serialize encodes an outbound payload for this remote session. HTTP/SSE-backed
+// sessions (jsonPayload) use the JSON codec so a binary cluster-wide serializer
+// does not produce a body the HTTP client cannot read (M35); a raw []byte is
+// passed through unchanged in both paths.
+func (a *acceptor) serialize(v interface{}) ([]byte, error) {
+	if a.jsonPayload {
+		return serializeHTTPJSON(v)
+	}
+	return message.Serialize(v)
 }

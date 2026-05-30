@@ -22,19 +22,21 @@ package cluster
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	cryptorand "crypto/rand"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/big"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -43,20 +45,32 @@ import (
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
+	"github.com/lonng/nano/internal/packet"
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
+	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 var (
 
 	// ErrLimitConnection the connection of the ip is reach the limit
 	ErrLimitConnection = errors.New("reach the limit of connection")
+
+	// httpJSONSerializer decodes HTTP /api request bodies, which are always
+	// JSON, independent of the cluster-wide binary serializer (M35).
+	httpJSONSerializer = nanojson.NewSerializer()
+
+	// clusterAuthMetadataKey is the gRPC metadata key that carries the shared
+	// cluster auth token on inter-node RPCs (H9).
+	clusterAuthMetadataKey = "authorization"
 )
 
 const (
@@ -82,6 +96,7 @@ type Options struct {
 	ForceHostname      bool
 	LimitConnectPerIp  uint
 	OpenPrometheus     bool
+	PrometheusAddr     string
 }
 
 // Node represents a node in nano cluster, which will contain a group of services.
@@ -100,12 +115,22 @@ type Node struct {
 	sessions        map[int64]*session.Session
 	sseClients      map[string]chan []byte
 	connectionCount map[string]uint
+	// acceptedConns is the node-global count of currently accepted client
+	// connections, enforced against env.MaxConnections independently of the
+	// per-IP cap (H11). Accessed atomically.
+	acceptedConns int64
 
 	once          sync.Once
 	keepaliveExit chan struct{}
 
 	// HTTP server
 	httpServer *http.Server
+
+	// clientServer is the public client (fasthttp) listener; retained so that
+	// Shutdown can stop it and release the port.
+	clientServer *fasthttp.Server
+	// metricsServer is the private Prometheus HTTP server, if enabled.
+	metricsServer *http.Server
 }
 
 func (n *Node) Startup() error {
@@ -125,6 +150,13 @@ func (n *Node) Startup() error {
 		}
 	}
 
+	// Opt into the sharded task dispatcher when configured so distinct sessions
+	// run concurrently while a single session stays ordered (H1). EnableSharded
+	// is idempotent, so repeated node startups in one process enable it once.
+	if env.SchedulerShards > 0 {
+		scheduler.EnableSharded(env.SchedulerShards)
+	}
+
 	cache()
 	if err := n.initNode(); err != nil {
 		return err
@@ -141,25 +173,25 @@ func (n *Node) Startup() error {
 	// Start the server to handle connections and HTTP requests
 	if n.ClientAddr != "" {
 		log.Println(fmt.Sprintf("Listen and serve on %s", n.ClientAddr))
-		go n.listenAndServe()
+		if err := n.listenAndServe(); err != nil {
+			return err
+		}
 	}
 
-	// Expose Prometheus metrics endpoint
-	go func() {
-		if n.OpenPrometheus {
-			http.Handle("/metrics", promhttp.Handler())
-			err := http.ListenAndServe(":2112", nil)
-			if err != nil {
-				log.Fatalf("Error starting Prometheus HTTP server: %v", err)
-			}
+	// Expose Prometheus metrics on a private, node-owned server. Bind errors
+	// are returned to the caller instead of crashing the process, and the
+	// endpoint is never routed through the public client listener.
+	if n.OpenPrometheus {
+		if err := n.startPrometheus(); err != nil {
+			return err
 		}
-	}()
+	}
 
 	return nil
 }
 
 // listenAndServe starts the server to handle both TCP and HTTP requests
-func (n *Node) listenAndServe() {
+func (n *Node) listenAndServe() error {
 	log.Println(fmt.Sprintf("Listening on %s", n.ClientAddr))
 
 	// Start the fasthttp server
@@ -175,11 +207,117 @@ func (n *Node) listenAndServe() {
 			// Call the original handler
 			n.handleFastHTTP(ctx)
 		},
+		// Bound how long a slow client may take to send its request headers/body
+		// and how long an idle keep-alive connection is held, to limit slowloris
+		// and idle-connection FD pinning (H35). WriteTimeout is intentionally
+		// left unset because /sse responses are long-lived streams.
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 75 * time.Second,
 	}
 
-	if err := server.ListenAndServe(n.ClientAddr); err != nil {
-		log.Println(fmt.Sprintf("Error starting fasthttp server: %v", err))
+	// Bind synchronously so a failure (invalid/in-use address) is reported to
+	// the caller instead of being swallowed inside a goroutine.
+	ln, err := net.Listen("tcp", n.ClientAddr)
+	if err != nil {
+		return err
 	}
+	n.clientServer = server
+
+	// Honor the configured TLS material so WithTSLConfig actually serves
+	// HTTPS/WSS instead of being silently ignored (M30). The serve loop runs in
+	// a goroutine only after a successful synchronous bind.
+	serveTLS := n.TSLCertificate != "" && n.TSLKey != ""
+	go func() {
+		var serveErr error
+		if serveTLS {
+			serveErr = server.ServeTLS(ln, n.TSLCertificate, n.TSLKey)
+		} else {
+			mux := newClientConnMultiplexer(ln)
+			go mux.serve(n.handler.handle)
+			serveErr = server.Serve(mux)
+		}
+		if serveErr != nil {
+			log.Println(fmt.Sprintf("Error serving fasthttp server: %v", serveErr))
+		}
+	}()
+	return nil
+}
+
+type bufferedClientConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedClientConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type clientConnMultiplexer struct {
+	net.Listener
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newClientConnMultiplexer(listener net.Listener) *clientConnMultiplexer {
+	return &clientConnMultiplexer{
+		Listener: listener,
+		conns:    make(chan net.Conn),
+		done:     make(chan struct{}),
+	}
+}
+
+func (m *clientConnMultiplexer) Accept() (net.Conn, error) {
+	select {
+	case conn, ok := <-m.conns:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return conn, nil
+	case <-m.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (m *clientConnMultiplexer) Close() error {
+	var err error
+	m.once.Do(func() {
+		close(m.done)
+		err = m.Listener.Close()
+	})
+	return err
+}
+
+func (m *clientConnMultiplexer) serve(handleNanoConn func(net.Conn)) {
+	defer close(m.conns)
+	for {
+		conn, err := m.Listener.Accept()
+		if err != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		header, err := reader.Peek(1)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		wrapped := &bufferedClientConn{Conn: conn, reader: reader}
+		if isNanoClientPacket(header[0]) {
+			go handleNanoConn(wrapped)
+			continue
+		}
+		select {
+		case m.conns <- wrapped:
+		case <-m.done:
+			conn.Close()
+			return
+		}
+	}
+}
+
+func isNanoClientPacket(firstByte byte) bool {
+	typ := packet.Type(firstByte)
+	return typ >= packet.Handshake && typ <= packet.Kick
 }
 
 func applyDefaultCORSHeaders(ctx *fasthttp.RequestCtx) {
@@ -194,7 +332,7 @@ func isPreflightRequest(ctx *fasthttp.RequestCtx) bool {
 
 // handleFastHTTP is the request handler for fasthttp
 func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
-	log.Println(fmt.Sprintf("Received request on %s", string(ctx.Path())))
+	log.Debugf("Received request on %s", string(ctx.Path()))
 	switch string(ctx.Path()) {
 	case "/api":
 		n.handleHTTPRequest(ctx)
@@ -203,35 +341,61 @@ func (n *Node) handleFastHTTP(ctx *fasthttp.RequestCtx) {
 	case "/health":
 		ctx.SetStatusCode(fasthttp.StatusOK)
 	case "/" + strings.TrimPrefix(env.WSPath, "/"):
-		log.Println("Handling WebSocket request")
+		// Gate the WebSocket upgrade route on the IsWebsocket option so a node
+		// that did not opt into WS does not expose an upgrade endpoint (M30).
+		if !n.IsWebsocket {
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+			return
+		}
+		log.Debug("Handling WebSocket request")
 		n.listenAndServeWS(ctx)
 	default:
-		// Use default http.Handler for unmatched routes
-		// Adapt net/http.DefaultServeMux to fasthttp.RequestHandler
-		fasthttpadaptor.NewFastHTTPHandler(http.DefaultServeMux)(ctx)
+		// Unmatched routes must not be forwarded to http.DefaultServeMux: that
+		// would expose internal handlers (e.g. /metrics) on the public client
+		// listener.
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
 	}
 }
 
 func convertFastHTTPToHTTP(ctx *fasthttp.RequestCtx) *http.Request {
 	header := make(http.Header)
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
-		header[string(key)] = []string{string(value)}
+		// Append rather than overwrite so repeated headers (e.g. multiple
+		// Cookie / X-Forwarded-For values) are preserved for middleware (M36).
+		header.Add(string(key), string(value))
 	})
-	return &http.Request{
-		Method:     string(ctx.Method()),
-		URL:        &url.URL{Scheme: "http", Host: string(ctx.Host()), Path: string(ctx.Path()), RawQuery: string(ctx.QueryArgs().QueryString())},
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     header,
-		Host:       string(ctx.Host()),
-		RemoteAddr: ctx.RemoteAddr().String(),
+
+	scheme := "http"
+	if ctx.IsTLS() {
+		scheme = "https"
 	}
+
+	// Copy the body so middleware can read the same payload the handler will
+	// dispatch: ctx.PostBody() aliases buffers fasthttp reuses after the
+	// handler returns (M36).
+	postBody := ctx.PostBody()
+	req := &http.Request{
+		Method:        string(ctx.Method()),
+		URL:           &url.URL{Scheme: scheme, Host: string(ctx.Host()), Path: string(ctx.Path()), RawQuery: string(ctx.QueryArgs().QueryString())},
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        header,
+		Host:          string(ctx.Host()),
+		RemoteAddr:    ctx.RemoteAddr().String(),
+		RequestURI:    string(ctx.RequestURI()),
+		ContentLength: int64(len(postBody)),
+	}
+	if len(postBody) > 0 {
+		b := make([]byte, len(postBody))
+		copy(b, postBody)
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
+	return req
 }
 
 // handleHTTPRequest handles incoming HTTP requests from clients
 func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
-
 	if !ctx.IsPost() {
 		ctx.Error("Only POST method is allowed", fasthttp.StatusMethodNotAllowed)
 		return
@@ -244,7 +408,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		Data  json.RawMessage `json:"data"`
 		Type  int             `json:"type,omitempty"`
 	}
-
 	if err := json.Unmarshal(body, &request); err != nil {
 		ctx.Error("Invalid JSON", fasthttp.StatusBadRequest)
 		return
@@ -260,8 +423,7 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	ch := n.sseClients[string(sid)]
-	if ch == nil {
+	if n.sseClient(string(sid)) == nil {
 		log.Infof("[Nano] Session ID not found")
 		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
 		return
@@ -274,26 +436,38 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	log.Infof("[Nano] Received request %v with session ID: %d", request, sidInt)
-
+	// The session must already exist (created by the SSE handler). A new
+	// stand-alone httpAgent here would have no SSE channel, so Push could never
+	// reach the client; reject instead of creating an orphaned session.
 	existingSession := n.findSession(sidInt)
-	var agent *httpAgent
-	var responseChan chan []byte
 	if existingSession == nil {
-		log.Infof("[Nano] session not found for %d, create new", sidInt)
-		agent = NewHTTPAgent(sidInt, nil, nil, n.handler.remoteProcess, ctx)
-		responseChan = make(chan []byte)
-		//agent.AttachResponseChan(responseChan)
-		n.storeSession(agent.session)
-	} else {
-		agent = existingSession.NetworkEntity().(*httpAgent)
+		log.Infof("[Nano] session not found for %d", sidInt)
+		ctx.Error("Session ID not found", fasthttp.StatusUnauthorized)
+		return
+	}
+	agent, ok := existingSession.NetworkEntity().(*httpAgent)
+	if !ok {
+		ctx.Error("Session is not an HTTP session", fasthttp.StatusBadRequest)
+		return
 	}
 
-	messageID := uint64(time.Now().UnixNano())
-	defer func() {
-		agent.RemoveHttpRequestCtx(messageID)
-	}()
+	var msgType message.Type
+	switch request.Type {
+	case 0:
+		msgType = message.Request
+	case 1:
+		msgType = message.Notify
+	default:
+		log.Errorf("[Nano] Invalid message type: %d", request.Type)
+		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
+		return
+	}
+
+	// Per-agent monotonic message id; wall-clock nanoseconds collided under
+	// concurrency and clobbered another in-flight request's context (H33).
+	messageID := agent.nextMid()
 	agent.AttackHttpRequestCtx(messageID, ctx)
+	defer agent.RemoveHttpRequestCtx(messageID)
 
 	// validate authenticate
 	if env.MiddlewareHttp != nil {
@@ -302,18 +476,6 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
 			return
 		}
-	}
-
-	var msgType message.Type
-
-	if request.Type == 0 {
-		msgType = message.Request
-	} else if request.Type == 1 {
-		msgType = message.Notify
-	} else {
-		log.Errorf("[Nano] Invalid message type: %d", request.Type)
-		ctx.Error("Invalid message type", fasthttp.StatusBadRequest)
-		return
 	}
 
 	rawData, _ := request.Data.MarshalJSON()
@@ -325,65 +487,79 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 	}
 
 	handler, found := n.handler.localHandlers[request.Route]
-	if !found {
-		log.Infof("[Nano] No local handler found for route: %s", request.Route)
-		n.handler.remoteProcess(agent.session, msg, false)
-		if msgType == message.Notify {
-			//responseChan = nil
-			//agent.DeAttachResponseChan()
-			// if notify, just send a response to client
-			ctx.SetStatusCode(fasthttp.StatusOK)
-			return
-		} else if msgType == message.Request {
-			// if request, attach response chan to agent to wait for service handle
-			// and send a response to client
-			// flow: node -[gRPC.HandleRequest]-> service
-			//      service -[gRPC.HandleResponse]-> agent
-			//      agent -[responseChan]-> client
-
-		}
+	if found {
+		log.Debugf("[Nano] Found local handler for route: %s", request.Route)
+		// HTTP bodies are JSON; decode with the JSON serializer regardless of
+		// the cluster-wide (possibly binary) serializer (M35).
+		n.handler.localProcess(handler, messageID, agent.session, msg, httpJSONSerializer)
 	} else {
-		log.Infof("[Nano] Found local handler for route: %s", request.Route)
-		n.handler.localProcess(handler, messageID, agent.session, msg, responseChan)
-	}
-
-	//timer := time.Now()
-
-	httpObserve := agent.GetFastHttpContextObserve(messageID)
-
-	if httpObserve != nil {
-		timer := time.NewTimer(10 * time.Second)
-		defer timer.Stop()
-
-		for {
-			select {
-			case <-timer.C:
-				log.Infof("[Nano] Request timeout")
-				ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-				return
-			default:
-				agent.mu.Lock()
-				observeStatus := httpObserve.observeStatus
-				agent.mu.Unlock()
-				if observeStatus != HttpObserveWaiting {
-
-					if observeStatus == HttpObserveSuccess {
-						log.Infof("[Nano] Request success %v", messageID)
-						return
-					}
-					if observeStatus == HttpObserveError {
-						log.Infof("[Nano] Request error %v", messageID)
-						ctx.Error("Request error", fasthttp.StatusInternalServerError)
-						return
-					}
-				}
-				time.Sleep(1 * time.Millisecond) // Sleep for a short duration before checking again
-			}
+		log.Debugf("[Nano] No local handler found for route: %s", request.Route)
+		if err := n.handler.remoteProcess(agent.session, msg, false); err != nil {
+			// Surface routing/delivery failures instead of waiting for the
+			// request to time out (M7).
+			log.Errorf("[Nano] remote process route %s failed: %v", request.Route, err)
+			ctx.Error("Service unavailable", fasthttp.StatusBadGateway)
+			return
 		}
-
 	}
-	return
 
+	// A notify expects no response: acknowledge immediately instead of pinning
+	// the request goroutine on the response-wait loop (H20).
+	if msgType == message.Notify {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		return
+	}
+
+	// A request waits for the response (the local handler's session.Response or
+	// the remote node's HandleResponse) to be recorded against this message id.
+	httpObserve := agent.GetFastHttpContextObserve(messageID)
+	if httpObserve != nil {
+		n.waitForHTTPResponse(ctx, httpObserve, messageID, remoteRPCTimeout)
+	}
+}
+
+// waitForHTTPResponse blocks until the in-flight request's observe is signalled
+// (its done channel closed when the response is recorded) or the timeout
+// elapses, writing the appropriate response to ctx. It replaces a 1ms busy-poll
+// that re-locked the agent mutex on every wakeup (M37). The response body is
+// written here, on the request-owning goroutine, so the fasthttp RequestCtx is
+// never mutated from the scheduler/RPC goroutine that produced it (H16).
+func (n *Node) waitForHTTPResponse(ctx *fasthttp.RequestCtx, observe *fastHttpContextObserve, messageID uint64, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		log.Infof("[Nano] Request timeout")
+		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+	case <-observe.done:
+		if observe.status() == HttpObserveError {
+			log.Infof("[Nano] Request error %v", messageID)
+			ctx.Error("Request error", fasthttp.StatusInternalServerError)
+			return
+		}
+		if observe.contentType != "" {
+			ctx.SetContentType(observe.contentType)
+		}
+		ctx.SetBody(observe.body)
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		log.Debugf("[Nano] Request success %v", messageID)
+	}
+}
+
+// sseWriteTimeout bounds a single SSE Flush so a stalled client cannot pin the
+// stream goroutine/FD forever. It is applied per write and refreshed before
+// each event/keepalive, so a healthy long-lived stream is unaffected (H35).
+const sseWriteTimeout = 10 * time.Second
+
+// flushSSE sets a bounded write deadline on the underlying connection (when
+// available) and flushes the buffered SSE writer. A stalled write then fails
+// with a timeout instead of blocking forever, so the caller can return and let
+// the unregister defer reclaim the stream (H35).
+func flushSSE(conn net.Conn, w *bufio.Writer, timeout time.Duration) error {
+	if conn != nil && timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	return w.Flush()
 }
 
 // handleSSE handles Server-Sent Events to push events to clients
@@ -393,18 +569,27 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	ctx.Response.Header.Set("Connection", "keep-alive")
 	ctx.Response.Header.Set("Transfer-Encoding", "chunked")
 	ctx.SetStatusCode(fasthttp.StatusOK)
-	log.Infof("SSE connection established")
+	log.Debugf("SSE connection established")
 
 	sessionID := sseSessionIDFromRequest(ctx)
+	clientSupplied := true
 	if len(sessionID) == 0 {
-		// Generate a new session ID if cookie doesn't exist
+		clientSupplied = false
 		sessionID = generateSessionID()
-		// Set the session ID cookie for the client
-		setSSESessionCookie(ctx, sessionID)
+		c := fasthttp.AcquireCookie()
+		c.SetKey("sse_sessionID")
+		c.SetValue(sessionID)
+		c.SetPath("/")
+		c.SetMaxAge(3600) // 1 hour
+		c.SetHTTPOnly(true)
+		// Only mark the cookie Secure when the listener actually serves TLS;
+		// on plain HTTP a Secure cookie is never sent back by the browser and
+		// the handshake silently breaks (L11).
+		c.SetSecure(n.TSLCertificate != "" && n.TSLKey != "")
+		ctx.Response.Header.SetCookie(c)
+		fasthttp.ReleaseCookie(c)
 	}
 
-	// Create a channel for sending events
-	sseEventChan := make(chan []byte, 2<<7) // Increased buffer size to 2 ^7
 	sidInt, err := strconv.ParseInt(sessionID, 10, 64)
 	if err != nil {
 		log.Errorf("Invalid session ID: %v", err)
@@ -412,34 +597,112 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// A client must not bind an SSE stream onto a session id owned by a
+	// non-SSE (TCP/WS) session: that would replace another user's network
+	// entity before any application auth (H18).
+	if clientSupplied {
+		if existing := n.findSession(sidInt); existing != nil {
+			if _, ok := existing.NetworkEntity().(*httpAgent); !ok {
+				log.Errorf("[Nano] SSE session id %d collides with a non-SSE session", sidInt)
+				ctx.Error("Session ID conflict", fasthttp.StatusConflict)
+				return
+			}
+		}
+	}
+
+	// Create the agent (and its sseDone signal) before the stream writer so the
+	// writer goroutine — which fasthttp runs after this handler returns — can
+	// capture it.
+	sseEventChan := make(chan []byte, 2<<7) // buffer size 256
+	agent := NewHTTPAgent(sidInt, nil, sseEventChan, n.handler.remoteProcess, ctx)
+	if env.MiddlewareHttp != nil {
+		if err := env.MiddlewareHttp(agent.session, convertFastHTTPToHTTP(ctx)); err != nil {
+			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
+			return
+		}
+	}
+	// Apply the same connection caps as the TCP/WS path so long-lived SSE
+	// streams are bounded too (H11): per-IP first, then the node-global cap.
+	// The matching decrements run in the stream-writer defer below.
+	remoteAddr := ctx.RemoteIP().String()
+	if err := n.increaseConnection(remoteAddr); err != nil {
+		ctx.Error("connection limit reached", fasthttp.StatusTooManyRequests)
+		return
+	}
+	if env.MaxConnections > 0 {
+		if atomic.AddInt64(&n.acceptedConns, 1) > int64(env.MaxConnections) {
+			atomic.AddInt64(&n.acceptedConns, -1)
+			n.decreaseConnection(remoteAddr)
+			metrics.ServerClosedConnections.Inc()
+			ctx.Error("server overloaded", fasthttp.StatusServiceUnavailable)
+			return
+		}
+	}
+	// Atomically publish the new SSE session + channel and capture any HTTP/SSE
+	// session it displaces (a client reconnecting / a second tab reusing the same
+	// id). The displaced session is closed after the lock so its
+	// Lifetime.OnClosed cleanup runs and its old stream goroutine stops — a
+	// plain overwrite would leak both on a normal EventSource reconnect. The
+	// stale-channel guard in unregisterSSEClient keeps the old stream's defer
+	// from tearing down this replacement (H19).
+	n.mu.Lock()
+	var displaced *httpAgent
+	if old := n.sessions[sidInt]; old != nil {
+		displaced, _ = old.NetworkEntity().(*httpAgent)
+	}
+	n.sessions[sidInt] = agent.session
+	n.sseClients[sessionID] = sseEventChan
+	n.mu.Unlock()
+	if displaced != nil {
+		displaced.Close()
+	}
+
+	// Capture the underlying connection before returning so the stream-writer
+	// goroutine (run by fasthttp after this handler returns) can bound each
+	// Flush with a write deadline (H35).
+	conn := ctx.Conn()
 	ctx.SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "data: {\"route\": \"onConnected\", \"body\": {\"sse_sessionID\": \"%s\"}}\n\n", sessionID)
-		w.Flush()
+		_ = flushSSE(conn, w, sseWriteTimeout)
 
 		// Keep the connection open with a ticker
 		ticker := time.NewTicker(1 * time.Second)
 		defer func() {
 			ticker.Stop()
-			n.unregisterSSEClient(sessionID)
-			log.Infof("SSE connection closed: %s", sessionID)
+			// Remove only this stream's mapping/session; a reconnect that
+			// replaced it under the same id must survive (H19).
+			n.unregisterSSEClient(sessionID, sseEventChan)
+			// Release this stream's connection-cap accounting exactly once (H11).
+			n.decreaseConnection(remoteAddr)
+			if env.MaxConnections > 0 {
+				atomic.AddInt64(&n.acceptedConns, -1)
+			}
+			log.Debugf("SSE connection closed: %s", sessionID)
 		}()
 
 		for {
 			select {
 			case <-ctx.Done():
-				log.Infof("SSE connection closed by context done: %s", sessionID)
+				log.Debugf("SSE connection closed by context done: %s", sessionID)
+				return
+			case <-agent.sseDone:
+				// Backend-initiated close (CloseSession) signalled this stream
+				// to stop, so the goroutine/entry don't leak (M31).
+				log.Debugf("SSE connection closed by backend: %s", sessionID)
 				return
 			case event := <-sseEventChan:
-				log.Infof("Send SSE event: %s", event)
+				log.Debugf("Send SSE event: %s", event)
 				fmt.Fprintf(w, "data: %s\n\n", event)
-				if err := w.Flush(); err != nil {
+				if err := flushSSE(conn, w, sseWriteTimeout); err != nil {
 					log.Errorf("Error flushing SSE event: %v", err)
 					return
 				}
 			case <-ticker.C:
-				// Send a keep-alive comment to prevent connection timeout
+				// Send a keep-alive comment; a Flush error here reliably
+				// detects a disconnected client within the tick interval so the
+				// unregister defer runs (H35).
 				fmt.Fprintf(w, ": keep-alive\n\n")
-				if err := w.Flush(); err != nil {
+				if err := flushSSE(conn, w, sseWriteTimeout); err != nil {
 					log.Errorf("Error flushing keep-alive: %v", err)
 					return
 				}
@@ -447,22 +710,7 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 		}
 	}))
 
-	log.Infof("after ctx.SetBodyStreamWriter SSE connection established: %s", sessionID)
-
-	httpAgent := NewHTTPAgent(sidInt, nil, sseEventChan, n.handler.remoteProcess, ctx)
-	responseChan := make(chan []byte)
-	httpAgent.AttachResponseChan(responseChan)
-	if env.MiddlewareHttp != nil {
-		// validate authen
-		if err := env.MiddlewareHttp(httpAgent.session, convertFastHTTPToHTTP(ctx)); err != nil {
-			ctx.Error("Invalidate authenticate", fasthttp.StatusUnauthorized)
-			return
-		}
-	}
-	n.storeSession(httpAgent.session)
-	// Register the client's event channel
-	n.registerSSEClient(sessionID, sseEventChan)
-
+	log.Debugf("SSE stream established: %s", sessionID)
 }
 
 func sseSessionIDFromRequest(ctx *fasthttp.RequestCtx) string {
@@ -492,33 +740,60 @@ func setSSESessionCookie(ctx *fasthttp.RequestCtx, sessionID string) {
 }
 
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
-	log.Infof("Register SSE client: %s", sessionID)
+	log.Debugf("Register SSE client: %s", sessionID)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.sseClients[sessionID] = eventChan
 }
 
-func (n *Node) unregisterSSEClient(sessionID string) {
-	log.Infof("Unregister SSE client: %s", sessionID)
+// sseClient returns the SSE event channel for a session id, reading the map
+// under the lock so concurrent register/unregister cannot trigger a fatal
+// concurrent map access (H14).
+func (n *Node) sseClient(sessionID string) chan []byte {
+	n.mu.RLock()
+	ch := n.sseClients[sessionID]
+	n.mu.RUnlock()
+	return ch
+}
+
+// unregisterSSEClient removes the SSE mapping and session for sessionID, but
+// only when the registered channel still matches ch — a reconnect that replaced
+// this stream under the same id must not be torn down (H19). It deletes the
+// session and closes the entity too, so a stream exit fully reclaims state; it
+// is the single teardown path shared with backend-initiated closes (M31).
+func (n *Node) unregisterSSEClient(sessionID string, ch chan []byte) {
+	log.Debugf("Unregister SSE client: %s", sessionID)
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	// convert sessionID  to uint64
+	cur, ok := n.sseClients[sessionID]
+	if ok && ch != nil && cur != ch {
+		// A newer stream replaced this one; leave it and its session intact.
+		n.mu.Unlock()
+		return
+	}
+	delete(n.sseClients, sessionID)
 	sidInt, _ := strconv.ParseInt(sessionID, 10, 64)
-	// close the agentHttp
-	if session, exists := n.sessions[sidInt]; exists && session != nil {
-		if ne := session.NetworkEntity(); ne != nil {
+	s := n.sessions[sidInt]
+	delete(n.sessions, sidInt)
+	n.mu.Unlock()
+
+	if s != nil {
+		if ne := s.NetworkEntity(); ne != nil {
 			ne.Close()
 		}
 	}
-	delete(n.sseClients, sessionID)
 }
 
 func generateSessionID() string {
-	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(math.MaxInt64-1))
-	if err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+	// Wall-clock nanoseconds collide for concurrent connections and are not
+	// monotonic; use a crypto-random positive int64 so SSE ids are unique and
+	// unguessable (H33). The id must remain a base-10 int64 string because it
+	// doubles as the nano session id.
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
-	return fmt.Sprintf("%d", n.Int64()+1)
+	id := int64(binary.BigEndian.Uint64(b[:]) >> 1) // clear sign bit -> positive
+	return strconv.FormatInt(id, 10)
 }
 
 // listenAndServeWS handles WebSocket connections using fasthttp
@@ -540,7 +815,9 @@ func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
 				r.Header.Add(string(key), string(value))
 			})
 			ok := env.CheckOrigin(r)
-			log.Println(fmt.Sprintf("CheckOrigin ok: %v", ok))
+			if env.Debug {
+				log.Debugf("CheckOrigin ok: %v", ok)
+			}
 			return ok
 		},
 	}
@@ -558,27 +835,9 @@ func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
 	}
 }
 
-func (n *Node) listenAndServeWSTLS() {
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin:     env.CheckOrigin,
-	}
-
-	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
-			return
-		}
-
-		n.handler.handleWS(conn)
-	})
-
-	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
-		log.Fatal(err.Error())
-	}
-}
+// (removed dead listenAndServeWSTLS: it had no caller, routed WS through the
+// global http.DefaultServeMux, and called log.Fatal on a bind error. TLS is now
+// served by listenAndServe via fasthttp ServeTLS (M30).)
 
 func (n *Node) Handler() *LocalHandler {
 	return n.handler
@@ -591,7 +850,13 @@ func (n *Node) initNode() error {
 		return nil
 	}
 
-	port := strings.Split(n.ServiceAddr, ":")[1]
+	// Parse with net.SplitHostPort so a malformed address returns a startup
+	// error instead of panicking on a missing index, and an IPv6 hostport such
+	// as "[::1]:9000" is handled correctly (L9).
+	_, port, err := net.SplitHostPort(n.ServiceAddr)
+	if err != nil {
+		return fmt.Errorf("cluster: invalid service address %q: %w", n.ServiceAddr, err)
+	}
 	if port == "" {
 		return errors.New("invalid service address")
 	}
@@ -599,7 +864,7 @@ func (n *Node) initNode() error {
 	var listenAddr string
 	if !n.ForceHostname {
 		// This is a hack for docker container and kubernetes
-		listenAddr = fmt.Sprintf("0.0.0.0:%s", port)
+		listenAddr = net.JoinHostPort("0.0.0.0", port)
 	} else {
 		listenAddr = n.ServiceAddr
 	}
@@ -610,16 +875,21 @@ func (n *Node) initNode() error {
 	}
 
 	// Initialize the gRPC server and register service
-	n.server = grpc.NewServer()
+	// Chain the recovery interceptor (outermost, so it also covers a panic in
+	// auth) with the shared-token auth interceptor (H9). With no token set the
+	// auth interceptor is a pass-through.
+	n.server = grpc.NewServer(grpc.ChainUnaryInterceptor(recoveryUnaryInterceptor, n.authUnaryInterceptor))
+
+	// H9: a cluster gRPC server with no token accepts any peer that can reach
+	// the port (register fake backends, close arbitrary sessions). Warn loudly
+	// once at startup unless the operator explicitly acknowledged insecure mode.
+	if env.ClusterAuthToken == "" && !env.InsecureCluster {
+		log.Warn("cluster: SECURITY: gRPC server is running WITHOUT authentication (env.ClusterAuthToken is empty); any peer reaching this port can register backends or close sessions. Set env.ClusterAuthToken, or set env.InsecureCluster=true to acknowledge.")
+	}
 	n.rpcClient = newRPCClient()
 	clusterpb.RegisterMemberServer(n.server, n)
 
-	go func() {
-		err := n.server.Serve(listener)
-		if err != nil {
-			log.Fatalf("Start current node failed: %v", err)
-		}
-	}()
+	go n.runGRPCServer(listener)
 
 	n.cluster.setRpcClient(n.rpcClient)
 	if n.IsMaster {
@@ -632,7 +902,7 @@ func (n *Node) initNode() error {
 				Services:    n.handler.LocalService(),
 			},
 		}
-		n.cluster.members = append(n.cluster.members, member)
+		n.cluster.addLocalMember(member)
 	} else {
 		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
 		if err != nil {
@@ -647,14 +917,23 @@ func (n *Node) initNode() error {
 			},
 		}
 		for {
-			resp, err := client.Register(context.Background(), request)
+			// Bound each attempt and abort the retry loop on shutdown: the
+			// previous context.Background() + unconditional sleep could hang
+			// startup indefinitely during a master partition (H23).
+			ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+			resp, err := client.Register(ctx, request)
+			cancel()
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
 				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion(), resp.GetMembershipEpoch())
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
-			time.Sleep(n.RetryInterval)
+			select {
+			case <-env.Die:
+				return fmt.Errorf("cluster: registration aborted during shutdown: %w", err)
+			case <-time.After(n.RetryInterval):
+			}
 		}
 		n.once.Do(n.keepalive)
 	}
@@ -679,6 +958,11 @@ func (n *Node) Shutdown() {
 	if n.keepaliveExit != nil {
 		close(n.keepaliveExit)
 	}
+	// Stop the master heartbeat-checker goroutine so it no longer mutates stale
+	// cluster state after shutdown (M13). Idempotent / no-op when not started.
+	if n.cluster != nil {
+		n.cluster.stopHeartbeatChecker()
+	}
 	if !n.IsMaster && n.AdvertiseAddr != "" {
 		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
 		if err != nil {
@@ -689,7 +973,11 @@ func (n *Node) Shutdown() {
 		request := &clusterpb.UnregisterRequest{
 			ServiceAddr: n.ServiceAddr,
 		}
-		_, err = client.Unregister(context.Background(), request)
+		// Bound shutdown unregister so a stalled master cannot hang shutdown
+		// indefinitely (H23).
+		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+		_, err = client.Unregister(ctx, request)
+		cancel()
 		if err != nil {
 			log.Println("Unregister current node failed", err)
 			goto EXIT
@@ -709,12 +997,34 @@ EXIT:
 			log.Println(fmt.Sprintf("HTTP server Shutdown Error: %v", err))
 		}
 	}
+
+	// Stop the public client listener so its port is released on restart.
+	if n.clientServer != nil {
+		if err := n.clientServer.Shutdown(); err != nil {
+			log.Println(fmt.Sprintf("Client server Shutdown Error: %v", err))
+		}
+	}
+
+	// Stop the Prometheus metrics server if it was started.
+	if n.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := n.metricsServer.Shutdown(ctx); err != nil {
+			log.Println(fmt.Sprintf("Metrics server Shutdown Error: %v", err))
+		}
+	}
+
+	// Close outbound gRPC client pools so their ClientConns/goroutines are
+	// reclaimed on in-process shutdown/restart (M8).
+	if n.rpcClient != nil {
+		n.rpcClient.closePool()
+	}
 }
 
 func (n *Node) storeSession(s *session.Session) {
 	n.mu.Lock()
 	n.sessions[s.ID()] = s
-	log.Infof("session %d stored", s.ID())
+	log.Debugf("session %d stored", s.ID())
 	n.mu.Unlock()
 }
 
@@ -725,88 +1035,124 @@ func (n *Node) findSession(sid int64) *session.Session {
 	return s
 }
 
-func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, clientUserData []byte) (*session.Session, error) {
+// deleteSession removes a session by id under the lock. Used by the client
+// read-loop cleanup so a disconnect doesn't leak its n.sessions entry (H13).
+func (n *Node) deleteSession(sid int64) {
+	n.mu.Lock()
+	delete(n.sessions, sid)
+	n.mu.Unlock()
+}
+
+// applyClientState restores the client-supplied uid and user data onto a
+// session. Shared by the found / created / raced paths of findOrCreateSession.
+func applyClientState(s *session.Session, clientUid int64, clientUserData []byte) error {
+	s.SetClientUid(clientUid)
+	var userData map[string]interface{}
+	if err := json.Unmarshal(clientUserData, &userData); err != nil {
+		return err
+	}
+	s.Restore(userData)
+	return nil
+}
+
+func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, clientUserData []byte, jsonPayload bool) (*session.Session, error) {
 	n.mu.RLock()
 	s, found := n.sessions[sid]
 	n.mu.RUnlock()
-	if !found {
-		if env.Debug {
-			log.Println("Not found session ")
-		}
-		conns, err := n.rpcClient.getConnPool(gateAddr)
-		if err != nil {
-			return nil, err
-		}
-		ac := &acceptor{
-			sid:        sid,
-			gateClient: clusterpb.NewMemberClient(conns.Get()),
-			rpcHandler: n.handler.remoteProcess,
-			gateAddr:   gateAddr,
-		}
-		s = session.New(ac)
-		s.SetClientUid(clientUid)
-
-		var userData map[string]interface{}
-		if err := json.Unmarshal(clientUserData, &userData); err != nil {
-			return nil, err
-		}
-		s.Restore(userData)
-
-		ac.session = s
-		n.mu.Lock()
-		n.sessions[sid] = s
-		n.mu.Unlock()
-	} else {
+	if found {
 		if env.Debug {
 			log.Println("Found session ")
 		}
-		s.SetClientUid(clientUid)
-
-		var userData map[string]interface{}
-		if err := json.Unmarshal(clientUserData, &userData); err != nil {
+		if err := applyClientState(s, clientUid, clientUserData); err != nil {
 			return nil, err
 		}
-		s.Restore(userData)
+		return s, nil
 	}
+
+	if env.Debug {
+		log.Println("Not found session ")
+	}
+
+	// Only dial gates that are registered cluster members (or this node
+	// itself). A malformed/hostile member RPC must not be able to make this
+	// node dial an arbitrary address or forge a session for one (M9).
+	if gateAddr != n.ServiceAddr && (n.cluster == nil || !n.cluster.isKnownAddr(gateAddr)) {
+		return nil, fmt.Errorf("cluster: refusing to create session for unknown gate address %q", gateAddr)
+	}
+
+	conns, err := n.rpcClient.getConnPool(gateAddr)
+	if err != nil {
+		return nil, err
+	}
+	ac := &acceptor{
+		sid:         sid,
+		gateClient:  clusterpb.NewMemberClient(conns.Get()),
+		rpcHandler:  n.handler.remoteProcess,
+		gateAddr:    gateAddr,
+		jsonPayload: jsonPayload,
+	}
+	s = session.New(ac)
+	ac.session = s
+	if err := applyClientState(s, clientUid, clientUserData); err != nil {
+		return nil, err
+	}
+
+	// Double-check under the write lock: a concurrent first-seen RPC for the
+	// same sid may have created and stored a session already. Reuse it so every
+	// caller shares one Session per sid instead of splitting state across two
+	// objects (M10).
+	n.mu.Lock()
+	if existing, ok := n.sessions[sid]; ok {
+		n.mu.Unlock()
+		if err := applyClientState(existing, clientUid, clientUserData); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	n.sessions[sid] = s
+	n.mu.Unlock()
 	return s, nil
 }
 
 // / increaseConnection prevent too many connections from the same ip
 // / maybe cheat or ddos
 func (n *Node) increaseConnection(ipAddress string) error {
-	metrics.ConnectionsPerIP.WithLabelValues(ipAddress).Inc()
 	if n.LimitConnectPerIp > 0 {
+		// Check and increment the per-IP count atomically under the lock so a
+		// rejection rolls back cleanly and never races a concurrent connect /
+		// disconnect (H15).
 		n.mu.Lock()
-		defer n.mu.Unlock()
-		if _, ok := n.connectionCount[ipAddress]; !ok {
-			n.connectionCount[ipAddress] = 0
-		}
-		n.connectionCount[ipAddress]++
-		log.Println(fmt.Sprintf("IncreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
-
-		if n.connectionCount[ipAddress] > n.LimitConnectPerIp {
+		if n.connectionCount[ipAddress] >= n.LimitConnectPerIp {
+			n.mu.Unlock()
 			log.Warn(fmt.Sprintf("The connection of ip %s is reach the limit %v", ipAddress, n.LimitConnectPerIp))
-			n.connectionCount[ipAddress]--
 			return ErrLimitConnection
 		}
+		n.connectionCount[ipAddress]++
+		n.mu.Unlock()
 	}
-
+	// Only count accepted connections so a rejected one doesn't leak a gauge
+	// child that is never decremented (M18); reclamation happens in
+	// DecConnectionsPerIP when the per-IP count drains to zero (H29).
+	metrics.IncConnectionsPerIP(ipAddress)
 	return nil
 }
 
 func (n *Node) decreaseConnection(ipAddress string) {
-	metrics.ConnectionsPerIP.WithLabelValues(ipAddress).Dec()
+	metrics.DecConnectionsPerIP(ipAddress)
 
 	if n.LimitConnectPerIp > 0 {
+		// Read and mutate the count only under the lock (H15) and drop the key
+		// once it reaches zero so IP churn cannot grow the map unboundedly
+		// (M28).
 		n.mu.Lock()
-		defer n.mu.Unlock()
-		if _, ok := n.connectionCount[ipAddress]; ok {
-			if n.connectionCount[ipAddress] > 0 {
-				n.connectionCount[ipAddress]--
-				log.Println(fmt.Sprintf("DecreaseConnection of ip %s the connect remain  %v", ipAddress, n.connectionCount[ipAddress]))
-
+		if c, ok := n.connectionCount[ipAddress]; ok {
+			if c <= 1 {
+				delete(n.connectionCount, ipAddress)
+			} else {
+				n.connectionCount[ipAddress] = c - 1
 			}
 		}
+		n.mu.Unlock()
 	}
 }
 
@@ -817,13 +1163,15 @@ func (n *Node) Ping(_ context.Context, _ *clusterpb.PingRequest) (*clusterpb.Pin
 }
 
 func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Debug("[Node] Start handle HandleRequest", req.String())
+	if env.Debug {
+		log.Debug("[Node] Start handle HandleRequest", req.String())
+	}
 	handler, found := n.handler.localHandlers[req.Route]
 
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData, req.JsonPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -836,8 +1184,14 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, req.Id, s, msg, nil)
-	log.Debug("[Node] End handle HandleRequest", req.String())
+	if req.JsonPayload {
+		n.handler.localProcess(handler, req.Id, s, msg, httpJSONSerializer)
+	} else {
+		n.handler.localProcess(handler, req.Id, s, msg, nil)
+	}
+	if env.Debug {
+		log.Debug("[Node] End handle HandleRequest", req.String())
+	}
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
@@ -850,22 +1204,30 @@ func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage)
 }
 
 func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
-	log.Debug("[Node] Start handle HandleNotify", req.String())
+	if env.Debug {
+		log.Debug("[Node] Start handle HandleNotify", req.String())
+	}
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData)
+	s, err := n.findOrCreateSession(req.SessionId, req.ClientUid, req.GateAddr, req.ClientUserData, req.JsonPayload)
 	if err != nil {
 		return nil, err
 	}
-	log.Println("[Node] HandleRequest old: ", req.Route, req.SessionId, fmt.Sprintf("New session id: %v", s.ID()))
+	if env.Debug {
+		log.Println("[Node] HandleNotify:", req.Route, req.SessionId, fmt.Sprintf("session id: %v", s.ID()))
+	}
 	msg := &message.Message{
 		Type:  message.Notify,
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, 0, s, msg, nil)
+	if req.JsonPayload {
+		n.handler.localProcess(handler, 0, s, msg, httpJSONSerializer)
+	} else {
+		n.handler.localProcess(handler, 0, s, msg, nil)
+	}
 	return &clusterpb.MemberHandleResponse{}, nil
 }
 
@@ -878,6 +1240,9 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
+	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
+		return nil, ErrInvalidRegisterReq
+	}
 	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
 		n.handler.delMember(req.MemberInfo.GetServiceAddr())
 		n.handler.addRemoteService(req.MemberInfo)
@@ -886,17 +1251,73 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 }
 
 func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*clusterpb.DelMemberResponse, error) {
+	if req == nil || req.ServiceAddr == "" {
+		return nil, ErrInvalidRegisterReq
+	}
 	log.Println("[Node] DelMember member", req.String())
 	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
-		n.handler.delMember(req.ServiceAddr)
+		n.removeRemoteMember(req.ServiceAddr)
 	}
 	return &clusterpb.DelMemberResponse{}, nil
 }
 
-// SessionClosed implements the MemberServer interface
+// removeRemoteMember applies all local cleanup for a remote member leaving the
+// cluster: route cache removal, gate-owned session reclamation, and outbound RPC
+// pool teardown.
+func (n *Node) removeRemoteMember(addr string) {
+	if n == nil || addr == "" {
+		return
+	}
+	if n.handler != nil {
+		n.handler.delMember(addr)
+	}
+	n.purgeGateSessions(addr)
+	rpcClient := n.rpcClient
+	if rpcClient == nil && n.cluster != nil {
+		rpcClient = n.cluster.rpcClient
+	}
+	if rpcClient != nil {
+		rpcClient.removePool(addr)
+	}
+}
+
+// purgeGateSessions removes every acceptor session whose owning gate matches
+// gateAddr and runs its lifetime-close hooks. It deliberately does not call the
+// acceptor's Close (which would issue a CloseSession RPC back to the now-gone
+// gate); it only reclaims local state.
+func (n *Node) purgeGateSessions(gateAddr string) {
+	n.mu.Lock()
+	var closed []*session.Session
+	for sid, s := range n.sessions {
+		if ac, ok := s.NetworkEntity().(*acceptor); ok && ac.gateAddr == gateAddr {
+			delete(n.sessions, sid)
+			closed = append(closed, s)
+		}
+	}
+	n.mu.Unlock()
+	for _, s := range closed {
+		sc := s
+		scheduler.PushTask(func() { session.Lifetime.Close(sc) })
+	}
+}
+
+// SessionClosed implements the MemberServer interface.
+//
+// M11 (owner authorization): a session is only reclaimed when the caller is its
+// owning gate. When req.GateAddr is set and does not match the session's owning
+// acceptor.gateAddr, the request is ignored so a non-owning peer cannot drop
+// another gate's session. An empty GateAddr keeps legacy behavior; note a
+// shared-token peer could still spoof GateAddr — full per-gate identity needs
+// mTLS client certificates.
 func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequest) (*clusterpb.SessionClosedResponse, error) {
 	n.mu.Lock()
 	s, found := n.sessions[req.SessionId]
+	if found && req.GateAddr != "" {
+		if ac, ok := s.NetworkEntity().(*acceptor); ok && ac.gateAddr != req.GateAddr {
+			n.mu.Unlock()
+			return &clusterpb.SessionClosedResponse{}, nil
+		}
+	}
 	delete(n.sessions, req.SessionId)
 	n.mu.Unlock()
 	if found {
@@ -905,7 +1326,10 @@ func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequ
 	return &clusterpb.SessionClosedResponse{}, nil
 }
 
-// CloseSession implements the MemberServer interface
+// CloseSession implements the MemberServer interface.
+//
+// M11: same caveat as SessionClosed — no caller/gate identity is available on
+// the request, so ownership is not verified before closing. See SessionClosed.
 func (n *Node) CloseSession(_ context.Context, req *clusterpb.CloseSessionRequest) (*clusterpb.CloseSessionResponse, error) {
 	n.mu.Lock()
 	s, found := n.sessions[req.SessionId]
@@ -943,7 +1367,9 @@ func (n *Node) keepalive() {
 		masterCli := clusterpb.NewMasterClient(pool.Get())
 		heartbeatSeq := n.cluster.nextMembershipSnapshotSeq()
 		membershipVersion, membershipEpoch, removedMembershipVersion := n.cluster.membershipState()
-		resp, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+		defer cancel()
+		resp, err := masterCli.Heartbeat(ctx, &clusterpb.HeartbeatRequest{
 			MemberInfo: &clusterpb.MemberInfo{
 				Label:       n.Label,
 				ServiceAddr: n.ServiceAddr,
@@ -964,6 +1390,9 @@ func (n *Node) keepalive() {
 			return
 		}
 		if len(resp.GetMembers()) == 0 && len(resp.GetRemovedMembers()) == 0 && !resp.GetResetMembership() {
+			for _, addr := range n.cluster.pruneExpiredStaleEpochMembers(time.Now()) {
+				n.removeRemoteMember(addr)
+			}
 			return
 		}
 		// Self-heal any NewMember push missed during churn: the master
@@ -982,7 +1411,7 @@ func (n *Node) keepalive() {
 			n.handler.addRemoteService(info)
 		}
 		for _, addr := range removed {
-			n.handler.delMember(addr)
+			n.removeRemoteMember(addr)
 		}
 	}
 	go func() {
@@ -1008,4 +1437,98 @@ func heartbeatSnapshotSeq(requestSeq, responseSeq uint64) (uint64, bool) {
 		return responseSeq, false
 	}
 	return responseSeq, true
+}
+
+// recoveryUnaryInterceptor converts a panic in any gRPC handler into a
+// codes.Internal error instead of letting it crash the node process.
+func recoveryUnaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (resp interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			method := ""
+			if info != nil {
+				method = info.FullMethod
+			}
+			log.Error(fmt.Sprintf("cluster: recovered panic in gRPC handler %s: %v", method, r))
+			err = status.Errorf(codes.Internal, "internal server error")
+		}
+	}()
+	return handler(ctx, req)
+}
+
+// authUnaryInterceptor enforces the shared-token check on inter-node cluster
+// RPCs when env.ClusterAuthToken is configured: the incoming `authorization`
+// metadata must carry a matching token, otherwise the call is rejected with
+// codes.Unauthenticated. With no token configured it is a pass-through
+// (insecure mode, warned about at startup) (H9).
+func (n *Node) authUnaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	token := env.ClusterAuthToken
+	if token == "" {
+		return handler(ctx, req)
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing cluster auth metadata")
+	}
+	vals := md.Get(clusterAuthMetadataKey)
+	if len(vals) == 0 || vals[0] != token {
+		return nil, status.Error(codes.Unauthenticated, "invalid cluster auth token")
+	}
+	return handler(ctx, req)
+}
+
+// runGRPCServer serves the gRPC listener. A post-startup Serve error is logged
+// rather than escalated to log.Fatalf, which would call os.Exit from this
+// background goroutine and bypass node/component shutdown.
+func (n *Node) runGRPCServer(listener net.Listener) {
+	if err := n.server.Serve(listener); err != nil {
+		log.Errorf("cluster: gRPC server stopped serving: %v", err)
+	}
+}
+
+// startPrometheus exposes the metrics endpoint on a private mux and a
+// node-owned HTTP server bound to a configurable address (default :2112). The
+// listener is bound synchronously so bind errors surface to the caller, and
+// the server is retained for shutdown.
+func (n *Node) startPrometheus() error {
+	addr := n.PrometheusAddr
+	if addr == "" {
+		addr = ":2112"
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	server := &http.Server{Addr: addr, Handler: mux}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	n.metricsServer = server
+
+	go func() {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Errorf("cluster: prometheus metrics server stopped: %v", err)
+		}
+	}()
+	return nil
+}
+
+// serializeHTTPJSON marshals an outbound payload with the HTTP JSON serializer,
+// passing a raw []byte through unchanged (matching message.Serialize semantics)
+// so an already-encoded payload is not double-encoded (M35).
+func serializeHTTPJSON(v interface{}) ([]byte, error) {
+	if b, ok := v.([]byte); ok {
+		return b, nil
+	}
+	return httpJSONSerializer.Marshal(v)
 }

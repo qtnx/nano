@@ -20,7 +20,7 @@ func newHTTPAgentForTest() *httpAgent {
 		123,
 		nil,
 		make(chan []byte, 16),
-		func(_ *session.Session, _ *message.Message, _ bool) {},
+		func(_ *session.Session, _ *message.Message, _ bool) error { return nil },
 		&ctx,
 	)
 }
@@ -110,12 +110,13 @@ func TestHTTPAgentOpenPathStillWorks(t *testing.T) {
 		got    *message.Message
 	)
 	agent := newHTTPAgentForTest()
-	agent.rpcHandler = func(_ *session.Session, msg *message.Message, noCopy bool) {
+	agent.rpcHandler = func(_ *session.Session, msg *message.Message, noCopy bool) error {
 		called = true
 		got = msg
 		if !noCopy {
 			t.Fatal("RPC noCopy = false, want true")
 		}
+		return nil
 	}
 
 	if err := agent.RPC("Service.Method", []byte("payload")); err != nil {

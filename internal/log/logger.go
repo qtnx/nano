@@ -21,7 +21,9 @@
 package log
 
 import (
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/lonng/nano/internal/env"
 	"github.com/rs/zerolog"
@@ -117,19 +119,22 @@ func SetLogger(logger Logger) {
 	Fatal = logger.Fatal
 	Fatalf = logger.Fatalf
 	Debug = func(v ...interface{}) {
-		if env.Debug {
-			logger.Infof(
-				"[DEBUG] %v",
-				v,
-			)
+		if !env.Debug || len(v) == 0 {
+			return
 		}
+		// Several call sites use Debug as a Printf-style helper, passing a
+		// format string followed by its arguments. Treat the first arg as a
+		// format string only when it carries verbs and arguments follow;
+		// otherwise concatenate so print-style calls keep working.
+		if format, ok := v[0].(string); ok && len(v) > 1 && strings.Contains(format, "%") {
+			logger.Infof("[DEBUG] "+format, v[1:]...)
+			return
+		}
+		logger.Infof("[DEBUG] %v", fmt.Sprint(v...))
 	}
 	Debugf = func(format string, v ...interface{}) {
 		if env.Debug {
-			logger.Infof(
-				"[DEBUG] "+format,
-				v,
-			)
+			logger.Infof("[DEBUG] "+format, v...)
 		}
 	}
 	Error = logger.Error

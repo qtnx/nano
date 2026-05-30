@@ -8,27 +8,23 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"testing"
 	"time"
 
-	"github.com/lonng/nano/benchmark/testdata"
 	"github.com/lonng/nano/cluster"
 	"github.com/lonng/nano/component"
 	"github.com/lonng/nano/scheduler"
 	. "github.com/pingcap/check"
-	"google.golang.org/protobuf/proto"
 )
-
-var _ = Suite(&nodeSuite{})
-
-func TestNodeHTTP(t *testing.T) {
-	TestingT(t)
-}
 
 func (s *nodeSuite) TestNodeHTTP(c *C) {
 	go scheduler.Sched()
-	defer scheduler.Close()
+
+	// HTTP /api + SSE are JSON end-to-end for LOCAL routes only: handleHTTPRequest
+	// decodes the body with httpJSONSerializer and ResponseMid serializes with it,
+	// both independent of the cluster-wide (protobuf) serializer. Making a peer
+	// node decode a forwarded JSON body needs an explicit per-request JSON marker
+	// on the cluster RPC, so remote /api JSON is a documented partial (M35) and
+	// this test no longer mutates the global env.Serializer to fake it.
 
 	// Start the master node
 	masterComps := &component.Components{}
@@ -82,31 +78,26 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	client := &http.Client{}
 	baseURL := "http://127.0.0.1:14452"
 
-	// First, establish SSE connection
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// First, establish SSE connection. connectSSE returns only after the HTTP
+	// response headers are received, so the session ID is synchronized before it
+	// is used by /api requests.
 	messageChan := make(chan string, 10)
-	var sseSessionID string
-	go func() {
-		defer wg.Done()
-		var err error
-		sseSessionID, err = connectSSE(baseURL+"/sse", messageChan)
-		if err != nil {
-			c.Errorf("Failed to connect to SSE: %v", err)
-			return
-		}
-	}()
-	// Wait for SSE to be ready
-	time.Sleep(100 * time.Millisecond)
-
-	pingData := &testdata.Ping{Content: "ping"}
-	pingDataBytes, err := proto.Marshal(pingData)
+	sseSessionID, err := connectSSE(baseURL+"/sse", messageChan)
 	c.Assert(err, IsNil)
+
+	// The SSE handler emits an initial onConnected event before any push;
+	// drain it so the push/response assertions below line up with the actual
+	// handler messages instead of the handshake event.
+	select {
+	case <-messageChan:
+	case <-time.After(2 * time.Second):
+		c.Error("Timeout waiting for SSE onConnected event")
+	}
 
 	// --- Test Notify ---
 	notifyBody := map[string]interface{}{
 		"route": "GateComponent.Test",
-		"data":  string(pingDataBytes),
+		"data":  map[string]interface{}{"Content": "ping"},
 		"type":  1, // Notify
 	}
 	bodyBytes, err := json.Marshal(notifyBody)
@@ -134,7 +125,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	// --- Test Request/Response ---
 	requestBody := map[string]interface{}{
 		"route": "GateComponent.Test2",
-		"data":  pingDataBytes,
+		"data":  map[string]interface{}{"Content": "ping"},
 		"type":  0, // Request
 	}
 	bodyBytes, err = json.Marshal(requestBody)
@@ -174,6 +165,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -203,6 +195,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -232,6 +225,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -246,9 +240,8 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 		c.Error("Timeout waiting for SSE message")
 	}
 
-	// Close the SSE connection
-	close(messageChan)
-	wg.Wait() // Wait for the SSE goroutine to finish
+	// Node shutdown closes the SSE response body; leave messageChan open because
+	// the reader goroutine owns writes to it.
 }
 
 // connectSSE connects to the SSE endpoint and reads messages.

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/lonng/nano/cluster/clusterpb"
+	"github.com/lonng/nano/internal/env"
 )
 
 func mkMemberInfo(label, addr string, services ...string) *clusterpb.MemberInfo {
@@ -125,6 +126,107 @@ func TestReconcileMembersAcceptsLowerVersionFromNewMasterEpoch(t *testing.T) {
 	}
 	if c.membershipEpoch != 200 || c.membershipVersion != 1 {
 		t.Fatalf("membership state = epoch %d version %d, want epoch 200 version 1", c.membershipEpoch, c.membershipVersion)
+	}
+}
+
+func TestReconcileMembersNewEpochKeepsAbsentMembersDuringGrace(t *testing.T) {
+	known := mkMemberInfo("user-service", "user:8085", "UserService")
+	stale := mkMemberInfo("old-service", "old:8085", "OldService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{
+		{memberInfo: known, membershipVersion: 10, membershipEpoch: 100},
+		{memberInfo: stale, lastHeartbeatAt: time.Now().Add(-time.Hour), membershipVersion: 10, membershipEpoch: 100},
+	}
+	c.membershipVersion = 10
+	c.membershipEpoch = 100
+
+	added, updated, removed := c.reconcileMembers([]*clusterpb.MemberInfo{known}, nil, 1, 200)
+
+	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("added=%v updated=%v removed=%v, want no immediate prune", added, updated, removed)
+	}
+	if countMemberAddr(c, stale.ServiceAddr) != 1 {
+		t.Fatalf("stale member %s was removed during new epoch grace", stale.ServiceAddr)
+	}
+	if c.members[1].epochStaleSince.IsZero() {
+		t.Fatal("stale old-epoch member was not marked for grace-period pruning")
+	}
+	if c.removedMembershipVersion != 0 {
+		t.Fatalf("removedMembershipVersion = %d, want 0 after epoch reset without explicit reset", c.removedMembershipVersion)
+	}
+}
+
+func TestReconcileMembersPrunesAbsentOldEpochMembersAfterGrace(t *testing.T) {
+	known := mkMemberInfo("user-service", "user:8085", "UserService")
+	stale := mkMemberInfo("old-service", "old:8085", "OldService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{
+		{memberInfo: known, membershipVersion: 1, membershipEpoch: 200},
+		{memberInfo: stale, membershipVersion: 10, membershipEpoch: 100, epochStaleSince: time.Now().Add(-4*env.Heartbeat - time.Second)},
+	}
+	c.membershipVersion = 1
+	c.membershipEpoch = 200
+
+	added, updated, removed := c.reconcileMembers([]*clusterpb.MemberInfo{known}, nil, 1, 200)
+
+	if len(added) != 0 || len(updated) != 0 {
+		t.Fatalf("added=%v updated=%v, want none", added, updated)
+	}
+	if len(removed) != 1 || removed[0] != stale.ServiceAddr {
+		t.Fatalf("removed=%v, want only %s", removed, stale.ServiceAddr)
+	}
+	if countMemberAddr(c, stale.ServiceAddr) != 0 {
+		t.Fatalf("stale member %s survived old-epoch grace pruning", stale.ServiceAddr)
+	}
+}
+
+func TestPruneExpiredStaleEpochMembersRunsWithoutSnapshotPayload(t *testing.T) {
+	stale := mkMemberInfo("old-service", "old:8085", "OldService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{
+		{memberInfo: stale, membershipVersion: 10, membershipEpoch: 100, epochStaleSince: time.Now().Add(-4*env.Heartbeat - time.Second)},
+	}
+	c.membershipVersion = 1
+	c.membershipEpoch = 200
+
+	removed := c.pruneExpiredStaleEpochMembers(time.Now())
+
+	if len(removed) != 1 || removed[0] != stale.ServiceAddr {
+		t.Fatalf("removed=%v, want only %s", removed, stale.ServiceAddr)
+	}
+	if countMemberAddr(c, stale.ServiceAddr) != 0 {
+		t.Fatalf("stale member %s survived empty-heartbeat pruning", stale.ServiceAddr)
+	}
+}
+
+func TestAddMemberClearsEpochStaleGraceBeforeNextEpoch(t *testing.T) {
+	member := mkMemberInfo("old-service", "old:8085", "OldService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.members = []*Member{{
+		memberInfo:        member,
+		membershipVersion: 1,
+		membershipEpoch:   100,
+		epochStaleSince:   time.Now().Add(-4*env.Heartbeat - time.Second),
+	}}
+	c.membershipVersion = 1
+	c.membershipEpoch = 100
+
+	if !c.addMember(member, 2, 100) {
+		t.Fatal("NewMember re-registration was not applied")
+	}
+	if !c.members[0].epochStaleSince.IsZero() {
+		t.Fatal("NewMember re-registration did not clear stale epoch grace timer")
+	}
+
+	added, updated, removed := c.reconcileMembers(nil, nil, 1, 200)
+	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("added=%v updated=%v removed=%v, want fresh grace after next epoch", added, updated, removed)
+	}
+	if countMemberAddr(c, member.ServiceAddr) != 1 {
+		t.Fatalf("member %s was pruned immediately after next epoch", member.ServiceAddr)
+	}
+	if c.members[0].epochStaleSince.IsZero() {
+		t.Fatal("next epoch did not start a fresh stale grace timer")
 	}
 }
 
