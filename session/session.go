@@ -141,6 +141,8 @@ func (s *Session) SetLastMid() uint64 {
 
 // get client uid
 func (s *Session) ClientUid() int64 {
+	s.RLock()
+	defer s.RUnlock()
 	return s.clientUid
 }
 
@@ -460,12 +462,16 @@ func UnmarshalAny[T any](session *Session, key string) (*T, error) {
 	return out, nil
 }
 
-// State returns all session state
+// State returns a snapshot copy of all session state
 func (s *Session) State() map[string]interface{} {
 	s.RLock()
 	defer s.RUnlock()
 
-	return s.data
+	state := make(map[string]interface{}, len(s.data))
+	for k, v := range s.data {
+		state[k] = v
+	}
+	return state
 }
 
 // Restore session state after reconnect
@@ -481,6 +487,6 @@ func (s *Session) Clear() {
 	s.Lock()
 	defer s.Unlock()
 
-	s.uid = 0
+	atomic.StoreInt64(&s.uid, 0)
 	s.data = map[string]interface{}{}
 }

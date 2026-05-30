@@ -9,17 +9,21 @@ import (
 // implement Connection
 type defaultConnectionServer struct {
 	count int64
-	node  *snowflake.Node
+	node  atomic.Pointer[snowflake.Node]
 }
 
 func newDefaultConnectionServer(node uint64) *defaultConnectionServer {
-	dcs := &defaultConnectionServer{
-		count: 0,
-		node:  nil,
-	}
-	n := int64(node % 1000) // safety node value
-	dcs.node, _ = snowflake.NewNode(n)
+	dcs := &defaultConnectionServer{count: 0}
+	dcs.resetNode(node)
 	return dcs
+}
+
+// resetNode atomically swaps the snowflake node used to generate session ids,
+// so a runtime ResetNodeId can never race concurrent SessionID readers.
+func (dcs *defaultConnectionServer) resetNode(node uint64) {
+	n := int64(node % 1000) // safety node value
+	sn, _ := snowflake.NewNode(n)
+	dcs.node.Store(sn)
 }
 
 // Increment increment the connection count
@@ -44,5 +48,5 @@ func (dcs *defaultConnectionServer) Reset() {
 
 // SessionID returns the session id, (snowflake impl)
 func (dcs *defaultConnectionServer) SessionID() int64 {
-	return dcs.node.Generate().Int64()
+	return dcs.node.Load().Generate().Int64()
 }

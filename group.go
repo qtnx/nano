@@ -23,6 +23,7 @@ package nano
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -130,23 +131,28 @@ func (c *Group) Multicast(route string, v interface{}, filter SessionFilter) err
 		log.Println(fmt.Sprintf("Multicast %s, Data=%+v", route, v))
 	}
 
+	// Snapshot the matching sessions under the read lock, then release it so the
+	// fan-out (which may block on slow clients) does not serialize Add/Leave/Close.
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	sessions := make([]*session.Session, 0, len(c.sessions))
 	for _, s := range c.sessions {
-		if !filter(s) {
-			continue
+		if filter(s) {
+			sessions = append(sessions, s)
 		}
-		if err = s.Push(route, data); err != nil {
-			if errors.Is(err, cluster.ErrBrokenPipe) {
-				return err
-			} else {
+	}
+	c.mu.RUnlock()
+
+	var errs []error
+	for _, s := range sessions {
+		if err := s.Push(route, data); err != nil {
+			if !errors.Is(err, cluster.ErrBrokenPipe) {
 				log.Println(fmt.Sprintf("Session Multicast message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
 			}
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return joinErrors(errs)
 }
 
 // Singlecast push the message to the specified client decided by session id
@@ -195,17 +201,22 @@ func (c *Group) Broadcast(route string, v interface{}) error {
 		log.Println(fmt.Sprintf("Broadcast %s, Data=%+v", route, v))
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, s := range c.sessions {
-		if err = s.Push(route, data); err != nil {
-			if !errors.Is(err, cluster.ErrBrokenPipe) {
-				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
-			}
+	sessions := c.snapshotSessions()
 
+	var errs []error
+	for _, s := range sessions {
+		if err := s.Push(route, data); err != nil {
+			// A broken pipe simply means the client is gone; it is not a
+			// broadcast failure (use BroadcastWithFallbackClosedSession to
+			// observe those). Any other error must be surfaced, not swallowed.
+			if errors.Is(err, cluster.ErrBrokenPipe) {
+				continue
+			}
+			log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+			errs = append(errs, err)
 		}
 	}
-	return err
+	return joinErrors(errs)
 }
 
 // BroadcastWithFallbackClosedSession push  the message(s) to  all members
@@ -224,24 +235,24 @@ func (c *Group) BroadcastWithFallbackClosedSession(route string, v interface{}) 
 		log.Println(fmt.Sprintf("Broadcast %s, Data=%+v", route, v))
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	sessions := c.snapshotSessions()
 
-	for _, s := range c.sessions {
-		if err = s.Push(route, data); err != nil {
+	var errs []error
+	for _, s := range sessions {
+		if err := s.Push(route, data); err != nil {
 			if errors.Is(err, cluster.ErrBrokenPipe) {
 				closedSession = append(closedSession, s.ID())
 			} else {
 				log.Println(fmt.Sprintf("Session push message error, ID=%d, UID=%d, Error=%s", s.ID(), s.UID(), err.Error()))
+				errs = append(errs, err)
 			}
-
 		}
 	}
 	if env.Debug {
 		log.Println(fmt.Sprintf("Broadcast done %s, Data=%+v, closedSession=%+v", route, v, closedSession))
 	}
 
-	return closedSession, err
+	return closedSession, joinErrors(errs)
 }
 
 // Contains check whether a UID is contained in current group or not
@@ -252,10 +263,6 @@ func (c *Group) Contains(uid int64) bool {
 
 // Add add session to group
 func (c *Group) Add(session *session.Session) error {
-	if c.isClosed() {
-		return ErrClosedGroup
-	}
-
 	if env.Debug {
 		log.Println(fmt.Sprintf("Add session to group %s, ID=%d, UID=%d", c.name, session.ID(), session.UID()))
 	}
@@ -263,9 +270,15 @@ func (c *Group) Add(session *session.Session) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Re-check the closed state under the lock: a concurrent Close may have run
+	// between a lock-free check and acquiring the lock (TOCTOU), which would
+	// otherwise repopulate an already-closed group.
+	if c.isClosed() {
+		return ErrClosedGroup
+	}
+
 	id := session.ID()
-	_, ok := c.sessions[id]
-	if ok {
+	if _, ok := c.sessions[id]; ok {
 		return ErrSessionDuplication
 	}
 
@@ -331,14 +344,28 @@ func (c *Group) Count() int {
 }
 
 func (c *Group) isClosed() bool {
-	if atomic.LoadInt32(&c.status) == groupStatusClosed {
-		return true
+	return atomic.LoadInt32(&c.status) == groupStatusClosed
+}
+
+// snapshotSessions returns a copy of the current session pointers so callers can
+// fan out (push) after releasing the lock, instead of serializing the whole
+// broadcast under the read lock.
+func (c *Group) snapshotSessions() []*session.Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*session.Session, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		sessions = append(sessions, s)
 	}
-	return false
+	return sessions
 }
 
 // Close destroy group, which will release all resource in the group
 func (c *Group) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.isClosed() {
 		return ErrCloseClosedGroup
 	}
@@ -348,4 +375,43 @@ func (c *Group) Close() error {
 	// release all reference
 	c.sessions = make(map[int64]*session.Session)
 	return nil
+}
+
+// joinErrors aggregates push errors into a single error while preserving
+// errors.Is matching against any wrapped error. It returns nil when empty.
+func joinErrors(errs []error) error {
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return &multiError{errs: errs}
+	}
+}
+
+type multiError struct {
+	errs []error
+}
+
+func (m *multiError) Error() string {
+	var b strings.Builder
+	for i, err := range m.errs {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(err.Error())
+	}
+	return b.String()
+}
+
+// Is reports whether any aggregated error matches target, so callers can keep
+// using errors.Is (e.g. against cluster.ErrBrokenPipe).
+func (m *multiError) Is(target error) bool {
+	for _, err := range m.errs {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }

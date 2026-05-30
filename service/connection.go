@@ -34,12 +34,17 @@ type Connection interface {
 }
 
 func ResetNodeId(nodeId uint64) {
-	Connections = newDefaultConnectionServer(nodeId)
+	// Mutate the stable instance in place instead of replacing the global
+	// interface value, which would race concurrent Connections readers (M25).
+	defaultConnections.Reset()
+	defaultConnections.resetNode(nodeId)
 }
+
+var defaultConnections = newDefaultConnectionServer(uint64(os.Getpid()))
 
 // Connections is a global variable which is used by session.
 // var Connections  = newConnectionService()
-var Connections Connection = newDefaultConnectionServer(uint64(os.Getpid()))
+var Connections Connection = defaultConnections
 
 type connectionService struct {
 	count int64

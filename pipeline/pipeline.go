@@ -64,11 +64,17 @@ func (p *pipelineChannel) PushBack(h Func) {
 // Process process message with all pipeline functions
 func (p *pipelineChannel) Process(s *session.Session, msg *message.Message) error {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	if len(p.handlers) < 1 {
+		p.mu.RUnlock()
 		return nil
 	}
-	for _, h := range p.handlers {
+	// Snapshot the handlers and release the lock before invoking them, so a
+	// slow handler cannot block PushFront/PushBack and a handler that mutates
+	// the channel does not deadlock (RLock -> Lock on the same goroutine).
+	handlers := make([]Func, len(p.handlers))
+	copy(handlers, p.handlers)
+	p.mu.RUnlock()
+	for _, h := range handlers {
 		err := h(s, msg)
 		if err != nil {
 			return err

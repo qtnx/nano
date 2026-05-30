@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/fasthttp/websocket"
+	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 )
 
@@ -45,10 +46,17 @@ type wsConn struct {
 func newWSConn(conn *websocket.Conn) (*wsConn, error) {
 	c := &wsConn{conn: conn}
 
+	// Bound the first frame read so a client that upgrades then stalls
+	// (slowloris) cannot pin this goroutine/FD indefinitely (H11). The read
+	// loop manages deadlines for subsequent reads, so clear it afterwards.
+	if env.Heartbeat > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * env.Heartbeat))
+	}
 	t, r, err := conn.NextReader()
 	if err != nil {
 		return nil, err
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 
 	c.typ = t
 	c.reader = r
@@ -103,6 +111,17 @@ func (c *wsConn) Write(b []byte) (int, error) {
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *wsConn) Close() error {
+	// Send a close control frame so clients/proxies observe a normal closure
+	// instead of an abnormal one on every server-side close (L4). Best-effort:
+	// proceed to close the underlying connection regardless. The write mutex
+	// serializes this against concurrent Write calls.
+	c.mu.Lock()
+	_ = c.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(time.Second),
+	)
+	c.mu.Unlock()
 	return c.conn.Close()
 }
 

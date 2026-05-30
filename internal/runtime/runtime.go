@@ -20,6 +20,23 @@
 
 package runtime
 
-import "github.com/lonng/nano/cluster"
+import (
+	"sync/atomic"
 
-var CurrentNode *cluster.Node
+	"github.com/lonng/nano/cluster"
+)
+
+// currentNode holds the node for the current process. It is published through
+// an atomic pointer so concurrent readers (e.g. PingNodes) never race the
+// startup/shutdown writers.
+var currentNode atomic.Pointer[cluster.Node]
+
+// SetCurrentNode publishes the node for the current process.
+func SetCurrentNode(n *cluster.Node) {
+	currentNode.Store(n)
+}
+
+// CurrentNode returns the node for the current process, or nil if unset.
+func CurrentNode() *cluster.Node {
+	return currentNode.Load()
+}

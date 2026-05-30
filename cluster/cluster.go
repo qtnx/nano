@@ -41,6 +41,13 @@ type cluster struct {
 
 	mu      sync.RWMutex
 	members []*Member
+
+	// heartbeat-checker lifecycle (master only). heartbeatStop is closed by
+	// stopHeartbeatChecker to terminate the goroutine on Shutdown; heartbeatDone
+	// is closed by the goroutine when it exits so shutdown/tests can join it.
+	heartbeatStop chan struct{}
+	heartbeatDone chan struct{}
+	heartbeatOnce sync.Once
 }
 
 func newCluster(currentNode *Node) *cluster {
@@ -53,7 +60,7 @@ func newCluster(currentNode *Node) *cluster {
 
 // Register implements the MasterServer gRPC service
 func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*clusterpb.RegisterResponse, error) {
-	if req.MemberInfo == nil {
+	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
 	resp := &clusterpb.RegisterResponse{}
@@ -70,83 +77,131 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 			//return nil, fmt.Errorf("address %s has registered", req.MemberInfo.ServiceAddr)
 		}
 	}
+	// Snapshot the surviving members under the lock so the fan-out below never
+	// races concurrent membership mutations on the backing array (H4).
+	snapshot := make([]*Member, len(c.members))
+	copy(snapshot, c.members)
 	c.mu.Unlock()
 
-	// Notify registered node to update remote services
-	newMember := &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo}
-	for _, m := range c.members {
+	// Register the new member locally FIRST so a single unreachable or stale
+	// peer cannot block the join (and leave the registering node retrying
+	// forever). Peer notification below is best-effort (H25).
+	for _, m := range snapshot {
 		resp.Members = append(resp.Members, m.memberInfo)
+	}
+
+	c.currentNode.handler.addRemoteService(req.MemberInfo)
+	c.mu.Lock()
+	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
+	c.mu.Unlock()
+
+	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
+
+	// Notify already-registered nodes about the new member. Failures are logged
+	// and skipped instead of aborting the join; each call is bounded so a slow
+	// peer cannot stall registration (H25).
+	newMember := &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo}
+	for _, m := range snapshot {
 		if m.isMaster {
 			continue
 		}
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if err != nil {
-			return nil, err
+			log.Errorf("cluster: notify new member %s -> %s failed: %v", req.MemberInfo.ServiceAddr, m.memberInfo.ServiceAddr, err)
+			continue
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
-		_, err = client.NewMember(context.Background(), newMember)
+		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+		_, err = client.NewMember(ctx, newMember)
+		cancel()
 		if err != nil {
-			return nil, err
+			log.Errorf("cluster: notify new member %s -> %s failed: %v", req.MemberInfo.ServiceAddr, m.memberInfo.ServiceAddr, err)
 		}
 	}
-
-	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
-
-	// Register services to current node
-	c.currentNode.handler.addRemoteService(req.MemberInfo)
-	c.mu.Lock()
-	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
-	c.mu.Unlock()
 	return resp, nil
 }
 
 // Unregister implements the MasterServer gRPC service
 func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest) (*clusterpb.UnregisterResponse, error) {
-	if req.ServiceAddr == "" {
+	if req == nil || req.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
 
-	var index = -1
 	resp := &clusterpb.UnregisterResponse{}
-	for i, m := range c.members {
+
+	// Snapshot members under the lock; the fan-out below issues RPCs and must
+	// not hold the lock or read the live backing array (H4).
+	c.mu.RLock()
+	snapshot := make([]*Member, len(c.members))
+	copy(snapshot, c.members)
+	c.mu.RUnlock()
+
+	var target *Member
+	for _, m := range snapshot {
 		if m.memberInfo.ServiceAddr == req.ServiceAddr {
-			index = i
+			target = m
 			break
 		}
 	}
-	if index < 0 {
+	if target == nil {
 		return nil, fmt.Errorf("address %s has not registered", req.ServiceAddr)
 	}
 
-	// Notify registered node to update remote services
-	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr}
+	// Remove the departed member from the master/local registry FIRST so a
+	// single unreachable peer cannot block removal and leave a stale routable
+	// address (plus a heartbeat retry loop) (H25).
+	c.currentNode.handler.delMember(req.ServiceAddr)
+	c.mu.Lock()
 	for i, m := range c.members {
-		if i == index {
+		if m.memberInfo.ServiceAddr == req.ServiceAddr {
+			if i >= len(c.members)-1 {
+				c.members = c.members[:i]
+			} else {
+				c.members = append(c.members[:i], c.members[i+1:]...)
+			}
+			break
+		}
+	}
+	c.mu.Unlock()
+
+	// Close the outbound connection pool to the departed member so its gRPC
+	// ClientConns/goroutines are reclaimed (M3).
+	if c.rpcClient != nil {
+		c.rpcClient.removePool(req.ServiceAddr)
+	}
+
+	log.Println("Exists peer unregister to cluster", req.ServiceAddr)
+
+	// Notify the remaining peers best-effort; a failed peer is logged and
+	// skipped rather than aborting removal, and each call is bounded (H25).
+	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr}
+	for _, m := range snapshot {
+		if m.memberInfo.ServiceAddr == req.ServiceAddr {
 			// this node is down.
 			continue
 		}
-
 		if m.MemberInfo().ServiceAddr == c.currentNode.ServiceAddr {
 			continue
 		}
 		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
 		if err != nil {
-			return nil, err
+			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
+			continue
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
-		_, err = client.DelMember(context.Background(), delMember)
+		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+		_, err = client.DelMember(ctx, delMember)
+		cancel()
 		if err != nil {
-			return nil, err
+			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
 		}
 	}
 
-	log.Println("Exists peer unregister to cluster", req.ServiceAddr)
-
 	if c.currentNode.UnregisterCallback != nil {
-		c.currentNode.UnregisterCallback(*c.members[index], func() {
+		c.currentNode.UnregisterCallback(*target, func() {
 			log.Println("UnregisterCallback")
 			res, err := c.Register(context.Background(), &clusterpb.RegisterRequest{
-				MemberInfo: c.members[index].MemberInfo(),
+				MemberInfo: target.MemberInfo(),
 			})
 			if err != nil {
 				log.Error("UnregisterCallback register error", err)
@@ -156,20 +211,16 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 		})
 	}
 
-	// Register services to current node
-	c.currentNode.handler.delMember(req.ServiceAddr)
-	c.mu.Lock()
-	if index >= len(c.members)-1 {
-		c.members = c.members[:index]
-	} else {
-		c.members = append(c.members[:index], c.members[index+1:]...)
-	}
-	c.mu.Unlock()
-
 	return resp, nil
 }
 
 func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) (*clusterpb.HeartbeatResponse, error) {
+	// MemberInfo is an optional proto message: a malformed RPC can omit it.
+	// Validate before touching shared state so a nil deref cannot crash the
+	// master node.
+	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
+		return nil, ErrInvalidRegisterReq
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	log.Println("Receive Heartbeat from: ", req.MemberInfo.Label)
@@ -197,10 +248,19 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 }
 
 func (c *cluster) checkMemberHeartbeat() {
+	c.heartbeatStop = make(chan struct{})
+	c.heartbeatDone = make(chan struct{})
 	check := func() {
+		// Snapshot members under the lock so the check never reads the live
+		// backing array concurrently with membership mutations (H4).
+		c.mu.RLock()
+		snapshot := make([]*Member, len(c.members))
+		copy(snapshot, c.members)
+		c.mu.RUnlock()
+
 		unregisterMembers := make([]*Member, 0)
 		// check heartbeat time
-		for _, m := range c.members {
+		for _, m := range snapshot {
 			log.Infof("Check heartbeat for %s, last heartbeat: %v, diff %v, deadline: %v", m.MemberInfo().ServiceAddr, m.lastHeartbeatAt, time.Now().Sub(m.lastHeartbeatAt), 4*env.Heartbeat)
 			if time.Now().Sub(m.lastHeartbeatAt) > 4*env.Heartbeat && !m.isMaster {
 				unregisterMembers = append(unregisterMembers, m)
@@ -217,25 +277,46 @@ func (c *cluster) checkMemberHeartbeat() {
 		}
 	}
 	go func() {
+		defer close(c.heartbeatDone)
 		ticker := time.NewTicker(env.Heartbeat)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				if !c.currentNode.IsMaster {
-					ticker.Stop()
 					return
 				}
 				check()
+			case <-c.heartbeatStop:
+				// Stopped by Shutdown so the goroutine no longer mutates stale
+				// cluster state after the node is torn down (M13).
+				return
 			}
 		}
 	}()
+}
+
+// stopHeartbeatChecker terminates the master heartbeat-checker goroutine. It is
+// idempotent and a no-op when the checker was never started.
+func (c *cluster) stopHeartbeatChecker() {
+	c.heartbeatOnce.Do(func() {
+		if c.heartbeatStop != nil {
+			close(c.heartbeatStop)
+		}
+	})
 }
 
 // pingNodes sends ping request to all nodes in the cluster
 // withLabels is the labels of nodes that should be pinged
 // returns the labels of nodes that are alive and dead
 func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string, err error) {
-	for _, m := range c.members {
+	// Snapshot the membership so iteration never races concurrent
+	// register/unregister mutations of the backing array (H4).
+	c.mu.RLock()
+	snapshot := make([]*Member, len(c.members))
+	copy(snapshot, c.members)
+	c.mu.RUnlock()
+	for _, m := range snapshot {
 		if m.isMaster {
 			continue
 		}
@@ -258,7 +339,7 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 			log.Error("Ping node error", m.memberInfo.Label, err)
 			dies = append(dies, m.memberInfo.Label)
 		} else {
-			log.Debug("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
+			log.Debugf("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
 			if resp.Msg == "pong" {
 				lives = append(lives, m.memberInfo.Label)
 			} else {
@@ -269,7 +350,7 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 
 	for _, label := range withLabels {
 		var found bool
-		for _, m := range c.members {
+		for _, m := range snapshot {
 			if m.memberInfo.Label == label {
 				found = true
 			}
@@ -341,4 +422,32 @@ func (c *cluster) delMember(addr string) {
 		}
 	}
 	c.mu.Unlock()
+
+	// Close the outbound connection pool to the departed member so its gRPC
+	// ClientConns/goroutines are reclaimed on member removal (M3).
+	if c.rpcClient != nil {
+		c.rpcClient.removePool(addr)
+	}
+}
+
+// addLocalMember appends a member under the lock. Used by node startup to
+// register the master's own member entry without racing routing/heartbeat
+// readers (H4).
+func (c *cluster) addLocalMember(m *Member) {
+	c.mu.Lock()
+	c.members = append(c.members, m)
+	c.mu.Unlock()
+}
+
+// isKnownAddr reports whether addr is a currently-registered member's service
+// address. Used to validate RPC-supplied gate addresses before dialing (M9).
+func (c *cluster) isKnownAddr(addr string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, m := range c.members {
+		if m.memberInfo.ServiceAddr == addr {
+			return true
+		}
+	}
+	return false
 }

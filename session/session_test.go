@@ -1,6 +1,9 @@
 package session
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestNewSession(t *testing.T) {
 	s := New(nil)
@@ -172,4 +175,89 @@ func TestSession_Restore(t *testing.T) {
 	if value != s2.Uint64(key) {
 		t.Fail()
 	}
+}
+
+func TestSession_StateRace(t *testing.T) {
+	s := New(nil)
+	s.Set("k", 0)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			s.Set("k", i)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			for range s.State() {
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestSession_ClientUidRace(t *testing.T) {
+	s := New(nil)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			s.SetClientUid(int64(i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			_ = s.ClientUid()
+		}
+	}()
+	wg.Wait()
+}
+
+func TestSession_ClearUIDRace(t *testing.T) {
+	s := New(nil)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			s.Clear()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			_ = s.UID()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 1000; i++ {
+			_ = s.Bind(int64(i))
+		}
+	}()
+	wg.Wait()
+}
+
+func TestLifetime_OnClosedRace(t *testing.T) {
+	lt := &lifetime{}
+	s := New(nil)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			lt.OnClosed(func(*Session) {})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			lt.Close(s)
+		}
+	}()
+	wg.Wait()
 }

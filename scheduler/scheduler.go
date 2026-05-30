@@ -23,6 +23,7 @@ package scheduler
 import (
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,22 +106,53 @@ func Sched() {
 		return
 	}
 
-	ticker := time.NewTicker(env.TimerPrecision)
+	// Timer processing runs on its own ticker/goroutine, independent of the
+	// task-dispatch select loop below. This decouples the two subsystems
+	// (C6/H1): a saturated task queue can no longer delay timer ticks, and a
+	// long-running timer can no longer stall task dispatch. Timer callbacks are
+	// still delivered through cron()/safecall, preserving recovery semantics.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		timerLoop()
+	}()
+
+	// chExit must not close until BOTH the timer loop and this dispatch loop
+	// have returned, so Close() blocks until the scheduler is fully stopped.
 	defer func() {
-		ticker.Stop()
+		wg.Wait()
 		close(chExit)
 	}()
 
 	for {
 		select {
-		case <-ticker.C:
-			cron()
-
 		case f := <-chTasks:
 			try(f)
 
 		case <-chDie:
 			log.Println("[Nano] Scheduler stopped")
+			return
+		}
+	}
+}
+
+// timerLoop drives the periodic cron() timer processing on a dedicated ticker
+// and goroutine. Keeping it off the task-dispatch loop means timer ticks fire
+// on schedule regardless of how busy or blocked task dispatch is. It exits when
+// the scheduler is closed (chDie).
+func timerLoop() {
+	ticker := time.NewTicker(env.TimerPrecision)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Wrap cron in the same recover() boundary used for tasks: an
+			// unrecovered panic on this goroutine would crash the process.
+			try(cron)
+
+		case <-chDie:
 			return
 		}
 	}
@@ -132,6 +164,9 @@ func Close() {
 	}
 	close(chDie)
 	<-chExit
+	// Tear down the sharded dispatcher (if enabled) so its worker goroutines do
+	// not outlive the scheduler. No-op in single-scheduler mode.
+	stopSharded()
 	log.Println("Scheduler stopped")
 }
 
@@ -139,6 +174,6 @@ func PushTask(task Task) {
 	chTasks <- task
 	metrics.SchedulePendingTasks.Set(float64(len(chTasks)))
 	if env.Debug {
-		log.Println("Scheduler push task channel size %d", len(chTasks))
+		log.Infof("Scheduler push task channel size %d", len(chTasks))
 	}
 }
