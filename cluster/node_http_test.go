@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"testing"
 	"time"
 
 	"github.com/lonng/nano/cluster"
@@ -18,15 +16,8 @@ import (
 	. "github.com/pingcap/check"
 )
 
-var _ = Suite(&nodeSuite{})
-
-func TestNodeHTTP(t *testing.T) {
-	TestingT(t)
-}
-
 func (s *nodeSuite) TestNodeHTTP(c *C) {
 	go scheduler.Sched()
-	defer scheduler.Close()
 
 	// HTTP /api + SSE are JSON end-to-end for LOCAL routes only: handleHTTPRequest
 	// decodes the body with httpJSONSerializer and ResponseMid serializes with it,
@@ -87,22 +78,12 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	client := &http.Client{}
 	baseURL := "http://127.0.0.1:14452"
 
-	// First, establish SSE connection
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// First, establish SSE connection. connectSSE returns only after the HTTP
+	// response headers are received, so the session ID is synchronized before it
+	// is used by /api requests.
 	messageChan := make(chan string, 10)
-	var sseSessionID string
-	go func() {
-		defer wg.Done()
-		var err error
-		sseSessionID, err = connectSSE(baseURL+"/sse", messageChan)
-		if err != nil {
-			c.Errorf("Failed to connect to SSE: %v", err)
-			return
-		}
-	}()
-	// Wait for SSE to be ready
-	time.Sleep(100 * time.Millisecond)
+	sseSessionID, err := connectSSE(baseURL+"/sse", messageChan)
+	c.Assert(err, IsNil)
 
 	// The SSE handler emits an initial onConnected event before any push;
 	// drain it so the push/response assertions below line up with the actual
@@ -184,6 +165,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -213,6 +195,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -242,6 +225,7 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 	req, err = http.NewRequest("POST", baseURL+"/api", bytes.NewReader(bodyBytes))
 	c.Assert(err, IsNil)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SSE-SessionID", sseSessionID)
 	resp, err = client.Do(req)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -256,9 +240,8 @@ func (s *nodeSuite) TestNodeHTTP(c *C) {
 		c.Error("Timeout waiting for SSE message")
 	}
 
-	// Close the SSE connection
-	close(messageChan)
-	wg.Wait() // Wait for the SSE goroutine to finish
+	// Node shutdown closes the SSE response body; leave messageChan open because
+	// the reader goroutine owns writes to it.
 }
 
 // connectSSE connects to the SSE endpoint and reads messages.

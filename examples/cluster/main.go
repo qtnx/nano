@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"github.com/lonng/nano"
 	"github.com/lonng/nano/cluster"
@@ -149,7 +150,7 @@ func runGate(args *cli.Context) error {
 
 	pip.Inbound().PushBack(func(s *session.Session, msg *pipeline.Message) error {
 		runTimes++
-		log.Println("Inbound", runTimes, string(s.UID()))
+		log.Println("Inbound", runTimes, strconv.FormatInt(s.UID(), 10))
 		if runTimes < rand.Intn(3)+1 {
 			log.Println("Closing session due to random check")
 			// s.Close()

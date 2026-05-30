@@ -17,8 +17,8 @@ import (
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
 	"github.com/lonng/nano/internal/packet"
-	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/scheduler"
+	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/valyala/fasthttp"
 )
@@ -457,7 +457,7 @@ func newMasterCluster(t *testing.T) (*cluster, *rpcClient) {
 func TestRegisterBestEffortOnPeerFailure(t *testing.T) {
 	log.SetLogger(&noopLogger{})
 	c, rc := newMasterCluster(t)
-	c.addMember(memberInfo("127.0.0.1:9001", "peer"))
+	c.addMember(memberInfo("127.0.0.1:9001", "peer"), 0, 0)
 	rc.closePool() // every getConnPool now errors -> peer fan-out must be best-effort
 
 	resp, err := c.Register(context.Background(), &clusterpb.RegisterRequest{MemberInfo: memberInfo("127.0.0.1:9002", "svc")})
@@ -475,8 +475,8 @@ func TestRegisterBestEffortOnPeerFailure(t *testing.T) {
 func TestUnregisterBestEffortOnPeerFailure(t *testing.T) {
 	log.SetLogger(&noopLogger{})
 	c, rc := newMasterCluster(t)
-	c.addMember(memberInfo("127.0.0.1:9002", "svc"))  // the departing member
-	c.addMember(memberInfo("127.0.0.1:9001", "peer")) // a peer to notify
+	c.addMember(memberInfo("127.0.0.1:9002", "svc"), 0, 0)  // the departing member
+	c.addMember(memberInfo("127.0.0.1:9001", "peer"), 0, 0) // a peer to notify
 	rc.closePool()
 
 	if _, err := c.Unregister(context.Background(), &clusterpb.UnregisterRequest{ServiceAddr: "127.0.0.1:9002"}); err != nil {

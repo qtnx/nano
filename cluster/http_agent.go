@@ -140,6 +140,12 @@ func NewHTTPAgent(
 	return a
 }
 
+func (h *httpAgent) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCtx) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -158,6 +164,9 @@ func (h *httpAgent) AttackHttpRequestCtx(mid uint64, httpCtx *fasthttp.RequestCt
 func (h *httpAgent) RemoveHttpRequestCtx(mid uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.messageIDMapToRequest == nil {
+		return
+	}
 	if _, exists := h.messageIDMapToRequest[mid]; exists {
 		delete(h.messageIDMapToRequest, mid)
 	}
@@ -167,6 +176,9 @@ func (h *httpAgent) GetFastHttpContextObserve(mid uint64) *fastHttpContextObserv
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed || h.messageIDMapToRequest == nil {
+		return nil
+	}
 	if ctxObserve, exists := h.messageIDMapToRequest[mid]; exists {
 		return ctxObserve
 	}
@@ -226,6 +238,10 @@ func (h *httpAgent) OriginalSid() int64 {
 
 // Push implements session.NetworkEntity.
 func (h *httpAgent) Push(route string, v interface{}) error {
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
+
 	var body interface{}
 
 	// Check if v is already JSON
@@ -266,7 +282,6 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 	if closed || ch == nil {
 		return ErrBrokenPipe
 	}
-
 	select {
 	case ch <- data:
 		if env.Debug {
@@ -284,6 +299,10 @@ func (h *httpAgent) Push(route string, v interface{}) error {
 
 // RPC implements session.NetworkEntity.
 func (h *httpAgent) RPC(route string, v interface{}) error {
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
+
 	data, err := serializeHTTPJSON(v)
 	if err != nil {
 		return err
@@ -296,16 +315,35 @@ func (h *httpAgent) RPC(route string, v interface{}) error {
 	if env.Debug {
 		log.Infof("[HTTP Agent] RPC event: %s", data)
 	}
-	return h.rpcHandler(h.session, msg, true)
+
+	h.mu.Lock()
+	closed := h.closed
+	handler := h.rpcHandler
+	sess := h.session
+	h.mu.Unlock()
+	if closed || handler == nil || sess == nil {
+		return ErrBrokenPipe
+	}
+	return handler(sess, msg, true)
 }
 
 // RemoteAddr implements session.NetworkEntity.
 func (h *httpAgent) RemoteAddr() net.Addr {
-	return h.httpCtx.RemoteAddr()
+	h.mu.Lock()
+	closed := h.closed
+	ctx := h.httpCtx
+	h.mu.Unlock()
+	if closed || ctx == nil {
+		return nil
+	}
+	return ctx.RemoteAddr()
 }
 
 // Response implements session.NetworkEntity.
 func (h *httpAgent) Response(v interface{}) error {
+	if h.isClosed() {
+		return ErrBrokenPipe
+	}
 	// Route by the request mid bound to this goroutine (set by localProcess for
 	// the duration of the handler call) so concurrent /api requests sharing one
 	// agent cannot cross-wire their responses (H34). A bare Response is only
@@ -322,9 +360,6 @@ func (h *httpAgent) Response(v interface{}) error {
 
 // ResponseMid implements session.NetworkEntity.
 func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	if env.Debug {
 		log.Infof("[HTTP Agent] ResponseMid: %v", mid)
 	}
@@ -347,12 +382,21 @@ func (h *httpAgent) ResponseMid(mid uint64, v interface{}) error {
 		}
 	}
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.messageIDMapToRequest == nil {
+		return ErrBrokenPipe
+	}
+
 	ctx, exists := h.messageIDMapToRequest[mid]
 	if !exists {
 		if env.Debug {
 			log.Infof("[HTTP Agent] No context found for messageID: %d, response might have timed out", mid)
 		}
 		return nil
+	}
+	if ctx == nil || ctx.context == nil {
+		return ErrBrokenPipe
 	}
 
 	// Publish the serialized body and let the owning /api request goroutine

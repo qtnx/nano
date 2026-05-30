@@ -43,8 +43,8 @@ import (
 	"github.com/lonng/nano/internal/packet"
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
-	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/scheduler"
+	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/session"
 )
 
@@ -200,6 +200,10 @@ func (h *LocalHandler) initRemoteService(members []*clusterpb.MemberInfo) {
 }
 
 func (h *LocalHandler) addRemoteService(member *clusterpb.MemberInfo) {
+	if member == nil {
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -209,7 +213,7 @@ func (h *LocalHandler) addRemoteService(member *clusterpb.MemberInfo) {
 		// (M12). Routing therefore stays idempotent across rejoins.
 		var filtered []*clusterpb.MemberInfo
 		for _, m := range h.remoteServices[s] {
-			if m.ServiceAddr != member.ServiceAddr {
+			if m != nil && m.ServiceAddr != member.ServiceAddr {
 				filtered = append(filtered, m)
 			}
 		}
@@ -223,19 +227,17 @@ func (h *LocalHandler) delMember(addr string) {
 	defer h.mu.Unlock()
 
 	for name, members := range h.remoteServices {
-		for i, maddr := range members {
-			if addr == maddr.ServiceAddr {
-				if i >= len(members)-1 {
-					members = members[:i]
-				} else {
-					members = append(members[:i], members[i+1:]...)
-				}
+		kept := members[:0]
+		for _, maddr := range members {
+			if maddr != nil && addr == maddr.ServiceAddr {
+				continue
 			}
+			kept = append(kept, maddr)
 		}
-		if len(members) == 0 {
+		if len(kept) == 0 {
 			delete(h.remoteServices, name)
 		} else {
-			h.remoteServices[name] = members
+			h.remoteServices[name] = kept
 		}
 	}
 }
@@ -705,6 +707,14 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 	default:
 		log.Println("Invalid message type: " + msg.Type.String())
 		return
+	}
+
+	if pipe := h.pipeline; pipe != nil {
+		err := pipe.Inbound().Process(agent.session, msg)
+		if err != nil {
+			log.Println("Pipeline process failed: " + err.Error())
+			return
+		}
 	}
 
 	handler, found := h.localHandlers[msg.Route]

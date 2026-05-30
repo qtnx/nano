@@ -178,8 +178,8 @@ func TestClusterMembersNoRace(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					c.addMember(memberInfo(addr))
-					c.delMember(addr)
+					c.addMember(memberInfo(addr), 0, 0)
+					c.delMember(addr, 0, 0)
 				}
 			}
 		}(i)
@@ -409,7 +409,7 @@ func TestFindOrCreateSessionRejectsUnknownGate(t *testing.T) {
 	n.ServiceAddr = "self:1"
 	n.rpcClient = newRPCClient()
 	n.cluster.setRpcClient(n.rpcClient)
-	n.cluster.addMember(memberInfo("known-gate:1"))
+	n.cluster.addMember(memberInfo("known-gate:1"), 0, 0)
 
 	_, err := n.findOrCreateSession(7, 0, "evil.example.com:1", []byte("{}"), false)
 	if err == nil {
@@ -430,7 +430,7 @@ func TestFindOrCreateSessionNoDuplicate(t *testing.T) {
 		n.rpcClient = newRPCClient()
 		n.cluster.setRpcClient(n.rpcClient)
 		const gate = "127.0.0.1:1"
-		n.cluster.addMember(memberInfo(gate))
+		n.cluster.addMember(memberInfo(gate), 0, 0)
 
 		const sid = int64(123)
 		const workers = 32

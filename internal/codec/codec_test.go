@@ -99,6 +99,59 @@ func BenchmarkDecoder_Decode(b *testing.B) {
 	}
 }
 
+func TestEncodeAllocationsStayLow(t *testing.T) {
+	data := []byte("hello world")
+	var encoded []byte
+	var err error
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		encoded, err = Encode(Data, data)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs > 1 {
+		t.Fatalf("Encode allocations = %.1f, want <= 1", allocs)
+	}
+
+	want := []byte{byte(Data), 0x00, 0x00, byte(len(data))}
+	want = append(want, data...)
+	if !reflect.DeepEqual(want, encoded) {
+		t.Fatalf("encoded packet changed: want %v, got %v", want, encoded)
+	}
+}
+
+func TestDecodeMalformedPacketsReturnExpectedErrors(t *testing.T) {
+	t.Run("fragmented header waits for more data", func(t *testing.T) {
+		d := NewDecoder()
+		packets, err := d.Decode([]byte{byte(Data), 0x00})
+		if err != nil {
+			t.Fatalf("Decode error = %v, want nil", err)
+		}
+		if len(packets) != 0 {
+			t.Fatalf("Decode packets = %d, want 0", len(packets))
+		}
+	})
+
+	t.Run("wrong packet type", func(t *testing.T) {
+		d := NewDecoder()
+		_, err := d.Decode([]byte{0x00, 0x00, 0x00, 0x00})
+		if err != ErrWrongPacketType {
+			t.Fatalf("Decode error = %v, want %v", err, ErrWrongPacketType)
+		}
+	})
+
+	t.Run("oversized packet", func(t *testing.T) {
+		d := NewDecoder()
+		size := MaxPacketSize + 1
+		header := []byte{byte(Data), byte((size >> 16) & 0xff), byte((size >> 8) & 0xff), byte(size & 0xff)}
+		_, err := d.Decode(header)
+		if err != ErrPacketSizeExcced {
+			t.Fatalf("Decode error = %v, want %v", err, ErrPacketSizeExcced)
+		}
+	})
+}
+
 // TestEncodeMaxPacketSize covers M1: Encode must reject payloads larger than
 // MaxPacketSize instead of silently allocating and wrapping the 3-byte length.
 func TestEncodeMaxPacketSize(t *testing.T) {

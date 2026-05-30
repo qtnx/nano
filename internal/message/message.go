@@ -107,6 +107,29 @@ func invalidType(t Type) bool {
 
 }
 
+func messageIDSize(id uint64) int {
+	size := 1
+	for id >>= 7; id != 0; id >>= 7 {
+		size++
+	}
+	return size
+}
+
+func encodedSize(m *Message, compressed bool) int {
+	size := 1 + len(m.Data)
+	if m.Type == Request || m.Type == Response {
+		size += messageIDSize(m.ID)
+	}
+	if routable(m.Type) {
+		if compressed {
+			size += 2
+		} else {
+			size += 1 + len(m.Route)
+		}
+	}
+	return size
+}
+
 // Encode marshals message to binary format. Different message types is corresponding to
 // different message header, message types is identified by 2-4 bit of flag field. The
 // relationship between message types and message header is presented as follows:
@@ -125,23 +148,24 @@ func Encode(m *Message) ([]byte, error) {
 		return nil, ErrWrongMessageType
 	}
 
-	routesMu.RLock()
-	code, compressed := routes[m.Route]
-	routesMu.RUnlock()
+	var code uint16
+	compressed := false
+	if routable(m.Type) {
+		routesMu.RLock()
+		code, compressed = routes[m.Route]
+		routesMu.RUnlock()
 
-	if routable(m.Type) && !compressed && len(m.Route) > msgRouteLengthMask {
-		return nil, ErrRouteTooLong
+		if !compressed && len(m.Route) > msgRouteLengthMask {
+			return nil, ErrRouteTooLong
+		}
 	}
-
-	// Preallocate a single buffer big enough for header and payload to avoid
-	// repeated grow-and-copy: flag(1) + id varint(<=10) +
-	// route(<=2 when compressed, otherwise 1+len(route)) + data.
-	buf := make([]byte, 0, 1+10+2+len(m.Route)+len(m.Data))
 	flag := byte(m.Type) << 1
 
 	if compressed {
 		flag |= msgRouteCompressMask
 	}
+
+	buf := make([]byte, 0, encodedSize(m, compressed))
 	buf = append(buf, flag)
 
 	if m.Type == Request || m.Type == Response {
@@ -217,7 +241,7 @@ func Decode(data []byte) (*Message, error) {
 		m.ID = id
 	}
 
-	if offset >= len(data) {
+	if routable(m.Type) && offset >= len(data) {
 		return nil, ErrWrongMessage
 	}
 
@@ -264,12 +288,17 @@ func SetDictionary(dict map[string]uint16) {
 	for route, code := range dict {
 		r := strings.TrimSpace(route)
 
-		// duplication check
-		if _, ok := routes[r]; ok {
+		if oldCode, ok := routes[r]; ok {
+			if oldCode != code {
+				delete(codes, oldCode)
+			}
 			log.Println(fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
 		}
 
-		if _, ok := codes[code]; ok {
+		if oldRoute, ok := codes[code]; ok {
+			if oldRoute != r {
+				delete(routes, oldRoute)
+			}
 			log.Println(fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
 		}
 

@@ -45,11 +45,12 @@ import (
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 	"github.com/lonng/nano/internal/message"
+	"github.com/lonng/nano/internal/packet"
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
-	"github.com/lonng/nano/session"
 	nanojson "github.com/lonng/nano/serialize/json"
+	"github.com/lonng/nano/session"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
@@ -70,6 +71,12 @@ var (
 	// clusterAuthMetadataKey is the gRPC metadata key that carries the shared
 	// cluster auth token on inter-node RPCs (H9).
 	clusterAuthMetadataKey = "authorization"
+)
+
+const (
+	defaultCORSAllowOrigin  = "*"
+	defaultCORSAllowMethods = "POST, GET, OPTIONS, PUT, DELETE"
+	defaultCORSAllowHeaders = "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-SSE-SessionID"
 )
 
 // Options contains some configurations for current node
@@ -190,13 +197,9 @@ func (n *Node) listenAndServe() error {
 	// Start the fasthttp server
 	server := &fasthttp.Server{
 		Handler: func(ctx *fasthttp.RequestCtx) {
-			// Set CORS headers to accept all
-			ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
-			ctx.Response.Header.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-SSE-SessionID")
+			applyDefaultCORSHeaders(ctx)
 
-			// Handle preflight requests
-			if string(ctx.Method()) == "OPTIONS" {
+			if isPreflightRequest(ctx) {
 				ctx.SetStatusCode(fasthttp.StatusOK)
 				return
 			}
@@ -229,13 +232,102 @@ func (n *Node) listenAndServe() error {
 		if serveTLS {
 			serveErr = server.ServeTLS(ln, n.TSLCertificate, n.TSLKey)
 		} else {
-			serveErr = server.Serve(ln)
+			mux := newClientConnMultiplexer(ln)
+			go mux.serve(n.handler.handle)
+			serveErr = server.Serve(mux)
 		}
 		if serveErr != nil {
 			log.Println(fmt.Sprintf("Error serving fasthttp server: %v", serveErr))
 		}
 	}()
 	return nil
+}
+
+type bufferedClientConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedClientConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type clientConnMultiplexer struct {
+	net.Listener
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newClientConnMultiplexer(listener net.Listener) *clientConnMultiplexer {
+	return &clientConnMultiplexer{
+		Listener: listener,
+		conns:    make(chan net.Conn),
+		done:     make(chan struct{}),
+	}
+}
+
+func (m *clientConnMultiplexer) Accept() (net.Conn, error) {
+	select {
+	case conn, ok := <-m.conns:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return conn, nil
+	case <-m.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (m *clientConnMultiplexer) Close() error {
+	var err error
+	m.once.Do(func() {
+		close(m.done)
+		err = m.Listener.Close()
+	})
+	return err
+}
+
+func (m *clientConnMultiplexer) serve(handleNanoConn func(net.Conn)) {
+	defer close(m.conns)
+	for {
+		conn, err := m.Listener.Accept()
+		if err != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		header, err := reader.Peek(1)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		wrapped := &bufferedClientConn{Conn: conn, reader: reader}
+		if isNanoClientPacket(header[0]) {
+			go handleNanoConn(wrapped)
+			continue
+		}
+		select {
+		case m.conns <- wrapped:
+		case <-m.done:
+			conn.Close()
+			return
+		}
+	}
+}
+
+func isNanoClientPacket(firstByte byte) bool {
+	typ := packet.Type(firstByte)
+	return typ >= packet.Handshake && typ <= packet.Kick
+}
+
+func applyDefaultCORSHeaders(ctx *fasthttp.RequestCtx) {
+	ctx.Response.Header.Set("Access-Control-Allow-Origin", defaultCORSAllowOrigin)
+	ctx.Response.Header.Set("Access-Control-Allow-Methods", defaultCORSAllowMethods)
+	ctx.Response.Header.Set("Access-Control-Allow-Headers", defaultCORSAllowHeaders)
+}
+
+func isPreflightRequest(ctx *fasthttp.RequestCtx) bool {
+	return string(ctx.Method()) == fasthttp.MethodOptions
 }
 
 // handleFastHTTP is the request handler for fasthttp
@@ -479,20 +571,8 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	ctx.SetStatusCode(fasthttp.StatusOK)
 	log.Debugf("SSE connection established")
 
-	// Resolve the session id from cookie/header/query; clientSupplied records
-	// whether the client chose it (vs. a server-generated one).
-	var sessionID string
+	sessionID := sseSessionIDFromRequest(ctx)
 	clientSupplied := true
-	cookie := ctx.Request.Header.Cookie("sse_sessionID")
-	if len(cookie) == 0 {
-		sessionID = string(ctx.Request.Header.Peek("X-SSE-SessionID"))
-		if sessionID == "" {
-			sessionID = string(ctx.QueryArgs().Peek("sse_sessionID"))
-		}
-	} else {
-		sessionID = string(cookie)
-	}
-
 	if len(sessionID) == 0 {
 		clientSupplied = false
 		sessionID = generateSessionID()
@@ -633,6 +713,32 @@ func (n *Node) handleSSE(ctx *fasthttp.RequestCtx) {
 	log.Debugf("SSE stream established: %s", sessionID)
 }
 
+func sseSessionIDFromRequest(ctx *fasthttp.RequestCtx) string {
+	cookie := ctx.Request.Header.Cookie("sse_sessionID")
+	if len(cookie) > 0 {
+		return string(cookie)
+	}
+
+	sessionIDHeader := ctx.Request.Header.Peek("X-SSE-SessionID")
+	if len(sessionIDHeader) > 0 {
+		return string(sessionIDHeader)
+	}
+
+	return string(ctx.QueryArgs().Peek("sse_sessionID"))
+}
+
+func setSSESessionCookie(ctx *fasthttp.RequestCtx, sessionID string) {
+	c := fasthttp.AcquireCookie()
+	c.SetKey("sse_sessionID")
+	c.SetValue(sessionID)
+	c.SetPath("/")
+	c.SetMaxAge(3600) // 1 hour
+	c.SetHTTPOnly(true)
+	c.SetSecure(true)
+	ctx.Response.Header.SetCookie(c)
+	fasthttp.ReleaseCookie(c)
+}
+
 func (n *Node) registerSSEClient(sessionID string, eventChan chan []byte) {
 	log.Debugf("Register SSE client: %s", sessionID)
 	n.mu.Lock()
@@ -728,6 +834,7 @@ func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
 		return
 	}
 }
+
 // (removed dead listenAndServeWSTLS: it had no caller, routed WS through the
 // global http.DefaultServeMux, and called log.Fatal on a bind error. TLS is now
 // served by listenAndServe via fasthttp ServeTLS (M30).)
@@ -818,7 +925,7 @@ func (n *Node) initNode() error {
 			cancel()
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
-				n.cluster.initMembers(resp.Members)
+				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion(), resp.GetMembershipEpoch())
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
@@ -978,9 +1085,9 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		return nil, err
 	}
 	ac := &acceptor{
-		sid:        sid,
-		gateClient: clusterpb.NewMemberClient(conns.Get()),
-		rpcHandler: n.handler.remoteProcess,
+		sid:         sid,
+		gateClient:  clusterpb.NewMemberClient(conns.Get()),
+		rpcHandler:  n.handler.remoteProcess,
 		gateAddr:    gateAddr,
 		jsonPayload: jsonPayload,
 	}
@@ -1136,8 +1243,10 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
-	n.handler.addRemoteService(req.MemberInfo)
-	n.cluster.addMember(req.MemberInfo)
+	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
+		n.handler.delMember(req.MemberInfo.GetServiceAddr())
+		n.handler.addRemoteService(req.MemberInfo)
+	}
 	return &clusterpb.NewMemberResponse{}, nil
 }
 
@@ -1146,13 +1255,30 @@ func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*c
 		return nil, ErrInvalidRegisterReq
 	}
 	log.Println("[Node] DelMember member", req.String())
-	n.handler.delMember(req.ServiceAddr)
-	n.cluster.delMember(req.ServiceAddr)
-	// Purge any acceptor sessions homed on the departed gate so they don't leak
-	// in n.sessions when the gate vanishes before sending per-session
-	// SessionClosed RPCs (H24).
-	n.purgeGateSessions(req.ServiceAddr)
+	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
+		n.removeRemoteMember(req.ServiceAddr)
+	}
 	return &clusterpb.DelMemberResponse{}, nil
+}
+
+// removeRemoteMember applies all local cleanup for a remote member leaving the
+// cluster: route cache removal, gate-owned session reclamation, and outbound RPC
+// pool teardown.
+func (n *Node) removeRemoteMember(addr string) {
+	if n == nil || addr == "" {
+		return
+	}
+	if n.handler != nil {
+		n.handler.delMember(addr)
+	}
+	n.purgeGateSessions(addr)
+	rpcClient := n.rpcClient
+	if rpcClient == nil && n.cluster != nil {
+		rpcClient = n.cluster.rpcClient
+	}
+	if rpcClient != nil {
+		rpcClient.removePool(addr)
+	}
 }
 
 // purgeGateSessions removes every acceptor session whose owning gate matches
@@ -1239,16 +1365,53 @@ func (n *Node) keepalive() {
 			return
 		}
 		masterCli := clusterpb.NewMasterClient(pool.Get())
+		heartbeatSeq := n.cluster.nextMembershipSnapshotSeq()
+		membershipVersion, membershipEpoch, removedMembershipVersion := n.cluster.membershipState()
 		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
 		defer cancel()
-		if _, err := masterCli.Heartbeat(ctx, &clusterpb.HeartbeatRequest{
+		resp, err := masterCli.Heartbeat(ctx, &clusterpb.HeartbeatRequest{
 			MemberInfo: &clusterpb.MemberInfo{
 				Label:       n.Label,
 				ServiceAddr: n.ServiceAddr,
 				Services:    n.handler.LocalService(),
 			},
-		}); err != nil {
+			HeartbeatSeq:             heartbeatSeq,
+			MembershipVersion:        membershipVersion,
+			MembershipEpoch:          membershipEpoch,
+			RemovedMembershipVersion: removedMembershipVersion,
+		})
+		if err != nil {
 			log.Println("Member send heartbeat error", err)
+			return
+		}
+		snapshotSeq, ok := heartbeatSnapshotSeq(heartbeatSeq, resp.GetHeartbeatSeq())
+		if !ok {
+			log.Infof("Member heartbeat sequence mismatch, sent: %d, received: %d", heartbeatSeq, resp.GetHeartbeatSeq())
+			return
+		}
+		if len(resp.GetMembers()) == 0 && len(resp.GetRemovedMembers()) == 0 && !resp.GetResetMembership() {
+			for _, addr := range n.cluster.pruneExpiredStaleEpochMembers(time.Now()) {
+				n.removeRemoteMember(addr)
+			}
+			return
+		}
+		// Self-heal any NewMember push missed during churn: the master
+		// returns its authoritative member list, so a member that registered after
+		// our initial sync is re-learned here instead of staying invisible. Member
+		// removal self-heals through explicit tombstones so an incomplete master
+		// view cannot prune live peers just because they are absent. Updated
+		// members must refresh existing routes so services no longer advertised
+		// by that member are removed.
+		added, updated, removed := n.cluster.reconcileMembersSnapshot(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch(), snapshotSeq, resp.GetResetMembership())
+		for _, info := range updated {
+			n.handler.delMember(info.ServiceAddr)
+			n.handler.addRemoteService(info)
+		}
+		for _, info := range added {
+			n.handler.addRemoteService(info)
+		}
+		for _, addr := range removed {
+			n.removeRemoteMember(addr)
 		}
 	}
 	go func() {
@@ -1264,6 +1427,16 @@ func (n *Node) keepalive() {
 			}
 		}
 	}()
+}
+
+func heartbeatSnapshotSeq(requestSeq, responseSeq uint64) (uint64, bool) {
+	if responseSeq == 0 {
+		return requestSeq, true
+	}
+	if responseSeq != requestSeq {
+		return responseSeq, false
+	}
+	return responseSeq, true
 }
 
 // recoveryUnaryInterceptor converts a panic in any gRPC handler into a
@@ -1312,6 +1485,7 @@ func (n *Node) authUnaryInterceptor(
 	}
 	return handler(ctx, req)
 }
+
 // runGRPCServer serves the gRPC listener. A post-startup Serve error is logged
 // rather than escalated to log.Fatalf, which would call os.Exit from this
 // background goroutine and bypass node/component shutdown.
