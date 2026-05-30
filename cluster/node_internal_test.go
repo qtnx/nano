@@ -71,6 +71,23 @@ func TestGenerateSessionIDIsNumericAndNotTimestamp(t *testing.T) {
 	}
 }
 
+func TestHeartbeatSnapshotSeqFallsBackToRequestSeqWhenMasterDoesNotEcho(t *testing.T) {
+	got, ok := heartbeatSnapshotSeq(7, 0)
+	if !ok {
+		t.Fatal("heartbeat snapshot seq fallback rejected missing response echo")
+	}
+	if got != 7 {
+		t.Fatalf("heartbeat snapshot seq = %d, want request seq 7", got)
+	}
+}
+
+func TestHeartbeatSnapshotSeqRejectsMismatchedResponseEcho(t *testing.T) {
+	got, ok := heartbeatSnapshotSeq(7, 6)
+	if ok {
+		t.Fatalf("heartbeat snapshot seq accepted mismatched echo: got %d", got)
+	}
+}
+
 func TestDefaultCORSHeadersAndPreflightBehavior(t *testing.T) {
 	var req fasthttp.Request
 	var ctx fasthttp.RequestCtx

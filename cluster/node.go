@@ -650,7 +650,7 @@ func (n *Node) initNode() error {
 			resp, err := client.Register(context.Background(), request)
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
-				n.cluster.initMembers(resp.Members)
+				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion(), resp.GetMembershipEpoch())
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
@@ -878,15 +878,18 @@ func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clust
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
-	n.handler.addRemoteService(req.MemberInfo)
-	n.cluster.addMember(req.MemberInfo)
+	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
+		n.handler.delMember(req.MemberInfo.GetServiceAddr())
+		n.handler.addRemoteService(req.MemberInfo)
+	}
 	return &clusterpb.NewMemberResponse{}, nil
 }
 
 func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*clusterpb.DelMemberResponse, error) {
 	log.Println("[Node] DelMember member", req.String())
-	n.handler.delMember(req.ServiceAddr)
-	n.cluster.delMember(req.ServiceAddr)
+	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
+		n.handler.delMember(req.ServiceAddr)
+	}
 	return &clusterpb.DelMemberResponse{}, nil
 }
 
@@ -938,14 +941,48 @@ func (n *Node) keepalive() {
 			return
 		}
 		masterCli := clusterpb.NewMasterClient(pool.Get())
-		if _, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		heartbeatSeq := n.cluster.nextMembershipSnapshotSeq()
+		membershipVersion, membershipEpoch, removedMembershipVersion := n.cluster.membershipState()
+		resp, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
 			MemberInfo: &clusterpb.MemberInfo{
 				Label:       n.Label,
 				ServiceAddr: n.ServiceAddr,
 				Services:    n.handler.LocalService(),
 			},
-		}); err != nil {
+			HeartbeatSeq:             heartbeatSeq,
+			MembershipVersion:        membershipVersion,
+			MembershipEpoch:          membershipEpoch,
+			RemovedMembershipVersion: removedMembershipVersion,
+		})
+		if err != nil {
 			log.Println("Member send heartbeat error", err)
+			return
+		}
+		snapshotSeq, ok := heartbeatSnapshotSeq(heartbeatSeq, resp.GetHeartbeatSeq())
+		if !ok {
+			log.Infof("Member heartbeat sequence mismatch, sent: %d, received: %d", heartbeatSeq, resp.GetHeartbeatSeq())
+			return
+		}
+		if len(resp.GetMembers()) == 0 && len(resp.GetRemovedMembers()) == 0 && !resp.GetResetMembership() {
+			return
+		}
+		// Self-heal any NewMember push missed during churn: the master
+		// returns its authoritative member list, so a member that registered after
+		// our initial sync is re-learned here instead of staying invisible. Member
+		// removal self-heals through explicit tombstones so an incomplete master
+		// view cannot prune live peers just because they are absent. Updated
+		// members must refresh existing routes so services no longer advertised
+		// by that member are removed.
+		added, updated, removed := n.cluster.reconcileMembersSnapshot(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch(), snapshotSeq, resp.GetResetMembership())
+		for _, info := range updated {
+			n.handler.delMember(info.ServiceAddr)
+			n.handler.addRemoteService(info)
+		}
+		for _, info := range added {
+			n.handler.addRemoteService(info)
+		}
+		for _, addr := range removed {
+			n.handler.delMember(addr)
 		}
 	}
 	go func() {
@@ -961,4 +998,14 @@ func (n *Node) keepalive() {
 			}
 		}
 	}()
+}
+
+func heartbeatSnapshotSeq(requestSeq, responseSeq uint64) (uint64, bool) {
+	if responseSeq == 0 {
+		return requestSeq, true
+	}
+	if responseSeq != requestSeq {
+		return responseSeq, false
+	}
+	return responseSeq, true
 }
