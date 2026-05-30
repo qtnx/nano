@@ -1136,7 +1136,10 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
-	n.handler.addRemoteService(req.MemberInfo)
+	// Use replaceRemoteService (not addRemoteService) so a same-address rejoin
+	// that dropped a service purges the stale route on this peer too; an additive
+	// add would leave the dropped service routable here (issue #7, fix 2/7).
+	n.handler.replaceRemoteService(req.MemberInfo)
 	n.cluster.addMember(req.MemberInfo)
 	return &clusterpb.NewMemberResponse{}, nil
 }

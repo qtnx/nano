@@ -255,16 +255,21 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 			memberInfo:      req.MemberInfo,
 			lastHeartbeatAt: time.Now(),
 		})
+		// Install the recovered member's routes while still holding c.mu so a
+		// concurrent Unregister for the same address cannot remove the member and
+		// then have this heartbeat reinstall its routes afterwards (issue #7,
+		// review round 1). c.mu -> h.mu order is safe: no handler method acquires
+		// c.mu.
+		c.currentNode.handler.replaceRemoteService(req.MemberInfo)
 	}
 	c.mu.Unlock()
 
 	if !isHit {
 		// The master did not know this member (e.g. it restarted and lost its
-		// in-memory registry). Re-learn the member's services and drop any stale
-		// delete still queued for it (issue #7, fixes 5 & 7). A *stable* heartbeat
-		// skips this entirely and only refreshes the timestamp above, so
-		// steady-state heartbeats stay O(1) with no route sync or broadcast.
-		c.currentNode.handler.replaceRemoteService(req.MemberInfo)
+		// in-memory registry); its services were re-learned above. Drop any stale
+		// delete still queued for it. A *stable* heartbeat skips all of this and
+		// only refreshes the timestamp, so steady-state heartbeats stay O(1) with
+		// no route sync or broadcast (issue #7, fixes 5 & 7).
 		c.cancelPendingDelete(addr)
 		log.Println("Heartbeat peer register to cluster", addr)
 	}
@@ -489,6 +494,12 @@ func (c *cluster) isKnownAddr(addr string) bool {
 // without limit; beyond it the stale target is reclaimed by heartbeat timeout.
 const maxPendingDeletePeers = 4096
 
+// maxDeleteRetriesPerHeartbeat bounds how many queued deletes a single heartbeat
+// flushes, so a peer with a large backlog cannot pin the heartbeat handler on
+// synchronous DelMember RPCs; the remainder is retried on the next heartbeat
+// (issue #7, review round 1).
+const maxDeleteRetriesPerHeartbeat = 64
+
 // recordPendingDelete queues deletedAddr to be re-sent to peerAddr on its next
 // heartbeat after a live DelMember broadcast to peerAddr failed (issue #7).
 func (c *cluster) recordPendingDelete(peerAddr, deletedAddr string) {
@@ -503,6 +514,7 @@ func (c *cluster) recordPendingDelete(peerAddr, deletedAddr string) {
 	set := c.pendingDeletes[peerAddr]
 	if set == nil {
 		if len(c.pendingDeletes) >= maxPendingDeletePeers {
+			log.Warn(fmt.Sprintf("cluster: pending-delete ledger full (%d peers); dropping retry to %s for departed %s; that peer may keep a stale route until it re-registers (issue #7)", maxPendingDeletePeers, peerAddr, deletedAddr))
 			return
 		}
 		set = map[string]struct{}{}
@@ -511,10 +523,13 @@ func (c *cluster) recordPendingDelete(peerAddr, deletedAddr string) {
 	set[deletedAddr] = struct{}{}
 }
 
-// flushPendingDeletes re-sends every queued delete to peerAddr, which has just
-// proven liveness by heartbeating. Successful sends drop from the ledger;
-// failures are re-queued. RPCs run without the lock held so a slow peer cannot
-// stall heartbeat processing (issue #7, fixes 4 & 5).
+// flushPendingDeletes re-sends queued deletes to peerAddr, which has just proven
+// liveness by heartbeating. It drops any target that is a live member again
+// (re-registered) so a peer is never told to drop a rejoined pod, caps the batch
+// so a large backlog cannot pin the heartbeat handler on synchronous RPCs (the
+// remainder is retried next beat), and re-checks liveness right before each
+// send. Successful sends leave the ledger; failures are re-queued. RPCs run
+// without the lock held (issue #7, fixes 4 & 5; review round 1).
 func (c *cluster) flushPendingDeletes(peerAddr string) {
 	c.mu.Lock()
 	set := c.pendingDeletes[peerAddr]
@@ -522,14 +537,33 @@ func (c *cluster) flushPendingDeletes(peerAddr string) {
 		c.mu.Unlock()
 		return
 	}
-	pending := make([]string, 0, len(set))
-	for a := range set {
-		pending = append(pending, a)
+	alive := make(map[string]struct{}, len(c.members))
+	for _, m := range c.members {
+		alive[m.memberInfo.ServiceAddr] = struct{}{}
 	}
-	delete(c.pendingDeletes, peerAddr)
+	pending := make([]string, 0, len(set))
+	for addr := range set {
+		if _, ok := alive[addr]; ok {
+			delete(set, addr) // re-registered -> the queued delete is stale, drop it
+			continue
+		}
+		if len(pending) >= maxDeleteRetriesPerHeartbeat {
+			break
+		}
+		pending = append(pending, addr)
+		delete(set, addr)
+	}
+	if len(set) == 0 {
+		delete(c.pendingDeletes, peerAddr)
+	}
 	c.mu.Unlock()
 
 	for _, deletedAddr := range pending {
+		// The target may have re-registered between the snapshot above and now;
+		// never tell a peer to drop a currently-registered member (issue #7).
+		if c.isKnownAddr(deletedAddr) {
+			continue
+		}
 		if err := c.notifyDelMember(peerAddr, deletedAddr); err != nil {
 			log.Errorf("cluster: retry del member %s -> %s failed (re-queued): %v", deletedAddr, peerAddr, err)
 			c.recordPendingDelete(peerAddr, deletedAddr)
