@@ -43,8 +43,8 @@ import (
 	"github.com/lonng/nano/internal/packet"
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
-	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/scheduler"
+	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/session"
 )
 
@@ -215,6 +215,38 @@ func (h *LocalHandler) addRemoteService(member *clusterpb.MemberInfo) {
 		}
 		log.Println("Register remote service", s)
 		h.remoteServices[s] = append(filtered, member)
+	}
+}
+
+// replaceRemoteService atomically drops every existing route entry for
+// member.ServiceAddr and installs the member's current service list, so a
+// rejoin that changes or shrinks its advertised services leaves no stale
+// service selectable for that address (issue #7, fixes 2 & 7). addRemoteService
+// only refreshes the services the member still advertises, so a service it
+// dropped on rejoin would otherwise remain routable under the old address.
+func (h *LocalHandler) replaceRemoteService(member *clusterpb.MemberInfo) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	addr := member.ServiceAddr
+	// 1) Purge every existing entry for this address across all services.
+	for name, members := range h.remoteServices {
+		kept := members[:0]
+		for _, m := range members {
+			if m.ServiceAddr != addr {
+				kept = append(kept, m)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.remoteServices, name)
+		} else {
+			h.remoteServices[name] = kept
+		}
+	}
+	// 2) Install the member's current service list.
+	for _, s := range member.Services {
+		log.Println("Register remote service", s)
+		h.remoteServices[s] = append(h.remoteServices[s], member)
 	}
 }
 

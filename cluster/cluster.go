@@ -48,10 +48,26 @@ type cluster struct {
 	heartbeatStop chan struct{}
 	heartbeatDone chan struct{}
 	heartbeatOnce sync.Once
+
+	// pendingDeletes queues DelMember notifications that failed to reach a live
+	// peer during Unregister, keyed by the recipient peer's ServiceAddr -> set of
+	// member addresses it must still drop. Retried on that peer's next heartbeat
+	// so a peer that briefly missed a delete cannot route to an unregistered pod
+	// indefinitely (issue #7, fix 4). Guarded by mu.
+	pendingDeletes map[string]map[string]struct{}
+
+	// notifyDelMember sends one DelMember to a peer. Indirected so tests can
+	// observe/stub the fan-out without a live gRPC peer; wired to sendDelMember in
+	// newCluster.
+	notifyDelMember func(peerAddr, deletedAddr string) error
 }
 
 func newCluster(currentNode *Node) *cluster {
-	c := &cluster{currentNode: currentNode}
+	c := &cluster{
+		currentNode:    currentNode,
+		pendingDeletes: map[string]map[string]struct{}{},
+	}
+	c.notifyDelMember = c.sendDelMember
 	if currentNode.IsMaster {
 		c.checkMemberHeartbeat()
 	}
@@ -90,10 +106,17 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		resp.Members = append(resp.Members, m.memberInfo)
 	}
 
-	c.currentNode.handler.addRemoteService(req.MemberInfo)
+	// Clean-replace the (re)joining member's routes so a changed/shrunk service
+	// set cannot leave stale services routable for this address (issue #7).
+	c.currentNode.handler.replaceRemoteService(req.MemberInfo)
 	c.mu.Lock()
 	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
 	c.mu.Unlock()
+
+	// A node that just (re)registered is alive again: cancel any queued
+	// delete-propagation for its address so peers are not later taught to drop a
+	// member that came back (issue #7).
+	c.cancelPendingDelete(req.MemberInfo.ServiceAddr)
 
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
@@ -169,12 +192,12 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	if c.rpcClient != nil {
 		c.rpcClient.removePool(req.ServiceAddr)
 	}
+	c.dropPendingDeletesForPeer(req.ServiceAddr)
 
 	log.Println("Exists peer unregister to cluster", req.ServiceAddr)
 
 	// Notify the remaining peers best-effort; a failed peer is logged and
 	// skipped rather than aborting removal, and each call is bounded (H25).
-	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr}
 	for _, m := range snapshot {
 		if m.memberInfo.ServiceAddr == req.ServiceAddr {
 			// this node is down.
@@ -183,17 +206,12 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 		if m.MemberInfo().ServiceAddr == c.currentNode.ServiceAddr {
 			continue
 		}
-		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
-		if err != nil {
-			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
-			continue
-		}
-		client := clusterpb.NewMemberClient(pool.Get())
-		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
-		_, err = client.DelMember(ctx, delMember)
-		cancel()
-		if err != nil {
-			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
+		if err := c.notifyDelMember(m.memberInfo.ServiceAddr, req.ServiceAddr); err != nil {
+			// The peer was unreachable: queue the delete so it is retried on the
+			// peer's next heartbeat. Without this, a peer that briefly missed the
+			// notification routes to the unregistered pod indefinitely (issue #7).
+			log.Errorf("cluster: notify del member %s -> %s failed (queued for retry): %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
+			c.recordPendingDelete(m.memberInfo.ServiceAddr, req.ServiceAddr)
 		}
 	}
 
@@ -221,29 +239,42 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
+	addr := req.MemberInfo.ServiceAddr
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	log.Println("Receive Heartbeat from: ", req.MemberInfo.Label)
-
 	isHit := false
 	for i, m := range c.members {
-		if m.MemberInfo().GetServiceAddr() == req.GetMemberInfo().GetServiceAddr() {
+		if m.MemberInfo().GetServiceAddr() == addr {
 			c.members[i].lastHeartbeatAt = time.Now()
 			isHit = true
 		}
 	}
 	if !isHit {
-		// master local not binding this node, other members do not need to be notified, because this node registered.
-		// maybe the master process reload
-		m := &Member{
+		c.members = append(c.members, &Member{
 			isMaster:        false,
-			memberInfo:      req.GetMemberInfo(),
+			memberInfo:      req.MemberInfo,
 			lastHeartbeatAt: time.Now(),
-		}
-		c.members = append(c.members, m)
-		c.currentNode.handler.addRemoteService(req.MemberInfo)
-		log.Println("Heartbeat peer register to cluster", req.MemberInfo.ServiceAddr)
+		})
 	}
+	c.mu.Unlock()
+
+	if !isHit {
+		// The master did not know this member (e.g. it restarted and lost its
+		// in-memory registry). Re-learn the member's services and drop any stale
+		// delete still queued for it (issue #7, fixes 5 & 7). A *stable* heartbeat
+		// skips this entirely and only refreshes the timestamp above, so
+		// steady-state heartbeats stay O(1) with no route sync or broadcast.
+		c.currentNode.handler.replaceRemoteService(req.MemberInfo)
+		c.cancelPendingDelete(addr)
+		log.Println("Heartbeat peer register to cluster", addr)
+	}
+
+	// Retry any delete notifications this peer missed while it was briefly
+	// unreachable, now that it has proven liveness by heartbeating. Gated on
+	// pending work, so a steady-state cluster does no extra work (issue #7,
+	// fixes 4 & 5).
+	c.flushPendingDeletes(addr)
+
 	return &clusterpb.HeartbeatResponse{}, nil
 }
 
@@ -428,6 +459,7 @@ func (c *cluster) delMember(addr string) {
 	if c.rpcClient != nil {
 		c.rpcClient.removePool(addr)
 	}
+	c.dropPendingDeletesForPeer(addr)
 }
 
 // addLocalMember appends a member under the lock. Used by node startup to
@@ -450,4 +482,98 @@ func (c *cluster) isKnownAddr(addr string) bool {
 		}
 	}
 	return false
+}
+
+// maxPendingDeletePeers bounds how many distinct peers may hold queued
+// delete-retries, so an endlessly unreachable peer cannot grow the ledger
+// without limit; beyond it the stale target is reclaimed by heartbeat timeout.
+const maxPendingDeletePeers = 4096
+
+// recordPendingDelete queues deletedAddr to be re-sent to peerAddr on its next
+// heartbeat after a live DelMember broadcast to peerAddr failed (issue #7).
+func (c *cluster) recordPendingDelete(peerAddr, deletedAddr string) {
+	if peerAddr == "" || deletedAddr == "" || peerAddr == deletedAddr {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingDeletes == nil {
+		c.pendingDeletes = map[string]map[string]struct{}{}
+	}
+	set := c.pendingDeletes[peerAddr]
+	if set == nil {
+		if len(c.pendingDeletes) >= maxPendingDeletePeers {
+			return
+		}
+		set = map[string]struct{}{}
+		c.pendingDeletes[peerAddr] = set
+	}
+	set[deletedAddr] = struct{}{}
+}
+
+// flushPendingDeletes re-sends every queued delete to peerAddr, which has just
+// proven liveness by heartbeating. Successful sends drop from the ledger;
+// failures are re-queued. RPCs run without the lock held so a slow peer cannot
+// stall heartbeat processing (issue #7, fixes 4 & 5).
+func (c *cluster) flushPendingDeletes(peerAddr string) {
+	c.mu.Lock()
+	set := c.pendingDeletes[peerAddr]
+	if len(set) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	pending := make([]string, 0, len(set))
+	for a := range set {
+		pending = append(pending, a)
+	}
+	delete(c.pendingDeletes, peerAddr)
+	c.mu.Unlock()
+
+	for _, deletedAddr := range pending {
+		if err := c.notifyDelMember(peerAddr, deletedAddr); err != nil {
+			log.Errorf("cluster: retry del member %s -> %s failed (re-queued): %v", deletedAddr, peerAddr, err)
+			c.recordPendingDelete(peerAddr, deletedAddr)
+		} else {
+			log.Infof("cluster: repaired missed del member %s -> %s on heartbeat", deletedAddr, peerAddr)
+		}
+	}
+}
+
+// cancelPendingDelete removes deletedAddr from every peer's retry set, used when
+// a node (re)registers so peers are not later taught to drop a member that has
+// returned under the same address (issue #7).
+func (c *cluster) cancelPendingDelete(deletedAddr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for peer, set := range c.pendingDeletes {
+		delete(set, deletedAddr)
+		if len(set) == 0 {
+			delete(c.pendingDeletes, peer)
+		}
+	}
+}
+
+// dropPendingDeletesForPeer discards every queued retry destined for peerAddr,
+// used when that peer itself leaves the cluster (issue #7).
+func (c *cluster) dropPendingDeletesForPeer(peerAddr string) {
+	c.mu.Lock()
+	delete(c.pendingDeletes, peerAddr)
+	c.mu.Unlock()
+}
+
+// sendDelMember delivers one DelMember RPC; it is the production implementation
+// behind the notifyDelMember test seam.
+func (c *cluster) sendDelMember(peerAddr, deletedAddr string) error {
+	if c.rpcClient == nil {
+		return fmt.Errorf("cluster: rpc client is nil")
+	}
+	pool, err := c.rpcClient.getConnPool(peerAddr)
+	if err != nil {
+		return err
+	}
+	client := clusterpb.NewMemberClient(pool.Get())
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	defer cancel()
+	_, err = client.DelMember(ctx, &clusterpb.DelMemberRequest{ServiceAddr: deletedAddr})
+	return err
 }
