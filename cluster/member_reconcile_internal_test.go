@@ -665,6 +665,83 @@ func TestHeartbeatResponseIncludesCurrentMembers(t *testing.T) {
 	}
 }
 
+func TestHeartbeatOmitsPayloadWhenPeerIsAlreadySynced(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	memberA := mkMemberInfo("user-service", "user:8085")
+	memberB := mkMemberInfo("world-map-service", "worldmap:8088")
+	c.members = []*Member{
+		{memberInfo: memberA, isMaster: false},
+		{memberInfo: memberB, isMaster: false},
+	}
+	c.membershipVersion = 7
+	c.membershipEpoch = 10
+	c.removedMembershipVersion = 6
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		MemberInfo:               memberA,
+		MembershipVersion:        7,
+		MembershipEpoch:          10,
+		RemovedMembershipVersion: 6,
+		HeartbeatSeq:             3,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if resp.GetMembershipVersion() != 7 || resp.GetMembershipEpoch() != 10 || resp.GetHeartbeatSeq() != 3 {
+		t.Fatalf("heartbeat metadata = version %d epoch %d seq %d, want version 7 epoch 10 seq 3", resp.GetMembershipVersion(), resp.GetMembershipEpoch(), resp.GetHeartbeatSeq())
+	}
+	if len(resp.GetMembers()) != 0 {
+		t.Fatalf("Heartbeat returned %d members for already-synced peer, want none", len(resp.GetMembers()))
+	}
+	if len(resp.GetRemovedMembers()) != 0 {
+		t.Fatalf("Heartbeat returned removed members for already-synced peer: %v", resp.GetRemovedMembers())
+	}
+	if resp.GetResetMembership() {
+		t.Fatal("Heartbeat requested reset for already-synced peer")
+	}
+}
+
+func TestHeartbeatSendsOnlyPendingTombstonesWhenMemberListIsSynced(t *testing.T) {
+	master := &Node{ServiceAddr: "master:8085"}
+	master.IsMaster = true
+	c := &cluster{currentNode: master}
+	memberA := mkMemberInfo("user-service", "user:8085")
+	memberB := mkMemberInfo("world-map-service", "worldmap:8088")
+	c.members = []*Member{
+		{memberInfo: memberA, isMaster: false},
+		{memberInfo: memberB, isMaster: false},
+	}
+	c.membershipVersion = 7
+	c.membershipEpoch = 10
+	c.removedMembers = map[string]removedMemberTombstone{
+		"seen:8085":    {membershipVersion: 5, removedAt: time.Now()},
+		"pending:8085": {membershipVersion: 6, removedAt: time.Now()},
+	}
+
+	resp, err := c.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
+		MemberInfo:               memberA,
+		MembershipVersion:        7,
+		MembershipEpoch:          10,
+		RemovedMembershipVersion: 5,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat returned error: %v", err)
+	}
+
+	if len(resp.GetMembers()) != 0 {
+		t.Fatalf("Heartbeat returned %d members while member list is synced, want none", len(resp.GetMembers()))
+	}
+	if len(resp.GetRemovedMembers()) != 1 || resp.GetRemovedMembers()[0].GetServiceAddr() != "pending:8085" || resp.GetRemovedMembers()[0].GetMembershipVersion() != 6 {
+		t.Fatalf("Heartbeat removed members = %v, want only pending:8085 at version 6", resp.GetRemovedMembers())
+	}
+	if resp.GetResetMembership() {
+		t.Fatal("Heartbeat requested reset while pending tombstone is still retained")
+	}
+}
+
 func TestHeartbeatPrunesExpiredRemovedMemberTombstones(t *testing.T) {
 	master := &Node{ServiceAddr: "master:8085"}
 	master.IsMaster = true

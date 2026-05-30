@@ -275,20 +275,32 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	// any NewMember push it missed during churn (see reconcileMembers).
 	// Mirrors RegisterResponse: include every member, master included.
 	c.pruneRemovedMembersLocked(time.Now())
+	resetMembership := c.heartbeatRequiresResetLocked(req, membershipEpoch)
 	resp := &clusterpb.HeartbeatResponse{
 		MembershipVersion: c.membershipVersion,
 		MembershipEpoch:   membershipEpoch,
 		HeartbeatSeq:      req.GetHeartbeatSeq(),
-		ResetMembership:   c.heartbeatRequiresResetLocked(req, membershipEpoch),
+		ResetMembership:   resetMembership,
 	}
-	for _, m := range c.members {
-		resp.Members = append(resp.Members, m.MemberInfo())
+	if resetMembership || !c.heartbeatMemberListSyncedLocked(req, membershipEpoch) {
+		for _, m := range c.members {
+			resp.Members = append(resp.Members, m.MemberInfo())
+		}
 	}
-	for addr, tombstone := range c.removedMembers {
-		resp.RemovedMembers = append(resp.RemovedMembers, &clusterpb.RemovedMember{
-			ServiceAddr:       addr,
-			MembershipVersion: tombstone.membershipVersion,
-		})
+	if !resetMembership {
+		removedMembershipVersion := req.GetRemovedMembershipVersion()
+		if req.GetMembershipEpoch() != membershipEpoch {
+			removedMembershipVersion = 0
+		}
+		for addr, tombstone := range c.removedMembers {
+			if tombstone.membershipVersion <= removedMembershipVersion {
+				continue
+			}
+			resp.RemovedMembers = append(resp.RemovedMembers, &clusterpb.RemovedMember{
+				ServiceAddr:       addr,
+				MembershipVersion: tombstone.membershipVersion,
+			})
+		}
 	}
 	c.mu.Unlock()
 
@@ -628,6 +640,10 @@ func (c *cluster) heartbeatRequiresResetLocked(req *clusterpb.HeartbeatRequest, 
 		return false
 	}
 	return req.GetRemovedMembershipVersion() < c.membershipCompactVersion
+}
+
+func (c *cluster) heartbeatMemberListSyncedLocked(req *clusterpb.HeartbeatRequest, membershipEpoch uint64) bool {
+	return req.GetMembershipEpoch() == membershipEpoch && req.GetMembershipVersion() == c.membershipVersion
 }
 
 func (c *cluster) acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, snapshotSeq uint64) bool {

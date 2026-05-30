@@ -963,6 +963,9 @@ func (n *Node) keepalive() {
 			log.Infof("Member heartbeat sequence mismatch, sent: %d, received: %d", heartbeatSeq, resp.GetHeartbeatSeq())
 			return
 		}
+		if len(resp.GetMembers()) == 0 && len(resp.GetRemovedMembers()) == 0 && !resp.GetResetMembership() {
+			return
+		}
 		// Self-heal any NewMember push missed during churn: the master
 		// returns its authoritative member list, so a member that registered after
 		// our initial sync is re-learned here instead of staying invisible. Member
