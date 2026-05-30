@@ -410,3 +410,55 @@ func TestRegisterUnregisterRaceMembershipRouteConsistent(t *testing.T) {
 		}
 	}
 }
+
+// A3. The peer DelMember receive path must purge the route to the departed
+// address (the production hop the spy-based retry test stubs out): retry ->
+// peer Node.DelMember -> handler.delMember (issue #7 review round 4).
+func TestPeerDelMemberDropsRoute(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	n := newTestNode()
+	n.handler.addRemoteService(memberInfo("backend:7", "Map"))
+	if !routable(n.cluster, "Map", "backend:7") {
+		t.Fatal("setup: backend:7 should be routable for Map")
+	}
+	if _, err := n.DelMember(context.Background(), &clusterpb.DelMemberRequest{ServiceAddr: "backend:7"}); err != nil {
+		t.Fatalf("DelMember: %v", err)
+	}
+	if routable(n.cluster, "Map", "backend:7") {
+		t.Fatal("Node.DelMember did not purge the peer's route to the departed address")
+	}
+}
+
+// 5d. Stress the peer NewMember vs DelMember interleaving for the same address
+// (a rollover broadcast race on a non-master node). Invariant: peer membership
+// and the local route table agree — member iff routable (issue #7 round 4).
+func TestPeerNewMemberDelMemberRaceConsistent(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	const addr = "backend:9"
+	for iter := 0; iter < 200; iter++ {
+		n := newTestNode()
+		if _, err := n.NewMember(context.Background(), &clusterpb.NewMemberRequest{MemberInfo: memberInfo(addr, "Svc")}); err != nil {
+			t.Fatalf("seed NewMember: %v", err)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = n.NewMember(context.Background(), &clusterpb.NewMemberRequest{MemberInfo: memberInfo(addr, "Svc")})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = n.DelMember(context.Background(), &clusterpb.DelMemberRequest{ServiceAddr: addr})
+		}()
+		close(start)
+		wg.Wait()
+
+		if member, routed := n.cluster.isKnownAddr(addr), routable(n.cluster, "Svc", addr); member != routed {
+			t.Fatalf("iter %d: peer membership/route diverged: isKnownAddr=%v routable=%v", iter, member, routed)
+		}
+	}
+}

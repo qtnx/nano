@@ -48,8 +48,8 @@ import (
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
-	"github.com/lonng/nano/session"
 	nanojson "github.com/lonng/nano/serialize/json"
+	"github.com/lonng/nano/session"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
@@ -728,6 +728,7 @@ func (n *Node) listenAndServeWS(ctx *fasthttp.RequestCtx) {
 		return
 	}
 }
+
 // (removed dead listenAndServeWSTLS: it had no caller, routed WS through the
 // global http.DefaultServeMux, and called log.Fatal on a bind error. TLS is now
 // served by listenAndServe via fasthttp ServeTLS (M30).)
@@ -978,9 +979,9 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		return nil, err
 	}
 	ac := &acceptor{
-		sid:        sid,
-		gateClient: clusterpb.NewMemberClient(conns.Get()),
-		rpcHandler: n.handler.remoteProcess,
+		sid:         sid,
+		gateClient:  clusterpb.NewMemberClient(conns.Get()),
+		rpcHandler:  n.handler.remoteProcess,
 		gateAddr:    gateAddr,
 		jsonPayload: jsonPayload,
 	}
@@ -1136,11 +1137,14 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 	if req == nil || req.MemberInfo == nil || req.MemberInfo.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
-	// Use replaceRemoteService (not addRemoteService) so a same-address rejoin
-	// that dropped a service purges the stale route on this peer too; an additive
-	// add would leave the dropped service routable here (issue #7, fix 2/7).
+	// Update membership and install routes under one c.mu critical section so a
+	// concurrent same-address DelMember cannot interleave a route/member split on
+	// this peer (issue #7, review round 4). replaceRemoteService also drops stale
+	// services on a same-address rejoin (fix 2/7). c.mu -> h.mu order is safe.
+	n.cluster.mu.Lock()
+	n.cluster.addMemberLocked(req.MemberInfo)
 	n.handler.replaceRemoteService(req.MemberInfo)
-	n.cluster.addMember(req.MemberInfo)
+	n.cluster.mu.Unlock()
 	return &clusterpb.NewMemberResponse{}, nil
 }
 
@@ -1149,8 +1153,15 @@ func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*c
 		return nil, ErrInvalidRegisterReq
 	}
 	log.Println("[Node] DelMember member", req.String())
+	// Remove routes and membership under one c.mu critical section so a
+	// concurrent same-address NewMember cannot interleave a route/member split on
+	// this peer (issue #7, review round 4). Pool teardown / pending-delete drop
+	// stay outside the lock.
+	n.cluster.mu.Lock()
 	n.handler.delMember(req.ServiceAddr)
-	n.cluster.delMember(req.ServiceAddr)
+	n.cluster.removeMemberLocked(req.ServiceAddr)
+	n.cluster.mu.Unlock()
+	n.cluster.releaseDepartedPeer(req.ServiceAddr)
 	// Purge any acceptor sessions homed on the departed gate so they don't leak
 	// in n.sessions when the gate vanishes before sending per-session
 	// SessionClosed RPCs (H24).
@@ -1315,6 +1326,7 @@ func (n *Node) authUnaryInterceptor(
 	}
 	return handler(ctx, req)
 }
+
 // runGRPCServer serves the gRPC listener. A post-startup Serve error is logged
 // rather than escalated to log.Fatalf, which would call os.Exit from this
 // background goroutine and bypass node/component shutdown.

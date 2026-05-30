@@ -81,44 +81,35 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 	}
 	resp := &clusterpb.RegisterResponse{}
 	c.mu.Lock()
+	// Remove any existing entry for this address (crash/rollover re-register),
+	// snapshot the surviving peers for the response + fan-out, then add the new
+	// member and install its routes — all under one c.mu critical section so
+	// membership and the local route table never diverge for this address and a
+	// concurrent same-address Unregister cannot interleave a route/member split
+	// (issue #7, review rounds 3 & 4). c.mu -> h.mu is the global lock order;
+	// handler methods take h.mu, never c.mu, and do no network I/O. The peer RPC
+	// fan-out below stays outside the lock (H25).
 	for k, m := range c.members {
 		if m.memberInfo.ServiceAddr == req.MemberInfo.ServiceAddr {
-			// 节点异常崩溃，不会执行unregister，此时再次启动该节点，由于已存在注册信息，将再也无法成功注册，这里做个修改，先移除后重新注册
 			if k >= len(c.members)-1 {
 				c.members = c.members[:k]
 			} else {
 				c.members = append(c.members[:k], c.members[k+1:]...)
 			}
 			break
-			//return nil, fmt.Errorf("address %s has registered", req.MemberInfo.ServiceAddr)
 		}
 	}
-	// Snapshot the surviving members under the lock so the fan-out below never
-	// races concurrent membership mutations on the backing array (H4).
 	snapshot := make([]*Member, len(c.members))
 	copy(snapshot, c.members)
-	c.mu.Unlock()
-
-	// Register the new member locally FIRST so a single unreachable or stale
-	// peer cannot block the join (and leave the registering node retrying
-	// forever). Peer notification below is best-effort (H25).
-	for _, m := range snapshot {
-		resp.Members = append(resp.Members, m.memberInfo)
-	}
-
-	// Append the member AND install its routes under one c.mu critical section so
-	// membership and the local route table cannot diverge: installing the route
-	// outside the lock raced a concurrent same-address Unregister, which could
-	// remove the member while this reinstalled its route, leaving a route for a
-	// non-member (issue #7, review round 3). The pending-delete cancel is in the
-	// same section so a concurrent Unregister cannot re-queue a delete the cancel
-	// then erases (review round 2). c.mu -> h.mu order is safe: handler methods
-	// never acquire c.mu and do no network I/O.
-	c.mu.Lock()
 	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
 	c.currentNode.handler.replaceRemoteService(req.MemberInfo)
 	c.cancelPendingDeleteLocked(req.MemberInfo.ServiceAddr)
 	c.mu.Unlock()
+
+	// Tell the (re)joining node about the surviving peers (snapshot excludes it).
+	for _, m := range snapshot {
+		resp.Members = append(resp.Members, m.memberInfo)
+	}
 
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
@@ -430,42 +421,52 @@ func (c *cluster) initMembers(members []*clusterpb.MemberInfo) {
 
 func (c *cluster) addMember(info *clusterpb.MemberInfo) {
 	c.mu.Lock()
-	var found bool
+	c.addMemberLocked(info)
+	c.mu.Unlock()
+}
+
+// addMemberLocked upserts a member by service address. The caller must hold c.mu
+// so membership and the local route table can be updated atomically (issue #7,
+// review round 4).
+func (c *cluster) addMemberLocked(info *clusterpb.MemberInfo) {
 	for _, member := range c.members {
 		if member.memberInfo.ServiceAddr == info.ServiceAddr {
 			member.memberInfo = info
-			found = true
-			break
+			return
 		}
 	}
-	if !found {
-		c.members = append(c.members, &Member{
-			memberInfo: info,
-		})
-	}
-	c.mu.Unlock()
+	c.members = append(c.members, &Member{
+		memberInfo: info,
+	})
 }
 
 func (c *cluster) delMember(addr string) {
 	c.mu.Lock()
-	var index = -1
+	c.removeMemberLocked(addr)
+	c.mu.Unlock()
+	c.releaseDepartedPeer(addr)
+}
+
+// removeMemberLocked removes a member by service address from c.members. The
+// caller must hold c.mu so membership and the local route table can be updated
+// atomically (issue #7, review round 4).
+func (c *cluster) removeMemberLocked(addr string) {
 	for i, member := range c.members {
 		if member.memberInfo.ServiceAddr == addr {
-			index = i
-			break
+			if i >= len(c.members)-1 {
+				c.members = c.members[:i]
+			} else {
+				c.members = append(c.members[:i], c.members[i+1:]...)
+			}
+			return
 		}
 	}
-	if index != -1 {
-		if index >= len(c.members)-1 {
-			c.members = c.members[:index]
-		} else {
-			c.members = append(c.members[:index], c.members[index+1:]...)
-		}
-	}
-	c.mu.Unlock()
+}
 
-	// Close the outbound connection pool to the departed member so its gRPC
-	// ClientConns/goroutines are reclaimed on member removal (M3).
+// releaseDepartedPeer closes the outbound connection pool and drops queued
+// delete-retries for a peer that left the cluster. Kept OUT of c.mu because pool
+// teardown does network work (M3).
+func (c *cluster) releaseDepartedPeer(addr string) {
 	if c.rpcClient != nil {
 		c.rpcClient.removePool(addr)
 	}
