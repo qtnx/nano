@@ -106,15 +106,17 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		resp.Members = append(resp.Members, m.memberInfo)
 	}
 
-	// Clean-replace the (re)joining member's routes so a changed/shrunk service
-	// set cannot leave stale services routable for this address (issue #7).
-	c.currentNode.handler.replaceRemoteService(req.MemberInfo)
+	// Append the member AND install its routes under one c.mu critical section so
+	// membership and the local route table cannot diverge: installing the route
+	// outside the lock raced a concurrent same-address Unregister, which could
+	// remove the member while this reinstalled its route, leaving a route for a
+	// non-member (issue #7, review round 3). The pending-delete cancel is in the
+	// same section so a concurrent Unregister cannot re-queue a delete the cancel
+	// then erases (review round 2). c.mu -> h.mu order is safe: handler methods
+	// never acquire c.mu and do no network I/O.
 	c.mu.Lock()
 	c.members = append(c.members, &Member{isMaster: false, memberInfo: req.MemberInfo, lastHeartbeatAt: time.Now()})
-	// Cancel any queued delete-propagation for this address WHILE holding c.mu,
-	// atomically with making the member live again. Cancelling after unlocking
-	// raced a concurrent Unregister that could re-queue a legitimate delete in
-	// the gap, which the late cancel would then erase (issue #7, review round 2).
+	c.currentNode.handler.replaceRemoteService(req.MemberInfo)
 	c.cancelPendingDeleteLocked(req.MemberInfo.ServiceAddr)
 	c.mu.Unlock()
 
@@ -170,10 +172,13 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 		return nil, fmt.Errorf("address %s has not registered", req.ServiceAddr)
 	}
 
-	// Remove the departed member from the master/local registry FIRST so a
-	// single unreachable peer cannot block removal and leave a stale routable
-	// address (plus a heartbeat retry loop) (H25).
-	c.currentNode.handler.delMember(req.ServiceAddr)
+	// Remove the member from membership AND purge its local routes under one c.mu
+	// critical section so the two cannot diverge: purging the route outside the
+	// lock raced a concurrent same-address Register that could reinstall the route
+	// after this removed the member, leaving a route for a non-member (issue #7,
+	// review round 3). c.mu -> h.mu order is safe (handler methods never take
+	// c.mu and do no network I/O); the best-effort peer RPC fan-out below stays
+	// outside the lock (H25).
 	c.mu.Lock()
 	for i, m := range c.members {
 		if m.memberInfo.ServiceAddr == req.ServiceAddr {
@@ -185,6 +190,7 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 			break
 		}
 	}
+	c.currentNode.handler.delMember(req.ServiceAddr)
 	c.mu.Unlock()
 
 	// Close the outbound connection pool to the departed member so its gRPC

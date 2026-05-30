@@ -372,3 +372,41 @@ func TestUnknownHeartbeatRaceUnregisterNoStaleRoute(t *testing.T) {
 		}
 	}
 }
+
+// 5c. Stress the same-address Register vs Unregister interleaving (a rolling
+// rollover: old pod unregistering while the new pod registers). Invariant after
+// every round: membership and the local route table agree — the address is a
+// known member iff it is routable for its service. The pre-fix non-atomic
+// version could leave a route for a removed member (issue #7, review round 3).
+func TestRegisterUnregisterRaceMembershipRouteConsistent(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	const addr = "127.0.0.1:9008"
+	for iter := 0; iter < 200; iter++ {
+		c, _ := newMasterCluster(t)
+		c.notifyDelMember = (&delSpy{failPeers: map[string]bool{}}).notify
+		// Seed so Unregister has a target and the concurrent Register is a rejoin.
+		if _, err := c.Register(context.Background(), &clusterpb.RegisterRequest{MemberInfo: memberInfo(addr, "Svc")}); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = c.Register(context.Background(), &clusterpb.RegisterRequest{MemberInfo: memberInfo(addr, "Svc")})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = c.Unregister(context.Background(), &clusterpb.UnregisterRequest{ServiceAddr: addr})
+		}()
+		close(start)
+		wg.Wait()
+
+		if member, routed := c.isKnownAddr(addr), routable(c, "Svc", addr); member != routed {
+			t.Fatalf("iter %d: membership/route diverged: isKnownAddr=%v routable=%v", iter, member, routed)
+		}
+	}
+}
