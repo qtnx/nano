@@ -166,6 +166,39 @@ func TestEncodeMaxPacketSize(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeAllowsLargeResponsePayload(t *testing.T) {
+	if MaxPacketSize != 512*1024 {
+		t.Fatalf("MaxPacketSize = %d, want 512KB cap for large responses", MaxPacketSize)
+	}
+
+	payload := make([]byte, 88*1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	encoded, err := Encode(Data, payload)
+	if err != nil {
+		t.Fatalf("Encode 88KB response payload error = %v, want nil", err)
+	}
+
+	packets, err := NewDecoder().Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode 88KB response packet error = %v, want nil", err)
+	}
+	if len(packets) != 1 {
+		t.Fatalf("Decode packet count = %d, want 1", len(packets))
+	}
+	if packets[0].Type != Data {
+		t.Fatalf("Decode packet type = %v, want %v", packets[0].Type, Data)
+	}
+	if packets[0].Length != len(payload) {
+		t.Fatalf("Decode packet length = %d, want %d", packets[0].Length, len(payload))
+	}
+	if !reflect.DeepEqual(packets[0].Data, payload) {
+		t.Fatal("Decode packet data changed for 88KB response payload")
+	}
+}
+
 // TestDecoderResetAfterError covers L8: after a forward() error the decoder must
 // not retain stale frame state (oversized size / consumed header), so a reused
 // decoder can still parse a subsequent valid packet.
