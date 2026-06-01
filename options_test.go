@@ -1,6 +1,7 @@
 package nano
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -176,6 +177,57 @@ func TestWithScheduler(t *testing.T) {
 	WithScheduler(-1)(&cluster.Options{})
 	if env.SchedulerShards != 0 {
 		t.Fatalf("negative must clamp to 0, got %d", env.SchedulerShards)
+	}
+}
+
+func TestWithConcurrentRoutes(t *testing.T) {
+	var opt cluster.Options
+
+	routes := []string{"Chat.Send", "Room.Join"}
+	WithConcurrentRoutes(routes, 4)(&opt)
+	routes[0] = "mutated"
+	if !reflect.DeepEqual(opt.ConcurrentRoutes, []string{"Chat.Send", "Room.Join"}) {
+		t.Fatalf("routes must be copied, got %#v", opt.ConcurrentRoutes)
+	}
+	if opt.ConcurrentAllRequests {
+		t.Fatal("explicit routes must not enable all-request concurrency")
+	}
+	if opt.ConcurrentRouteConcurrency != 4 {
+		t.Fatalf("want concurrency 4, got %d", opt.ConcurrentRouteConcurrency)
+	}
+
+	WithConcurrentRoutes(nil, -1)(&opt)
+	if opt.ConcurrentAllRequests {
+		t.Fatal("nil routes must not enable all-request concurrency")
+	}
+	if len(opt.ConcurrentRoutes) != 0 {
+		t.Fatalf("nil routes must clear explicit routes, got %#v", opt.ConcurrentRoutes)
+	}
+	if opt.ConcurrentRouteConcurrency != 0 {
+		t.Fatalf("negative concurrency must clamp to 0, got %d", opt.ConcurrentRouteConcurrency)
+	}
+
+	opt.ConcurrentAllRequests = true
+	WithConcurrentRoutes([]string{}, 2)(&opt)
+	if opt.ConcurrentAllRequests {
+		t.Fatal("empty routes must not keep all-request concurrency enabled")
+	}
+	if len(opt.ConcurrentRoutes) != 0 {
+		t.Fatalf("empty routes must clear explicit routes, got %#v", opt.ConcurrentRoutes)
+	}
+}
+
+func TestWithConcurrentRequests(t *testing.T) {
+	opt := cluster.Options{ConcurrentRoutes: []string{"Chat.Send"}}
+	WithConcurrentRequests(-2)(&opt)
+	if !opt.ConcurrentAllRequests {
+		t.Fatal("all-request concurrency must be enabled")
+	}
+	if len(opt.ConcurrentRoutes) != 0 {
+		t.Fatalf("all-request concurrency must clear explicit routes, got %#v", opt.ConcurrentRoutes)
+	}
+	if opt.ConcurrentRouteConcurrency != 0 {
+		t.Fatalf("negative concurrency must clamp to 0, got %d", opt.ConcurrentRouteConcurrency)
 	}
 }
 

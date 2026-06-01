@@ -97,6 +97,10 @@ type Options struct {
 	LimitConnectPerIp  uint
 	OpenPrometheus     bool
 	PrometheusAddr     string
+
+	ConcurrentRoutes           []string
+	ConcurrentAllRequests      bool
+	ConcurrentRouteConcurrency int
 }
 
 // Node represents a node in nano cluster, which will contain a group of services.
@@ -141,6 +145,7 @@ func (n *Node) Startup() error {
 	n.connectionCount = map[string]uint{}
 	n.cluster = newCluster(n)
 	n.handler = NewHandler(n, n.Pipeline)
+	n.handler.setConcurrentRoutePolicy(n.ConcurrentRoutes, n.ConcurrentAllRequests)
 	n.sseClients = map[string]chan []byte{}
 	components := n.Components.List()
 	for _, c := range components {
@@ -155,6 +160,11 @@ func (n *Node) Startup() error {
 	// is idempotent, so repeated node startups in one process enable it once.
 	if env.SchedulerShards > 0 {
 		scheduler.EnableSharded(env.SchedulerShards)
+	}
+	if n.handler.concurrentRoutesEnabled() {
+		// Route eligibility is node-scoped on LocalHandler; the scheduler only
+		// provides the shared bounded worker pool.
+		scheduler.EnableConcurrentRequests(n.ConcurrentRouteConcurrency)
 	}
 
 	cache()
@@ -463,11 +473,14 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Per-agent monotonic message id; wall-clock nanoseconds collided under
-	// concurrency and clobbered another in-flight request's context (H33).
-	messageID := agent.nextMid()
-	agent.AttackHttpRequestCtx(messageID, ctx)
-	defer agent.RemoveHttpRequestCtx(messageID)
+	var messageID uint64
+	if msgType == message.Request {
+		// Per-agent monotonic message id; wall-clock nanoseconds collided under
+		// concurrency and clobbered another in-flight request's context (H33).
+		messageID = agent.nextMid()
+		agent.AttackHttpRequestCtx(messageID, ctx)
+		defer agent.RemoveHttpRequestCtx(messageID)
+	}
 
 	// validate authenticate
 	if env.MiddlewareHttp != nil {
@@ -1091,6 +1104,7 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		gateAddr:    gateAddr,
 		jsonPayload: jsonPayload,
 	}
+	ac.setStrictRequestMidBinding(n.handler.concurrentRoutesEnabled())
 	s = session.New(ac)
 	ac.session = s
 	if err := applyClientState(s, clientUid, clientUserData); err != nil {
