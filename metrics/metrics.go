@@ -77,6 +77,34 @@ var (
 		},
 	)
 
+	ConcurrentSchedulePendingTasks = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "concurrent_schedule_pending_tasks",
+			Help: "Number of pending tasks in the concurrent route scheduler",
+		},
+	)
+
+	ConcurrentScheduleRunningTasks = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "concurrent_schedule_running_tasks",
+			Help: "Number of running tasks in the concurrent route scheduler",
+		},
+	)
+
+	ConcurrentScheduleBacklogTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "concurrent_schedule_backlog_total",
+			Help: "Total number of concurrent route scheduler backlog rejections",
+		},
+	)
+
+	ConcurrentScheduleRecoveredPanicTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "concurrent_schedule_recovered_panic_total",
+			Help: "Total number of panics recovered by concurrent route scheduler workers",
+		},
+	)
+
 	CPUUsage = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "cpu_usage_percent",
@@ -112,6 +140,10 @@ func init() {
 	prometheus.MustRegister(ClientClosedConnections)
 	prometheus.MustRegister(ServerClosedConnections)
 	prometheus.MustRegister(SchedulePendingTasks)
+	prometheus.MustRegister(ConcurrentSchedulePendingTasks)
+	prometheus.MustRegister(ConcurrentScheduleRunningTasks)
+	prometheus.MustRegister(ConcurrentScheduleBacklogTotal)
+	prometheus.MustRegister(ConcurrentScheduleRecoveredPanicTotal)
 	prometheus.MustRegister(CPUUsage)
 	prometheus.MustRegister(CPUUserTime)
 	prometheus.MustRegister(CPUSystemTime)

@@ -22,6 +22,7 @@ package scheduler
 
 import (
 	"fmt"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,20 @@ var (
 	chTasks = make(chan Task, 1<<8)
 	started int32
 	closed  int32
+)
+
+type concurrentRouteSet struct {
+	routes map[string]struct{}
+	all    bool
+	ch     chan Task
+	die    chan struct{}
+}
+
+var (
+	concurrentRouteMu sync.RWMutex
+	concurrentRoutes  *concurrentRouteSet
+	concurrentRouteOn atomic.Bool
+	concurrentRouteWG sync.WaitGroup
 )
 
 func try(f func()) {
@@ -167,6 +182,7 @@ func Close() {
 	// Tear down the sharded dispatcher (if enabled) so its worker goroutines do
 	// not outlive the scheduler. No-op in single-scheduler mode.
 	stopSharded()
+	stopConcurrentRoutes()
 	log.Println("Scheduler stopped")
 }
 
@@ -176,4 +192,164 @@ func PushTask(task Task) {
 	if env.Debug {
 		log.Infof("Scheduler push task channel size %d", len(chTasks))
 	}
+}
+
+func EnableConcurrentRoutes(routes []string, concurrency int) {
+	routeSet := make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		if route == "" {
+			continue
+		}
+		routeSet[route] = struct{}{}
+	}
+	if len(routeSet) == 0 {
+		DisableConcurrentRoutes()
+		return
+	}
+
+	startConcurrentRoutes(&concurrentRouteSet{
+		routes: routeSet,
+		ch:     make(chan Task, cap(chTasks)),
+		die:    make(chan struct{}),
+	}, normalizeConcurrentRouteConcurrency(concurrency))
+}
+
+func EnableConcurrentRequests(concurrency int) {
+	startConcurrentRoutes(&concurrentRouteSet{
+		all: true,
+		ch:  make(chan Task, cap(chTasks)),
+		die: make(chan struct{}),
+	}, normalizeConcurrentRouteConcurrency(concurrency))
+}
+
+func ConcurrentRoutesEnabled() bool {
+	return concurrentRouteOn.Load()
+}
+
+func ScheduleConcurrentRoute(route string, task Task) (bool, error) {
+	concurrentRouteMu.RLock()
+	set := concurrentRoutes
+	if !concurrentRouteEligible(set, route) {
+		concurrentRouteMu.RUnlock()
+		return false, nil
+	}
+	select {
+	case set.ch <- task:
+		metrics.ConcurrentSchedulePendingTasks.Set(float64(len(set.ch)))
+		concurrentRouteMu.RUnlock()
+		return true, nil
+	default:
+		metrics.ConcurrentScheduleBacklogTotal.Inc()
+		concurrentRouteMu.RUnlock()
+		return true, ErrSchedulerBacklog
+	}
+}
+
+func ScheduleConcurrentRouteBlocking(route string, task Task) (bool, error) {
+	concurrentRouteMu.RLock()
+	set := concurrentRoutes
+	if !concurrentRouteEligible(set, route) {
+		concurrentRouteMu.RUnlock()
+		return false, nil
+	}
+	set.ch <- task
+	metrics.ConcurrentSchedulePendingTasks.Set(float64(len(set.ch)))
+	concurrentRouteMu.RUnlock()
+	return true, nil
+}
+
+func DisableConcurrentRoutes() {
+	stopConcurrentRoutes()
+}
+
+func startConcurrentRoutes(next *concurrentRouteSet, concurrency int) {
+	stopConcurrentRoutes()
+
+	concurrentRouteMu.Lock()
+	defer concurrentRouteMu.Unlock()
+
+	if concurrentRoutes != nil {
+		return
+	}
+	concurrentRoutes = next
+	concurrentRouteOn.Store(true)
+	for i := 0; i < concurrency; i++ {
+		concurrentRouteWG.Add(1)
+		go concurrentRouteWorker(next.ch, next.die)
+	}
+}
+
+func normalizeConcurrentRouteConcurrency(concurrency int) int {
+	if concurrency <= 0 {
+		concurrency = runtime.GOMAXPROCS(0)
+	}
+	if concurrency < 1 {
+		return 1
+	}
+	return concurrency
+}
+
+func concurrentRouteEligible(set *concurrentRouteSet, route string) bool {
+	if set == nil {
+		return false
+	}
+	if set.all {
+		return true
+	}
+	_, ok := set.routes[route]
+	return ok
+}
+
+func concurrentRouteWorker(ch chan Task, die chan struct{}) {
+	defer concurrentRouteWG.Done()
+	for {
+		select {
+		case task := <-ch:
+			metrics.ConcurrentSchedulePendingTasks.Set(float64(len(ch)))
+			runConcurrentRouteTask(task)
+		case <-die:
+			drainConcurrentRouteChan(ch)
+			return
+		}
+	}
+}
+
+func drainConcurrentRouteChan(ch chan Task) {
+	for {
+		select {
+		case task := <-ch:
+			metrics.ConcurrentSchedulePendingTasks.Set(float64(len(ch)))
+			runConcurrentRouteTask(task)
+		default:
+			metrics.ConcurrentSchedulePendingTasks.Set(0)
+			return
+		}
+	}
+}
+
+func runConcurrentRouteTask(task Task) {
+	metrics.ConcurrentScheduleRunningTasks.Inc()
+	defer metrics.ConcurrentScheduleRunningTasks.Dec()
+	defer func() {
+		if err := recover(); err != nil {
+			metrics.ConcurrentScheduleRecoveredPanicTotal.Inc()
+			log.Println(fmt.Sprintf("Handle concurrent route panic: %+v\n%s", err, debug.Stack()))
+		}
+	}()
+	task()
+}
+
+func stopConcurrentRoutes() {
+	concurrentRouteMu.Lock()
+	defer concurrentRouteMu.Unlock()
+
+	set := concurrentRoutes
+	if set == nil {
+		return
+	}
+	concurrentRoutes = nil
+	concurrentRouteOn.Store(false)
+	close(set.die)
+	concurrentRouteWG.Wait()
+	drainConcurrentRouteChan(set.ch)
 }

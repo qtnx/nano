@@ -353,7 +353,11 @@ func (h *httpAgent) Response(v interface{}) error {
 	// shared lastMid here would let a later concurrent /api request reassign it
 	// and cross-wire (or drop) this response, so reject instead (H34).
 	if raw, ok := h.reqMids.Load(goID()); ok {
-		return h.ResponseMid(raw.(uint64), v)
+		mid := raw.(uint64)
+		if mid <= 0 {
+			return ErrSessionOnNotify
+		}
+		return h.ResponseMid(mid, v)
 	}
 	return errNoRequestBound
 }
