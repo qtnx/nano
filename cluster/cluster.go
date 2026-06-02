@@ -38,8 +38,9 @@ import (
 // from client will send to gate firstly and be forwarded to appropriate node.
 type cluster struct {
 	// If cluster is not large enough, use slice is OK
-	currentNode *Node
-	rpcClient   *rpcClient
+	currentNode  *Node
+	rpcClient    *rpcClient
+	pingMemberFn func(context.Context, string) error
 
 	mu                sync.RWMutex
 	members           []*Member
@@ -132,9 +133,13 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		membershipVersion: c.membershipVersion,
 	})
 	c.mu.Unlock()
+	if c.rpcClient != nil {
+		c.rpcClient.allowPool(req.MemberInfo.ServiceAddr)
+	}
 
-	c.currentNode.handler.delMember(req.MemberInfo.ServiceAddr)
-	c.currentNode.handler.addRemoteService(req.MemberInfo)
+	if c.currentNode != nil {
+		c.currentNode.addRemoteMemberIfCurrent(req.MemberInfo)
+	}
 
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
@@ -160,27 +165,25 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 }
 
 // Unregister implements the MasterServer gRPC service
-func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest) (*clusterpb.UnregisterResponse, error) {
+func (c *cluster) Unregister(ctx context.Context, req *clusterpb.UnregisterRequest) (*clusterpb.UnregisterResponse, error) {
 	if req == nil || req.ServiceAddr == "" {
 		return nil, ErrInvalidRegisterReq
 	}
 
 	resp := &clusterpb.UnregisterResponse{}
+	snapshot := c.memberSnapshots()
 
-	c.mu.RLock()
-	snapshot := make([]*Member, len(c.members))
-	copy(snapshot, c.members)
-	c.mu.RUnlock()
-
-	var target *Member
+	var target memberSnapshot
+	var foundTarget bool
 	for _, m := range snapshot {
-		if m.memberInfo.ServiceAddr == req.ServiceAddr {
+		if m.serviceAddr == req.ServiceAddr {
 			target = m
+			foundTarget = true
 			break
 		}
 	}
-	if target == nil {
-		return nil, fmt.Errorf("address %s has not registered", req.ServiceAddr)
+	if !foundTarget {
+		return resp, nil
 	}
 
 	var (
@@ -190,14 +193,14 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	c.mu.Lock()
 	index := -1
 	for i, m := range c.members {
-		if m.memberInfo.ServiceAddr == req.ServiceAddr {
+		if m.memberInfo != nil && m.memberInfo.ServiceAddr == req.ServiceAddr {
 			index = i
 			break
 		}
 	}
 	if index < 0 {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("address %s has not registered", req.ServiceAddr)
+		return resp, nil
 	}
 	c.membershipVersion++
 	membershipEpoch = c.ensureMembershipEpochLocked()
@@ -211,36 +214,41 @@ func (c *cluster) Unregister(_ context.Context, req *clusterpb.UnregisterRequest
 	c.mu.Unlock()
 
 	if c.currentNode != nil {
-		c.currentNode.removeRemoteMember(req.ServiceAddr)
+		c.currentNode.removeRemoteMemberIfAbsent(req.ServiceAddr)
 	}
 
 	log.Println("Exists peer unregister to cluster", req.ServiceAddr)
 
 	delMember := &clusterpb.DelMemberRequest{ServiceAddr: req.ServiceAddr, MembershipVersion: version, MembershipEpoch: membershipEpoch}
 	for _, m := range snapshot {
-		if m.memberInfo.ServiceAddr == req.ServiceAddr {
+		if m.serviceAddr == "" || m.serviceAddr == req.ServiceAddr {
 			continue
 		}
-		if m.MemberInfo().ServiceAddr == c.currentNode.ServiceAddr {
+		if c.currentNode != nil && m.serviceAddr == c.currentNode.ServiceAddr {
 			continue
 		}
-		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
+		notifyCtx := ctx
+		if notifyCtx.Err() != nil {
+			notifyCtx = context.Background()
+		}
+		pool, err := c.rpcClient.getConnPoolWithContext(notifyCtx, m.serviceAddr)
 		if err != nil {
-			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
+			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.serviceAddr, err)
 			continue
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
-		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
-		_, err = client.DelMember(ctx, delMember)
+		peerCtx, cancel := context.WithTimeout(notifyCtx, remoteRPCTimeout)
+		_, err = client.DelMember(peerCtx, delMember)
 		cancel()
 		if err != nil {
-			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.memberInfo.ServiceAddr, err)
+			log.Errorf("cluster: notify del member %s -> %s failed: %v", req.ServiceAddr, m.serviceAddr, err)
 		}
 	}
 
-	if c.currentNode.UnregisterCallback != nil {
-		removedInfo := target.MemberInfo()
-		c.currentNode.UnregisterCallback(*target, func() {
+	if c.currentNode != nil && c.currentNode.UnregisterCallback != nil {
+		removedInfo := cloneMemberInfo(target.memberInfo)
+		removedMember := target.member()
+		c.currentNode.UnregisterCallback(removedMember, func() {
 			log.Println("UnregisterCallback")
 			res, err := c.Register(context.Background(), &clusterpb.RegisterRequest{
 				MemberInfo: removedInfo,
@@ -320,8 +328,8 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 	}
 	c.mu.Unlock()
 
-	if addedMember != nil {
-		c.currentNode.handler.addRemoteService(addedMember)
+	if addedMember != nil && c.currentNode != nil {
+		c.currentNode.addRemoteMemberIfCurrent(addedMember)
 	}
 	return resp, nil
 }
@@ -332,24 +340,22 @@ func (c *cluster) checkMemberHeartbeat() {
 	check := func() {
 		// Snapshot members under the lock so the check never reads the live
 		// backing array concurrently with membership mutations (H4).
-		c.mu.RLock()
-		snapshot := make([]*Member, len(c.members))
-		copy(snapshot, c.members)
-		c.mu.RUnlock()
+		snapshot := c.memberSnapshots()
 
-		unregisterMembers := make([]*Member, 0)
+		unregisterMembers := make([]memberSnapshot, 0)
 		// check heartbeat time
+		now := time.Now()
 		for _, m := range snapshot {
-			log.Infof("Check heartbeat for %s, last heartbeat: %v, diff %v, deadline: %v", m.MemberInfo().ServiceAddr, m.lastHeartbeatAt, time.Now().Sub(m.lastHeartbeatAt), 4*env.Heartbeat)
-			if time.Now().Sub(m.lastHeartbeatAt) > 4*env.Heartbeat && !m.isMaster {
+			log.Infof("Check heartbeat for %s, last heartbeat: %v, diff %v, deadline: %v", m.serviceAddr, m.lastHeartbeatAt, now.Sub(m.lastHeartbeatAt), 4*env.Heartbeat)
+			if now.Sub(m.lastHeartbeatAt) > 4*env.Heartbeat && !m.isMaster {
 				unregisterMembers = append(unregisterMembers, m)
 			}
 		}
 
 		for _, m := range unregisterMembers {
-			log.Println("Heartbeat timeout, unregister: ", m.MemberInfo().Label, m.MemberInfo().ServiceAddr)
+			log.Println("Heartbeat timeout, unregister: ", m.label, m.serviceAddr)
 			if _, err := c.Unregister(context.Background(), &clusterpb.UnregisterRequest{
-				ServiceAddr: m.MemberInfo().ServiceAddr,
+				ServiceAddr: m.serviceAddr,
 			}); err != nil {
 				log.Println("Heartbeat unregister error", err)
 			}
@@ -391,10 +397,7 @@ func (c *cluster) stopHeartbeatChecker() {
 func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string, err error) {
 	// Snapshot the membership so iteration never races concurrent
 	// register/unregister mutations of the backing array (H4).
-	c.mu.RLock()
-	snapshot := make([]*Member, len(c.members))
-	copy(snapshot, c.members)
-	c.mu.RUnlock()
+	snapshot := c.memberSnapshots()
 	for _, m := range snapshot {
 		if m.isMaster {
 			continue
@@ -402,8 +405,8 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 		if c.rpcClient == nil {
 			return nil, nil, fmt.Errorf("rpc client is nil")
 		}
-		log.Debug("Ping node: ", m.memberInfo.Label)
-		pool, err := c.rpcClient.getConnPool(m.memberInfo.ServiceAddr)
+		log.Debug("Ping node: ", m.label)
+		pool, err := c.rpcClient.getConnPool(m.serviceAddr)
 		if pool == nil {
 			log.Error("Get connection pool error", err)
 			continue
@@ -415,14 +418,14 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 		client := clusterpb.NewMemberClient(pool.Get())
 		// log.Println("Get client: ", client)
 		if resp, err := client.Ping(context.Background(), &clusterpb.PingRequest{}); err != nil {
-			log.Error("Ping node error", m.memberInfo.Label, err)
-			dies = append(dies, m.memberInfo.Label)
+			log.Error("Ping node error", m.label, err)
+			dies = append(dies, m.label)
 		} else {
-			log.Debugf("Ping node %s, label %s success, response: %s", m.memberInfo.ServiceAddr, m.memberInfo.Label, string(resp.String()))
+			log.Debugf("Ping node %s, label %s success, response: %s", m.serviceAddr, m.label, string(resp.String()))
 			if resp.Msg == "pong" {
-				lives = append(lives, m.memberInfo.Label)
+				lives = append(lives, m.label)
 			} else {
-				dies = append(dies, m.memberInfo.Label)
+				dies = append(dies, m.label)
 			}
 		}
 	}
@@ -430,7 +433,7 @@ func (c *cluster) pingNodes(withLabels []string) (lives []string, dies []string,
 	for _, label := range withLabels {
 		var found bool
 		for _, m := range snapshot {
-			if m.memberInfo.Label == label {
+			if m.label == label {
 				found = true
 			}
 		}
@@ -460,6 +463,9 @@ func (c *cluster) initMembers(members []*clusterpb.MemberInfo, membershipVersion
 	c.mu.Lock()
 	c.acceptMembershipSnapshotLocked(membershipVersion, membershipEpoch, 0)
 	for _, info := range members {
+		if c.rpcClient != nil {
+			c.rpcClient.allowPool(info.ServiceAddr)
+		}
 		c.members = append(c.members, &Member{
 			memberInfo:        info,
 			membershipEpoch:   c.membershipEpoch,
@@ -479,6 +485,9 @@ func (c *cluster) addMember(info *clusterpb.MemberInfo, membershipVersion, membe
 		return false
 	}
 	c.clearRemovedMemberLocked(info.GetServiceAddr())
+	if c.rpcClient != nil {
+		c.rpcClient.allowPool(info.GetServiceAddr())
+	}
 	now := time.Now()
 	var found bool
 	for _, member := range c.members {
@@ -555,6 +564,9 @@ func (c *cluster) reconcileMembersSnapshot(infos []*clusterpb.MemberInfo, remove
 			continue
 		}
 		snapshotMembers[info.ServiceAddr] = struct{}{}
+		if c.rpcClient != nil {
+			c.rpcClient.allowPool(info.ServiceAddr)
+		}
 		if member, ok := known[info.ServiceAddr]; ok {
 			if !memberInfoEqual(member.memberInfo, info) {
 				member.memberInfo = info
