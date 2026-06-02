@@ -246,6 +246,44 @@ func WithScheduler(shards int) Option {
 	}
 }
 
+// WithConcurrentRoutes enables route-aware concurrent handling for the provided
+// request routes. By default nano preserves FIFO scheduling. Only listed
+// message.Request routes may run on the concurrent worker pool; Notifies and
+// non-listed Requests remain serialized. Nil or empty routes disable explicit
+// route concurrency and do not opt into all-request concurrency. concurrency < 0
+// is treated as 0.
+func WithConcurrentRoutes(routes []string, concurrency int) Option {
+	return func(opt *cluster.Options) {
+		if concurrency < 0 {
+			concurrency = 0
+		}
+		opt.ConcurrentAllRequests = false
+		opt.ConcurrentRouteConcurrency = concurrency
+		if len(routes) == 0 {
+			opt.ConcurrentRoutes = nil
+			return
+		}
+		opt.ConcurrentRoutes = append([]string(nil), routes...)
+	}
+}
+
+// WithConcurrentRequests enables dangerous all-request concurrent handling.
+// Default scheduling remains FIFO unless this option or WithConcurrentRoutes is
+// configured. Every message.Request may run on the concurrent worker pool with
+// no ordering guarantee relative to other Requests or the serialized lane;
+// Notifies remain serialized. Applications using this option must synchronize
+// shared, session, and domain state themselves. concurrency < 0 is treated as 0.
+func WithConcurrentRequests(concurrency int) Option {
+	return func(opt *cluster.Options) {
+		if concurrency < 0 {
+			concurrency = 0
+		}
+		opt.ConcurrentAllRequests = true
+		opt.ConcurrentRoutes = nil
+		opt.ConcurrentRouteConcurrency = concurrency
+	}
+}
+
 // WithMaxConnections sets a global cap on concurrently accepted connections.
 // n <= 0 means unlimited (default).
 func WithMaxConnections(n int) Option {

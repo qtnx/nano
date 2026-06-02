@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,15 +56,17 @@ type (
 	// Agent corresponding a user, used for store raw conn information
 	agent struct {
 		// regular agent member
-		session  *session.Session    // session
-		conn     net.Conn            // low-level conn fd
-		lastMid  uint64              // last message id
-		state    int32               // current agent state
-		chDie    chan struct{}       // wait for close
-		chSend   chan pendingMessage // push message queue
-		lastAt   int64               // last heartbeat unix time stamp
-		decoder  *codec.Decoder      // binary decoder
-		pipeline pipeline.Pipeline
+		session                 *session.Session    // session
+		conn                    net.Conn            // low-level conn fd
+		lastMid                 uint64              // last message id; access atomically
+		state                   int32               // current agent state
+		chDie                   chan struct{}       // wait for close
+		chSend                  chan pendingMessage // push message queue
+		lastAt                  int64               // last heartbeat unix time stamp
+		decoder                 *codec.Decoder      // binary decoder
+		pipeline                pipeline.Pipeline
+		reqMids                 sync.Map // goroutine id -> in-flight request mid
+		strictRequestMidBinding atomic.Bool
 
 		rpcHandler rpcHandler
 		srv        reflect.Value // cached session reflect.Value
@@ -134,9 +137,27 @@ func (a *agent) send(m pendingMessage) (err error) {
 	}
 }
 
-// LastMid implements the session.NetworkEntity interface
 func (a *agent) LastMid() uint64 {
-	return a.lastMid
+	if raw, ok := a.reqMids.Load(goID()); ok {
+		return raw.(uint64)
+	}
+	return atomic.LoadUint64(&a.lastMid)
+}
+
+func (a *agent) setLastMid(mid uint64) {
+	atomic.StoreUint64(&a.lastMid, mid)
+}
+
+func (a *agent) setStrictRequestMidBinding(enabled bool) {
+	a.strictRequestMidBinding.Store(enabled)
+}
+
+func (a *agent) runWithRequestMid(mid uint64, fn func()) {
+	a.setLastMid(mid)
+	gid := goID()
+	a.reqMids.Store(gid, mid)
+	defer a.reqMids.Delete(gid)
+	fn()
 }
 
 // Push, implementation for session.NetworkEntity interface
@@ -187,7 +208,13 @@ func (a *agent) RPC(route string, v interface{}) error {
 // Response, implementation for session.NetworkEntity interface
 // Response message to session
 func (a *agent) Response(v interface{}) error {
-	return a.ResponseMid(a.lastMid, v)
+	if raw, ok := a.reqMids.Load(goID()); ok {
+		return a.ResponseMid(raw.(uint64), v)
+	}
+	if a.strictRequestMidBinding.Load() {
+		return errNoRequestBound
+	}
+	return a.ResponseMid(atomic.LoadUint64(&a.lastMid), v)
 }
 
 // ResponseMid, implementation for session.NetworkEntity interface

@@ -154,6 +154,9 @@ type LocalHandler struct {
 
 	pipeline    pipeline.Pipeline
 	currentNode *Node
+
+	concurrentAllRequests bool
+	concurrentRoutes      map[string]struct{}
 }
 
 func NewHandler(currentNode *Node, pipeline pipeline.Pipeline) *LocalHandler {
@@ -166,6 +169,32 @@ func NewHandler(currentNode *Node, pipeline pipeline.Pipeline) *LocalHandler {
 	}
 
 	return h
+}
+
+func (h *LocalHandler) setConcurrentRoutePolicy(routes []string, allRequests bool) {
+	h.concurrentAllRequests = allRequests
+	if len(routes) == 0 {
+		h.concurrentRoutes = nil
+		return
+	}
+	h.concurrentRoutes = make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		if route != "" {
+			h.concurrentRoutes[route] = struct{}{}
+		}
+	}
+}
+
+func (h *LocalHandler) concurrentRoutesEnabled() bool {
+	return h.concurrentAllRequests || len(h.concurrentRoutes) > 0
+}
+
+func (h *LocalHandler) canRunRequestConcurrently(route string) bool {
+	if h.concurrentAllRequests {
+		return true
+	}
+	_, ok := h.concurrentRoutes[route]
+	return ok
 }
 
 func (h *LocalHandler) register(comp component.Component, opts []component.Option) error {
@@ -283,6 +312,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		log.Error("handle: agent is nil after newAgent")
 		return
 	}
+	agent.setStrictRequestMidBinding(h.concurrentRoutesEnabled())
 
 	remoteAddr := agent.RemoteAddrWithoutPortStr()
 	if remoteAddr == "" {
@@ -492,7 +522,7 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 	switch p.Type {
 	case packet.Handshake:
 
-		agent.lastMid = 1
+		agent.setLastMid(1)
 		if err := env.HandshakeValidator(agent.session, p.Data); err != nil {
 			return err
 		}
@@ -723,7 +753,7 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 			log.Errorf("nano/handler: remote process route %s failed: %v", msg.Route, err)
 		}
 	} else {
-		h.localProcess(handler, lastMid, agent.session, msg, nil)
+		h.localProcessWithPipeline(handler, lastMid, agent.session, msg, nil, false)
 	}
 }
 
@@ -747,6 +777,17 @@ func (h *LocalHandler) localProcess(
 	msg *message.Message,
 	serializer serialize.Serializer,
 ) {
+	h.localProcessWithPipeline(handler, lastMid, session, msg, serializer, true)
+}
+
+func (h *LocalHandler) localProcessWithPipeline(
+	handler *component.Handler,
+	lastMid uint64,
+	session *session.Session,
+	msg *message.Message,
+	serializer serialize.Serializer,
+	processInbound bool,
+) {
 	// HTTP requests carry a JSON body while the cluster-wide env.Serializer may
 	// be binary (protobuf). Callers pass an explicit serializer for the inbound
 	// payload; nil falls back to the global serializer (M35).
@@ -754,11 +795,13 @@ func (h *LocalHandler) localProcess(
 		serializer = env.Serializer
 	}
 
-	if pipe := h.pipeline; pipe != nil {
-		err := pipe.Inbound().Process(session, msg)
-		if err != nil {
-			log.Println("Pipeline process failed: " + err.Error())
-			return
+	if processInbound {
+		if pipe := h.pipeline; pipe != nil {
+			err := pipe.Inbound().Process(session, msg)
+			if err != nil {
+				log.Println("Pipeline process failed: " + err.Error())
+				return
+			}
 		}
 	}
 
@@ -786,6 +829,14 @@ func (h *LocalHandler) localProcess(
 	if env.Debug {
 		log.Println(fmt.Sprintf("SID %d, UID=%d, Message={%s}, Data=%+v ClientUid=%d", session.ID(), session.UID(), msg.String(), data, session.ClientUid()))
 	}
+	if h.concurrentRoutesEnabled() {
+		switch v := session.NetworkEntity().(type) {
+		case *agent:
+			v.setStrictRequestMidBinding(true)
+		case *acceptor:
+			v.setStrictRequestMidBinding(true)
+		}
+	}
 
 	args := []reflect.Value{handler.Receiver, reflect.ValueOf(session), reflect.ValueOf(data)}
 
@@ -793,20 +844,16 @@ func (h *LocalHandler) localProcess(
 	startTime := time.Now()
 
 	task := func() {
-		// Bind the request mid before invoking the handler. For agent/acceptor
-		// (one connection == one session, processed sequentially) writing the
-		// field is safe; for httpAgent (one session shared by concurrent /api
-		// requests) the mid is bound to this goroutine for the synchronous call
-		// so a handler's session.Response routes to THIS request rather than a
-		// racing one that overwrote a shared field (H34).
 		var result []reflect.Value
 		switch v := session.NetworkEntity().(type) {
 		case *agent:
-			v.lastMid = lastMid
-			result = handler.Method.Func.Call(args)
+			v.runWithRequestMid(lastMid, func() {
+				result = handler.Method.Func.Call(args)
+			})
 		case *acceptor:
-			v.lastMid = lastMid
-			result = handler.Method.Func.Call(args)
+			v.runWithRequestMid(lastMid, func() {
+				result = handler.Method.Func.Call(args)
+			})
 		case *httpAgent:
 			v.runWithRequestMid(lastMid, func() {
 				result = handler.Method.Func.Call(args)
@@ -848,7 +895,20 @@ func (h *LocalHandler) localProcess(
 			return
 		}
 		local.Schedule(task)
-	} else if scheduler.Sharded() {
+		return
+	}
+
+	if msg.Type == message.Request && h.canRunRequestConcurrently(msg.Route) {
+		accepted, err := scheduler.ScheduleConcurrentRouteBlocking(msg.Route, task)
+		if err != nil {
+			log.Errorf("nano/handler: concurrent route scheduler failed, route=%s: %v", msg.Route, err)
+		}
+		if accepted {
+			return
+		}
+	}
+
+	if scheduler.Sharded() {
 		// Default path under sharding: route by session id so distinct sessions
 		// run concurrently while a single session stays strictly ordered. On
 		// backlog, shed the task (overload) instead of blocking the producer (H1).

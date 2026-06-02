@@ -374,9 +374,13 @@ func TestHTTPLocalRequestResponse(t *testing.T) {
 type HTTPNotifyComp struct {
 	component.Base
 	got chan struct{}
+	err chan error
 }
 
 func (c *HTTPNotifyComp) Do(s *session.Session, _ []byte) error {
+	if c.err != nil {
+		c.err <- s.Response([]byte("unexpected"))
+	}
 	select {
 	case c.got <- struct{}{}:
 	default:
@@ -389,7 +393,7 @@ func TestHTTPLocalNotifyReturns200Immediately(t *testing.T) {
 	ensureScheduler()
 
 	n := newTestNode()
-	comp := &HTTPNotifyComp{got: make(chan struct{}, 1)}
+	comp := &HTTPNotifyComp{got: make(chan struct{}, 1), err: make(chan error, 1)}
 	if err := n.handler.register(comp, nil); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -413,6 +417,14 @@ func TestHTTPLocalNotifyReturns200Immediately(t *testing.T) {
 	case <-comp.got:
 	case <-time.After(2 * time.Second):
 		t.Fatal("notify handler did not run; scheduler task blocked (H20)")
+	}
+	select {
+	case err := <-comp.err:
+		if err != ErrSessionOnNotify {
+			t.Fatalf("notify Response error = %v, want ErrSessionOnNotify", err)
+		}
+	default:
+		t.Fatal("notify handler did not attempt response")
 	}
 }
 

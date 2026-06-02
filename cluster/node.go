@@ -97,6 +97,10 @@ type Options struct {
 	LimitConnectPerIp  uint
 	OpenPrometheus     bool
 	PrometheusAddr     string
+
+	ConcurrentRoutes           []string
+	ConcurrentAllRequests      bool
+	ConcurrentRouteConcurrency int
 }
 
 // Node represents a node in nano cluster, which will contain a group of services.
@@ -120,8 +124,19 @@ type Node struct {
 	// per-IP cap (H11). Accessed atomically.
 	acceptedConns int64
 
-	once          sync.Once
-	keepaliveExit chan struct{}
+	once              sync.Once
+	keepaliveExit     chan struct{}
+	keepaliveStopOnce sync.Once
+	drainMu           sync.Mutex
+	heartbeatGuard    chan struct{}
+
+	initialized          atomic.Bool
+	clusterListening     atomic.Bool
+	clientListening      atomic.Bool
+	registeredWithMaster atomic.Bool
+	draining             atomic.Bool
+	drained              atomic.Bool
+	shutdown             atomic.Bool
 
 	// HTTP server
 	httpServer *http.Server
@@ -137,10 +152,12 @@ func (n *Node) Startup() error {
 	if n.ServiceAddr == "" {
 		return errors.New("service address cannot be empty in master node")
 	}
+	n.resetRolloutState()
 	n.sessions = map[int64]*session.Session{}
 	n.connectionCount = map[string]uint{}
 	n.cluster = newCluster(n)
 	n.handler = NewHandler(n, n.Pipeline)
+	n.handler.setConcurrentRoutePolicy(n.ConcurrentRoutes, n.ConcurrentAllRequests)
 	n.sseClients = map[string]chan []byte{}
 	components := n.Components.List()
 	for _, c := range components {
@@ -155,6 +172,11 @@ func (n *Node) Startup() error {
 	// is idempotent, so repeated node startups in one process enable it once.
 	if env.SchedulerShards > 0 {
 		scheduler.EnableSharded(env.SchedulerShards)
+	}
+	if n.handler.concurrentRoutesEnabled() {
+		// Route eligibility is node-scoped on LocalHandler; the scheduler only
+		// provides the shared bounded worker pool.
+		scheduler.EnableConcurrentRequests(n.ConcurrentRouteConcurrency)
 	}
 
 	cache()
@@ -174,6 +196,7 @@ func (n *Node) Startup() error {
 	if n.ClientAddr != "" {
 		log.Println(fmt.Sprintf("Listen and serve on %s", n.ClientAddr))
 		if err := n.listenAndServe(); err != nil {
+			n.cleanupFailedStartup()
 			return err
 		}
 	}
@@ -183,9 +206,12 @@ func (n *Node) Startup() error {
 	// endpoint is never routed through the public client listener.
 	if n.OpenPrometheus {
 		if err := n.startPrometheus(); err != nil {
+			n.cleanupFailedStartup()
 			return err
 		}
 	}
+
+	n.initialized.Store(true)
 
 	return nil
 }
@@ -222,6 +248,7 @@ func (n *Node) listenAndServe() error {
 		return err
 	}
 	n.clientServer = server
+	n.clientListening.Store(true)
 
 	// Honor the configured TLS material so WithTSLConfig actually serves
 	// HTTPS/WSS instead of being silently ignored (M30). The serve loop runs in
@@ -463,11 +490,14 @@ func (n *Node) handleHTTPRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Per-agent monotonic message id; wall-clock nanoseconds collided under
-	// concurrency and clobbered another in-flight request's context (H33).
-	messageID := agent.nextMid()
-	agent.AttackHttpRequestCtx(messageID, ctx)
-	defer agent.RemoveHttpRequestCtx(messageID)
+	var messageID uint64
+	if msgType == message.Request {
+		// Per-agent monotonic message id; wall-clock nanoseconds collided under
+		// concurrency and clobbered another in-flight request's context (H33).
+		messageID = agent.nextMid()
+		agent.AttackHttpRequestCtx(messageID, ctx)
+		defer agent.RemoveHttpRequestCtx(messageID)
+	}
 
 	// validate authenticate
 	if env.MiddlewareHttp != nil {
@@ -890,6 +920,7 @@ func (n *Node) initNode() error {
 	clusterpb.RegisterMemberServer(n.server, n)
 
 	go n.runGRPCServer(listener)
+	n.clusterListening.Store(true)
 
 	n.cluster.setRpcClient(n.rpcClient)
 	if n.IsMaster {
@@ -903,6 +934,7 @@ func (n *Node) initNode() error {
 			},
 		}
 		n.cluster.addLocalMember(member)
+		n.registeredWithMaster.Store(true)
 	} else {
 		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
 		if err != nil {
@@ -926,6 +958,7 @@ func (n *Node) initNode() error {
 			if err == nil {
 				n.handler.initRemoteService(resp.Members)
 				n.cluster.initMembers(resp.Members, resp.GetMembershipVersion(), resp.GetMembershipEpoch())
+				n.registeredWithMaster.Store(true)
 				break
 			}
 			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
@@ -954,37 +987,18 @@ func (n *Node) Shutdown() {
 		components[i].Comp.Shutdown()
 	}
 
-	// Close sendHeartbeat
-	if n.keepaliveExit != nil {
-		close(n.keepaliveExit)
-	}
+	n.shutdown.Store(true)
 	// Stop the master heartbeat-checker goroutine so it no longer mutates stale
 	// cluster state after shutdown (M13). Idempotent / no-op when not started.
 	if n.cluster != nil {
 		n.cluster.stopHeartbeatChecker()
 	}
-	if !n.IsMaster && n.AdvertiseAddr != "" {
-		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
-		if err != nil {
-			log.Println("Retrieve master address error", err)
-			goto EXIT
-		}
-		client := clusterpb.NewMasterClient(pool.Get())
-		request := &clusterpb.UnregisterRequest{
-			ServiceAddr: n.ServiceAddr,
-		}
-		// Bound shutdown unregister so a stalled master cannot hang shutdown
-		// indefinitely (H23).
-		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
-		_, err = client.Unregister(ctx, request)
-		cancel()
-		if err != nil {
-			log.Println("Unregister current node failed", err)
-			goto EXIT
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
+	if err := n.Drain(ctx); err != nil {
+		log.Println("Drain current node failed", err)
 	}
+	cancel()
 
-EXIT:
 	if n.server != nil {
 		n.server.GracefulStop()
 	}
@@ -1019,6 +1033,9 @@ EXIT:
 	if n.rpcClient != nil {
 		n.rpcClient.closePool()
 	}
+	n.initialized.Store(false)
+	n.clusterListening.Store(false)
+	n.clientListening.Store(false)
 }
 
 func (n *Node) storeSession(s *session.Session) {
@@ -1091,6 +1108,7 @@ func (n *Node) findOrCreateSession(sid, clientUid int64, gateAddr string, client
 		gateAddr:    gateAddr,
 		jsonPayload: jsonPayload,
 	}
+	ac.setStrictRequestMidBinding(n.handler.concurrentRoutesEnabled())
 	s = session.New(ac)
 	ac.session = s
 	if err := applyClientState(s, clientUid, clientUserData); err != nil {
@@ -1244,8 +1262,7 @@ func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*c
 		return nil, ErrInvalidRegisterReq
 	}
 	if n.cluster.addMember(req.MemberInfo, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
-		n.handler.delMember(req.MemberInfo.GetServiceAddr())
-		n.handler.addRemoteService(req.MemberInfo)
+		n.addRemoteMemberIfCurrent(req.MemberInfo)
 	}
 	return &clusterpb.NewMemberResponse{}, nil
 }
@@ -1256,9 +1273,32 @@ func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*c
 	}
 	log.Println("[Node] DelMember member", req.String())
 	if n.cluster.delMember(req.ServiceAddr, req.GetMembershipVersion(), req.GetMembershipEpoch()) {
-		n.removeRemoteMember(req.ServiceAddr)
+		n.removeRemoteMemberIfAbsent(req.ServiceAddr)
 	}
 	return &clusterpb.DelMemberResponse{}, nil
+}
+
+func (n *Node) addRemoteMemberIfCurrent(info *clusterpb.MemberInfo) {
+	if n == nil || info == nil || info.ServiceAddr == "" {
+		return
+	}
+	if n.cluster != nil && !n.cluster.isKnownAddr(info.ServiceAddr) {
+		return
+	}
+	if n.handler != nil {
+		n.handler.delMember(info.ServiceAddr)
+		n.handler.addRemoteService(info)
+	}
+}
+
+func (n *Node) removeRemoteMemberIfAbsent(addr string) {
+	if n == nil || addr == "" {
+		return
+	}
+	if n.cluster != nil && n.cluster.isKnownAddr(addr) {
+		return
+	}
+	n.removeRemoteMember(addr)
 }
 
 // removeRemoteMember applies all local cleanup for a remote member leaving the
@@ -1359,6 +1399,17 @@ func (n *Node) keepalive() {
 		return
 	}
 	heartbeat := func() {
+		if n.draining.Load() {
+			return
+		}
+		releaseHeartbeat, ok := n.tryAcquireHeartbeatGuard()
+		if !ok {
+			return
+		}
+		defer releaseHeartbeat()
+		if n.draining.Load() {
+			return
+		}
 		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
 		if err != nil {
 			log.Println("rpcClient master conn", err)
@@ -1391,7 +1442,7 @@ func (n *Node) keepalive() {
 		}
 		if len(resp.GetMembers()) == 0 && len(resp.GetRemovedMembers()) == 0 && !resp.GetResetMembership() {
 			for _, addr := range n.cluster.pruneExpiredStaleEpochMembers(time.Now()) {
-				n.removeRemoteMember(addr)
+				n.removeRemoteMemberIfAbsent(addr)
 			}
 			return
 		}
@@ -1404,14 +1455,13 @@ func (n *Node) keepalive() {
 		// by that member are removed.
 		added, updated, removed := n.cluster.reconcileMembersSnapshot(resp.GetMembers(), resp.GetRemovedMembers(), resp.GetMembershipVersion(), resp.GetMembershipEpoch(), snapshotSeq, resp.GetResetMembership())
 		for _, info := range updated {
-			n.handler.delMember(info.ServiceAddr)
-			n.handler.addRemoteService(info)
+			n.addRemoteMemberIfCurrent(info)
 		}
 		for _, info := range added {
-			n.handler.addRemoteService(info)
+			n.addRemoteMemberIfCurrent(info)
 		}
 		for _, addr := range removed {
-			n.removeRemoteMember(addr)
+			n.removeRemoteMemberIfAbsent(addr)
 		}
 	}
 	go func() {
