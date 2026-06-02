@@ -47,6 +47,7 @@ type rpcClient struct {
 	// the global lock held — otherwise one slow address stalls every concurrent
 	// getConnPool caller (routing / heartbeat / session-close) (M15).
 	dialing map[string]*sync.Mutex
+	removed map[string]struct{}
 }
 
 // clusterAuthClientInterceptor attaches the configured shared token to every
@@ -67,17 +68,21 @@ func clusterAuthClientInterceptor(
 }
 
 func newConnArray(maxSize uint, addr string) (*connPool, error) {
+	return newConnArrayContext(context.Background(), maxSize, addr)
+}
+
+func newConnArrayContext(ctx context.Context, maxSize uint, addr string) (*connPool, error) {
 	a := &connPool{
 		index: 0,
 		v:     make([]*grpc.ClientConn, maxSize),
 	}
-	if err := a.init(addr); err != nil {
+	if err := a.init(ctx, addr); err != nil {
 		return nil, err
 	}
 	return a, nil
 }
 
-func (a *connPool) init(addr string) error {
+func (a *connPool) init(ctx context.Context, addr string) error {
 	// Attach the cluster auth client interceptor so outbound RPCs carry the
 	// shared token when configured (H9). Copy env.GrpcOptions so the shared
 	// slice is never mutated.
@@ -85,9 +90,9 @@ func (a *connPool) init(addr string) error {
 	opts = append(opts, env.GrpcOptions...)
 	opts = append(opts, grpc.WithChainUnaryInterceptor(clusterAuthClientInterceptor))
 	for i := range a.v {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		conn, err := grpc.DialContext(
-			ctx,
+			dialCtx,
 			fmt.Sprintf("dns:///%s", addr),
 			opts...,
 		)
@@ -124,20 +129,32 @@ func newRPCClient() *rpcClient {
 	return &rpcClient{
 		pools:   make(map[string]*connPool),
 		dialing: make(map[string]*sync.Mutex),
+		removed: make(map[string]struct{}),
 	}
 }
 
 func (c *rpcClient) getConnPool(addr string) (*connPool, error) {
+	return c.getConnPoolWithContext(context.Background(), addr)
+}
+
+func (c *rpcClient) getConnPoolWithContext(ctx context.Context, addr string) (*connPool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.RLock()
 	if c.isClosed {
 		c.RUnlock()
 		return nil, errors.New("rpc client is closed")
 	}
+	if _, removed := c.removed[addr]; removed {
+		c.RUnlock()
+		return nil, errors.New("rpc client pool removed")
+	}
 	array, ok := c.pools[addr]
 	c.RUnlock()
 	if !ok {
 		var err error
-		array, err = c.createConnPool(addr)
+		array, err = c.createConnPoolWithContext(ctx, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -146,6 +163,10 @@ func (c *rpcClient) getConnPool(addr string) (*connPool, error) {
 }
 
 func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
+	return c.createConnPoolWithContext(context.Background(), addr)
+}
+
+func (c *rpcClient) createConnPoolWithContext(ctx context.Context, addr string) (*connPool, error) {
 	// Grab (or create) the per-address dial lock under the global lock, then
 	// release the global lock before dialing so concurrent getConnPool callers
 	// for other addresses are never blocked by a slow dial (M15).
@@ -153,6 +174,10 @@ func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
 	if c.isClosed {
 		c.Unlock()
 		return nil, errors.New("rpc client is closed")
+	}
+	if _, removed := c.removed[addr]; removed {
+		c.Unlock()
+		return nil, errors.New("rpc client pool removed")
 	}
 	if array, ok := c.pools[addr]; ok {
 		c.Unlock()
@@ -165,9 +190,23 @@ func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
 	}
 	c.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Only one goroutine dials a given address at a time.
 	dm.Lock()
 	defer dm.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.RLock()
+	_, removed := c.removed[addr]
+	c.RUnlock()
+	if removed {
+		return nil, errors.New("rpc client pool removed")
+	}
 
 	// Re-check: another goroutine may have built the pool while we waited.
 	c.RLock()
@@ -178,7 +217,7 @@ func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
 	}
 
 	// TODO: make conn count configurable
-	array, err := newConnArray(10, addr)
+	array, err := newConnArrayContext(ctx, 10, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +227,11 @@ func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
 		c.Unlock()
 		array.Close()
 		return nil, errors.New("rpc client is closed")
+	}
+	if _, removed := c.removed[addr]; removed {
+		c.Unlock()
+		array.Close()
+		return nil, errors.New("rpc client pool removed")
 	}
 	c.pools[addr] = array
 	c.Unlock()
@@ -213,12 +257,41 @@ func (c *rpcClient) closePool() {
 // Close cannot stall concurrent getConnPool callers.
 func (c *rpcClient) removePool(addr string) {
 	c.Lock()
+	if c.removed == nil {
+		c.removed = make(map[string]struct{})
+	}
+	c.removed[addr] = struct{}{}
 	pool, ok := c.pools[addr]
 	if ok {
 		delete(c.pools, addr)
 	}
+	dm := c.dialing[addr]
 	c.Unlock()
 	if ok {
 		pool.Close()
 	}
+
+	if dm == nil {
+		return
+	}
+	dm.Lock()
+	c.Lock()
+	pool, ok = c.pools[addr]
+	if ok {
+		delete(c.pools, addr)
+	}
+	delete(c.dialing, addr)
+	c.Unlock()
+	dm.Unlock()
+	if ok {
+		pool.Close()
+	}
+}
+
+func (c *rpcClient) allowPool(addr string) {
+	c.Lock()
+	if c.removed != nil {
+		delete(c.removed, addr)
+	}
+	c.Unlock()
 }

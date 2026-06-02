@@ -21,6 +21,7 @@
 package nano
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -152,4 +153,36 @@ func PingNodes(nodeLabels []string) (lives []string, dies []string, err error) {
 		return nil, nil, fmt.Errorf("Node is not initialized")
 	}
 	return node.PingNodes(nodeLabels)
+}
+
+// CheckClusterHealth probes cluster members matching nodeLabels and returns
+// label-level and member-level health details. Unlike PingNodes, requested
+// labels are filtered before dialing so stale unrelated members do not affect
+// readiness checks.
+func CheckClusterHealth(ctx context.Context, nodeLabels []string) (*cluster.HealthReport, error) {
+	node := runtime.CurrentNode()
+	if node == nil {
+		return nil, fmt.Errorf("Node is not initialized")
+	}
+	return node.CheckClusterHealth(ctx, nodeLabels)
+}
+
+// LocalNodeStatus returns local startup/registration state without pinging
+// cluster peers.
+func LocalNodeStatus() (cluster.LocalNodeStatus, error) {
+	node := runtime.CurrentNode()
+	if node == nil {
+		return cluster.LocalNodeStatus{}, fmt.Errorf("Node is not initialized")
+	}
+	return node.LocalNodeStatus(), nil
+}
+
+// Drain unregisters the current member from the cluster using ctx as the caller
+// controlled bound. It is safe to call before Shutdown.
+func Drain(ctx context.Context) error {
+	node := runtime.CurrentNode()
+	if node == nil {
+		return fmt.Errorf("Node is not initialized")
+	}
+	return node.Drain(ctx)
 }

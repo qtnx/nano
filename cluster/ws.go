@@ -21,7 +21,6 @@
 package cluster
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,13 +32,25 @@ import (
 	"github.com/lonng/nano/internal/log"
 )
 
+type websocketConn interface {
+	NextReader() (int, io.Reader, error)
+	WriteMessage(int, []byte) error
+	WriteControl(int, []byte, time.Time) error
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
 // wsConn is an adapter to t.Conn, which implements all t.Conn
 // interface base on *websocket.Conn
 type wsConn struct {
-	conn   *websocket.Conn
+	conn   websocketConn
 	typ    int // message type
 	reader io.Reader
-	mu     sync.Mutex //
+	mu     sync.Mutex
+	closed bool
 }
 
 // newWSConn return an initialized *wsConn
@@ -66,6 +77,9 @@ func newWSConn(conn *websocket.Conn) (*wsConn, error) {
 
 // RemoveIpAddress the address of the client that connected to the server
 func (c *wsConn) RemoveIpAddress() string {
+	if c == nil || c.conn == nil {
+		return ""
+	}
 	return c.conn.RemoteAddr().String()
 }
 
@@ -73,6 +87,9 @@ func (c *wsConn) RemoveIpAddress() string {
 // Read can be made to time out and return an Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
 func (c *wsConn) Read(b []byte) (int, error) {
+	if c == nil || c.conn == nil || c.reader == nil {
+		return 0, ErrBrokenPipe
+	}
 	n, err := c.reader.Read(b)
 	if err != nil && err != io.EOF {
 		return n, err
@@ -91,13 +108,15 @@ func (c *wsConn) Read(b []byte) (int, error) {
 // Write can be made to time out and return an Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (c *wsConn) Write(b []byte) (int, error) {
-	if c == nil || c.conn == nil {
-		log.Error("wsConn or its underlying connection is nil")
-		return 0, errors.New("wsConn or its underlying connection is nil")
+	if c == nil {
+		return 0, ErrBrokenPipe
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed || c.conn == nil {
+		return 0, ErrBrokenPipe
+	}
 
 	log.Debug(fmt.Sprintf("Writing %d bytes to WebSocket connection", len(b)))
 	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
@@ -111,28 +130,42 @@ func (c *wsConn) Write(b []byte) (int, error) {
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *wsConn) Close() error {
+	if c == nil {
+		return ErrBrokenPipe
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	if c.conn == nil {
+		c.closed = true
+		return ErrBrokenPipe
+	}
 	// Send a close control frame so clients/proxies observe a normal closure
 	// instead of an abnormal one on every server-side close (L4). Best-effort:
 	// proceed to close the underlying connection regardless. The write mutex
 	// serializes this against concurrent Write calls.
-	c.mu.Lock()
 	_ = c.conn.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
 		time.Now().Add(time.Second),
 	)
-	c.mu.Unlock()
+	c.closed = true
 	return c.conn.Close()
 }
 
 // LocalAddr returns the local network address.
 func (c *wsConn) LocalAddr() net.Addr {
+	if c == nil || c.conn == nil {
+		return nil
+	}
 	return c.conn.LocalAddr()
 }
 
 // RemoteAddr returns the remote network address.
 func (c *wsConn) RemoteAddr() net.Addr {
-	if c.conn == nil {
+	if c == nil || c.conn == nil {
 		log.Error("RemoteAddr: conn is nil")
 		return nil
 	}
@@ -155,6 +188,9 @@ func (c *wsConn) RemoteAddr() net.Addr {
 //
 // A zero value for t means I/O operations will not time out.
 func (c *wsConn) SetDeadline(t time.Time) error {
+	if c == nil || c.conn == nil {
+		return ErrBrokenPipe
+	}
 	if err := c.conn.SetReadDeadline(t); err != nil {
 		return err
 	}
@@ -166,6 +202,9 @@ func (c *wsConn) SetDeadline(t time.Time) error {
 // and any currently-blocked Read call.
 // A zero value for t means Read will not time out.
 func (c *wsConn) SetReadDeadline(t time.Time) error {
+	if c == nil || c.conn == nil {
+		return ErrBrokenPipe
+	}
 	return c.conn.SetReadDeadline(t)
 }
 
@@ -175,5 +214,8 @@ func (c *wsConn) SetReadDeadline(t time.Time) error {
 // some of the data was successfully written.
 // A zero value for t means Write will not time out.
 func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	if c == nil || c.conn == nil {
+		return ErrBrokenPipe
+	}
 	return c.conn.SetWriteDeadline(t)
 }
