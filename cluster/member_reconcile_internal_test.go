@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/lonng/nano/cluster/clusterpb"
+	"github.com/lonng/nano/component"
 	"github.com/lonng/nano/internal/env"
+	"github.com/lonng/nano/internal/log"
 )
 
 func mkMemberInfo(label, addr string, services ...string) *clusterpb.MemberInfo {
@@ -974,5 +976,89 @@ func TestRememberRemovedMemberPrunesExpiredTombstones(t *testing.T) {
 	}
 	if got := c.removedMembers["new:8085"].membershipVersion; got != 7 {
 		t.Fatalf("new tombstone version = %d, want 7", got)
+	}
+}
+
+// A version jump in a pushed NewMember/DelMember event means this node missed
+// at least one membership event. It must apply the event but NOT adopt the
+// jumped version: adopting it makes heartbeatMemberListSyncedLocked report the
+// node as converged while routes are missing, so the master never ships the
+// full member list and the gap becomes permanent (prod incident 2026-06-12:
+// a gateway ran 95 minutes without BuildingService/ResearchService routes).
+func TestEventVersionGapKeepsHeartbeatResyncPending(t *testing.T) {
+	missed := mkMemberInfo("building-service", "building:8088", "BuildingService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.membershipVersion = 5
+	c.membershipEpoch = 10
+
+	if !c.addMember(missed, 8, 10) {
+		t.Fatal("gapped NewMember event was rejected; it must still apply")
+	}
+	if countMemberAddr(c, missed.ServiceAddr) != 1 {
+		t.Fatalf("member %s not added exactly once", missed.ServiceAddr)
+	}
+	if c.membershipVersion != 5 {
+		t.Fatalf("membershipVersion = %d after gapped event, want 5 so the next heartbeat triggers a full resync", c.membershipVersion)
+	}
+}
+
+func TestEventVersionContiguousAdvances(t *testing.T) {
+	info := mkMemberInfo("building-service", "building:8088", "BuildingService")
+	c := &cluster{currentNode: &Node{ServiceAddr: "gateway:8080"}}
+	c.membershipVersion = 5
+	c.membershipEpoch = 10
+
+	if !c.addMember(info, 6, 10) {
+		t.Fatal("contiguous NewMember event was rejected")
+	}
+	if c.membershipVersion != 6 {
+		t.Fatalf("membershipVersion = %d after contiguous event, want 6", c.membershipVersion)
+	}
+}
+
+// A member that re-registers via heartbeat (it outlived a master restart, so
+// the new master has no record of it) must be pushed to existing members.
+// Prod incident 2026-06-12: building-service heartbeat-re-registered with a
+// restarted master; a gateway that had registered with the new master moments
+// earlier never learned BuildingService/ResearchService routes and answered
+// "not found(forgot registered?)" until it was manually restarted.
+func TestHeartbeatReRegisterNotifiesExistingMembers(t *testing.T) {
+	log.SetLogger(&noopLogger{})
+	master := &Node{
+		Options:     Options{IsMaster: true, Components: &component.Components{}},
+		ServiceAddr: freeAddr(t),
+	}
+	if err := master.Startup(); err != nil {
+		t.Fatalf("master Startup: %v", err)
+	}
+	t.Cleanup(master.Shutdown)
+
+	gateway := &Node{
+		Options: Options{
+			AdvertiseAddr: master.ServiceAddr,
+			RetryInterval: 10 * time.Millisecond,
+			Components:    &component.Components{},
+		},
+		ServiceAddr: freeAddr(t),
+	}
+	if err := gateway.Startup(); err != nil {
+		t.Fatalf("gateway Startup: %v", err)
+	}
+	t.Cleanup(gateway.Shutdown)
+
+	building := mkMemberInfo("building-service", freeAddr(t), "BuildingService")
+	if _, err := master.cluster.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{MemberInfo: building}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !gateway.cluster.isKnownAddr(building.ServiceAddr) {
+		if time.Now().After(deadline) {
+			t.Fatal("gateway never learned the heartbeat-re-registered member")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if members := gateway.handler.findMembers("BuildingService"); len(members) == 0 {
+		t.Fatal("gateway has no BuildingService route after heartbeat re-register")
 	}
 }

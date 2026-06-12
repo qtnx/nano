@@ -148,6 +148,17 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 	log.Println("New peer register to cluster", req.MemberInfo.ServiceAddr)
 
 	newMember := &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo, MembershipVersion: resp.MembershipVersion, MembershipEpoch: resp.MembershipEpoch}
+	c.notifyNewMember(snapshot, newMember)
+	return resp, nil
+}
+
+// notifyNewMember pushes a NewMember event to every non-master member in
+// snapshot. Failures are logged and not retried; the heartbeat version-gap
+// resync is the safety net for members that miss the push.
+func (c *cluster) notifyNewMember(snapshot []*Member, req *clusterpb.NewMemberRequest) {
+	if c.rpcClient == nil {
+		return
+	}
 	for _, m := range snapshot {
 		if m.isMaster {
 			continue
@@ -159,13 +170,12 @@ func (c *cluster) Register(_ context.Context, req *clusterpb.RegisterRequest) (*
 		}
 		client := clusterpb.NewMemberClient(pool.Get())
 		ctx, cancel := context.WithTimeout(context.Background(), remoteRPCTimeout)
-		_, err = client.NewMember(ctx, newMember)
+		_, err = client.NewMember(ctx, req)
 		cancel()
 		if err != nil {
 			log.Errorf("cluster: notify new member %s -> %s failed: %v", req.MemberInfo.ServiceAddr, m.memberInfo.ServiceAddr, err)
 		}
 	}
-	return resp, nil
 }
 
 // Unregister implements the MasterServer gRPC service
@@ -293,9 +303,16 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 			isHit = true
 		}
 	}
+	var notifyNewMember *clusterpb.NewMemberRequest
+	var notifySnapshot []*Member
 	if !isHit {
-		// master local not binding this node, other members do not need to be notified, because this node registered.
-		// maybe the master process reload
+		// The master does not know this member: it heartbeated a master that
+		// restarted (or otherwise lost its membership state). Re-register it
+		// AND notify every existing member — peers that registered with the
+		// new master before this heartbeat have never seen this member and
+		// would otherwise miss its services until their own restart.
+		notifySnapshot = make([]*Member, len(c.members))
+		copy(notifySnapshot, c.members)
 		m := &Member{
 			isMaster:        false,
 			memberInfo:      req.GetMemberInfo(),
@@ -308,6 +325,7 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 		c.clearRemovedMemberLocked(req.GetMemberInfo().GetServiceAddr())
 		c.currentNode.handler.addRemoteService(req.MemberInfo)
 		log.Println("Heartbeat peer register to cluster", req.MemberInfo.ServiceAddr)
+		notifyNewMember = &clusterpb.NewMemberRequest{MemberInfo: req.MemberInfo, MembershipVersion: c.membershipVersion, MembershipEpoch: membershipEpoch}
 	}
 
 	c.pruneRemovedMembersLocked(time.Now())
@@ -339,6 +357,13 @@ func (c *cluster) Heartbeat(_ context.Context, req *clusterpb.HeartbeatRequest) 
 		}
 	}
 	c.mu.Unlock()
+
+	if notifyNewMember != nil {
+		if c.rpcClient != nil {
+			c.rpcClient.allowPool(req.MemberInfo.ServiceAddr)
+		}
+		c.notifyNewMember(notifySnapshot, notifyNewMember)
+	}
 
 	return resp, nil
 }
@@ -788,7 +813,19 @@ func (c *cluster) acceptMembershipEventLocked(membershipVersion, membershipEpoch
 			return false
 		}
 	}
-	return c.acceptMembershipVersionLocked(membershipVersion)
+	if membershipVersion > 0 && membershipVersion < c.membershipVersion {
+		return false
+	}
+	// Only fast-forward contiguously. A version jump means this node missed at
+	// least one membership event (a lost NewMember/DelMember push, or a
+	// master-side bump that was never broadcast). Apply this event, but keep
+	// the local version behind so the next heartbeat's version mismatch makes
+	// the master ship the full member list and reconcile the gap. Snapshot
+	// syncs (acceptMembershipSnapshotLocked) still adopt any forward version.
+	if membershipVersion == c.membershipVersion+1 {
+		c.membershipVersion = membershipVersion
+	}
+	return true
 }
 
 func (c *cluster) acceptMembershipVersionLocked(membershipVersion uint64) bool {
