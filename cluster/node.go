@@ -323,30 +323,44 @@ func (m *clientConnMultiplexer) Close() error {
 	return err
 }
 
+// clientConnSniffTimeout bounds how long a freshly accepted connection may
+// stay silent before its first byte arrives. Connections that send nothing
+// within the window are dropped instead of pinning a sniffing goroutine.
+const clientConnSniffTimeout = 30 * time.Second
+
 func (m *clientConnMultiplexer) serve(handleNanoConn func(net.Conn)) {
-	defer close(m.conns)
 	for {
 		conn, err := m.Listener.Accept()
 		if err != nil {
 			return
 		}
-		reader := bufio.NewReader(conn)
-		header, err := reader.Peek(1)
-		if err != nil {
-			conn.Close()
-			continue
-		}
-		wrapped := &bufferedClientConn{Conn: conn, reader: reader}
-		if isNanoClientPacket(header[0]) {
-			go handleNanoConn(wrapped)
-			continue
-		}
-		select {
-		case m.conns <- wrapped:
-		case <-m.done:
-			conn.Close()
-			return
-		}
+		// Sniff the first byte in a per-connection goroutine. Doing this
+		// inline blocked the ONLY accept loop on a client that had connected
+		// but not yet sent anything (e.g. a proxy pre-opening connections or
+		// a slow network), which delayed every other client's websocket
+		// upgrade by seconds under load.
+		go m.sniffAndDispatch(conn, handleNanoConn)
+	}
+}
+
+func (m *clientConnMultiplexer) sniffAndDispatch(conn net.Conn, handleNanoConn func(net.Conn)) {
+	reader := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(clientConnSniffTimeout))
+	header, err := reader.Peek(1)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	wrapped := &bufferedClientConn{Conn: conn, reader: reader}
+	if isNanoClientPacket(header[0]) {
+		handleNanoConn(wrapped)
+		return
+	}
+	select {
+	case m.conns <- wrapped:
+	case <-m.done:
+		conn.Close()
 	}
 }
 
