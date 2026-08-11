@@ -239,6 +239,14 @@ func (n *Node) listenAndServe() error {
 		// left unset because /sse responses are long-lived streams.
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 75 * time.Second,
+		// Default fasthttp ReadBufferSize is 4096 bytes and the WHOLE request
+		// line + headers must fit in it. WebSocket upgrades proxied through
+		// Cloudflare carry CF-* headers, an X-Forwarded-For chain, and client
+		// cookies that routinely exceed 4KB, which fasthttp rejects with
+		// "431 Request Header Fields Too Large" and a connection reset —
+		// clients then need 1-2 reconnect attempts to get through. 32KB
+		// matches common proxy header limits (nginx large_client_header_buffers).
+		ReadBufferSize: 32 * 1024,
 	}
 
 	// Bind synchronously so a failure (invalid/in-use address) is reported to
