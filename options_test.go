@@ -33,6 +33,41 @@ func TestWithHeartbeatInterval_Invalid(t *testing.T) {
 	}
 }
 
+func TestWithHeartbeatTimeout(t *testing.T) {
+	prevHeartbeat := env.Heartbeat
+	prevTimeout := env.HeartbeatTimeout
+	defer func() {
+		env.Heartbeat = prevHeartbeat
+		env.HeartbeatTimeout = prevTimeout
+	}()
+
+	env.Heartbeat = 5 * time.Second
+	env.HeartbeatTimeout = 0
+	if got := env.EffectiveHeartbeatTimeout(); got != 10*time.Second {
+		t.Fatalf("default timeout = %v, want 10s", got)
+	}
+
+	WithHeartbeatTimeout(3 * time.Second)(&cluster.Options{})
+	if got := env.EffectiveHeartbeatTimeout(); got != 3*time.Second {
+		t.Fatalf("custom timeout = %v, want 3s", got)
+	}
+
+	WithHeartbeatTimeout(500 * time.Millisecond)(&cluster.Options{})
+	if got := env.EffectiveHeartbeatTimeout(); got != time.Second {
+		t.Fatalf("subsecond timeout = %v, want 1s", got)
+	}
+
+	WithHeartbeatTimeout(0)(&cluster.Options{})
+	if got := env.EffectiveHeartbeatTimeout(); got != time.Second {
+		t.Fatalf("zero timeout overwrote explicit timeout: %v", got)
+	}
+
+	env.HeartbeatTimeout = -time.Second
+	if got := env.EffectiveHeartbeatTimeout(); got != 10*time.Second {
+		t.Fatalf("negative timeout fallback = %v, want 10s", got)
+	}
+}
+
 // M21: a nil serializer must not clear the default (it would otherwise nil-deref
 // on the first non-raw request).
 func TestWithSerializer_Nil(t *testing.T) {

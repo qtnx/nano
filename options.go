@@ -96,6 +96,16 @@ func WithHeartbeatInterval(d time.Duration) Option {
 	}
 }
 
+// WithHeartbeatTimeout sets the inactivity timeout used to close silent
+// connections. Non-positive values preserve the existing effective timeout.
+func WithHeartbeatTimeout(d time.Duration) Option {
+	return func(_ *cluster.Options) {
+		if d > 0 {
+			env.HeartbeatTimeout = d
+		}
+	}
+}
+
 // WithCheckOriginFunc sets the function that check `Origin` in http headers
 func WithCheckOriginFunc(fn func(*http.Request) bool) Option {
 	return func(opt *cluster.Options) {

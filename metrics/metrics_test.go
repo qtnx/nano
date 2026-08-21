@@ -23,6 +23,15 @@ func resetIPConnCounts() {
 	ipConnMu.Unlock()
 }
 
+func TestConnectionClosedTracksTerminalReason(t *testing.T) {
+	ConnectionClosed.Reset()
+	ConnectionClosed.WithLabelValues(ConnectionCloseHeartbeatTimeout).Inc()
+
+	if got := testutil.ToFloat64(ConnectionClosed.WithLabelValues(ConnectionCloseHeartbeatTimeout)); got != 1 {
+		t.Fatalf("heartbeat timeout close count = %v, want 1", got)
+	}
+}
+
 // TestObserveRouteRequestDurationBoundsCardinality reproduces H28: a client can
 // vary the method suffix of a route to create an unbounded number of retained
 // histogram series (memory DoS). ObserveRouteRequestDuration must collapse
