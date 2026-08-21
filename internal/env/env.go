@@ -37,7 +37,8 @@ import (
 var (
 	Wd                 string                                            // working path
 	Die                chan bool                                         // wait for end application
-	Heartbeat          time.Duration                                     // Heartbeat internal
+	Heartbeat          time.Duration                                     // Heartbeat interval
+	HeartbeatTimeout   time.Duration                                     // Optional heartbeat inactivity timeout
 	CheckOrigin        func(*http.Request) bool                          // check origin when websocket enabled
 	Debug              bool                                              // enable Debug
 	WSPath             string                                            // WebSocket path(eg: ws://127.0.0.1/WSPath)
@@ -84,6 +85,21 @@ func init() {
 	HandshakeValidator = func(s *session.Session, _ []byte) error { return nil }
 	MiddlewareHttp = func(s *session.Session, ctx *http.Request) error { return nil }
 	Serializer = protobuf.NewSerializer()
+}
+
+// EffectiveHeartbeatTimeout returns the configured timeout when positive, or
+// the backwards-compatible two-heartbeat window otherwise. The wire protocol
+// advertises integer seconds, so normalize upward to the smallest matching
+// whole-second duration before any connection snapshots it.
+func EffectiveHeartbeatTimeout() time.Duration {
+	timeout := HeartbeatTimeout
+	if timeout <= 0 {
+		timeout = 2 * Heartbeat
+	}
+	if timeout <= time.Second {
+		return time.Second
+	}
+	return ((timeout + time.Second - 1) / time.Second) * time.Second
 }
 
 // dieMu guards Die so that closing it is idempotent and a new Listen run can

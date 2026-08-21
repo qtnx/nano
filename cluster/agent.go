@@ -61,9 +61,12 @@ type (
 		conn                    net.Conn            // low-level conn fd
 		lastMid                 uint64              // last message id; access atomically
 		state                   int32               // current agent state
+		terminal                int32               // terminal close reason; access atomically
 		chDie                   chan struct{}       // wait for close
 		chSend                  chan pendingMessage // push message queue
-		lastAt                  int64               // last heartbeat unix time stamp
+		lastAt                  int64               // last activity unix nanoseconds; access atomically
+		heartbeat               time.Duration       // immutable lifecycle timing snapshot
+		heartbeatTimeout        time.Duration       // immutable lifecycle timing snapshot
 		decoder                 *codec.Decoder      // binary decoder
 		preAckDataMu            sync.Mutex          // serializes pre-ACK Data with Close
 		pendingPreAckData       []byte              // copied, one-packet buffer until HandshakeAck
@@ -86,14 +89,16 @@ type (
 // Create new agent instance
 func newAgent(conn net.Conn, pipeline pipeline.Pipeline, rpcHandler rpcHandler) *agent {
 	a := &agent{
-		conn:       conn,
-		state:      statusStart,
-		chDie:      make(chan struct{}),
-		lastAt:     time.Now().Unix(),
-		chSend:     make(chan pendingMessage, agentWriteBacklog),
-		decoder:    codec.NewDecoder(),
-		pipeline:   pipeline,
-		rpcHandler: rpcHandler,
+		conn:             conn,
+		state:            statusStart,
+		chDie:            make(chan struct{}),
+		lastAt:           time.Now().UnixNano(),
+		heartbeat:        env.Heartbeat,
+		heartbeatTimeout: env.EffectiveHeartbeatTimeout(),
+		chSend:           make(chan pendingMessage, agentWriteBacklog),
+		decoder:          codec.NewDecoder(),
+		pipeline:         pipeline,
+		rpcHandler:       rpcHandler,
 	}
 
 	// binding session
@@ -250,39 +255,106 @@ func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 	return a.send(pendingMessage{typ: message.Response, mid: mid, payload: copyBytePayload(v)})
 }
 
-// Close, implementation for session.NetworkEntity interface
-// Close closes the agent, clean inner state and close low-level connection.
-// Any blocked Read or Write operations will be unblocked and return errors.
+// Close implements session.NetworkEntity. Calls from application code own the
+// terminal reason unless a transport failure won the close race first.
 func (a *agent) Close() error {
-	// Atomically transition to the closed state so that exactly one caller
-	// performs teardown. The previous check-then-close was racy: two goroutines
-	// (e.g. Session.Close racing the write-loop defer) could both observe a
-	// non-closed state and both close(a.chDie), panicking the process.
-	for {
-		s := a.status()
-		if s == statusClosed {
-			return ErrCloseClosedSession
-		}
-		if atomic.CompareAndSwapInt32(&a.state, s, statusClosed) {
-			break
-		}
+	return a.closeWithReason(metrics.ConnectionCloseApplication)
+}
+
+// closeWithReason is the sole owner of transport teardown. Exactly one caller
+// wins the terminal CAS, which prevents duplicate socket/channel cleanup and
+// bounds the reason metric to one sample per agent.
+func (a *agent) closeWithReason(reason string) error {
+	code := closeReasonCode(reason)
+	if !atomic.CompareAndSwapInt32(&a.terminal, 0, code) {
+		return ErrCloseClosedSession
 	}
 
+	atomic.StoreInt32(&a.state, statusClosed)
 	a.clearPreAckData()
-
 	if env.Debug {
 		log.Println(fmt.Sprintf("Session closed, ID=%d, UID=%d, IP=%s",
 			a.session.ID(), a.session.UID(), a.conn.RemoteAddr()))
 	}
 
-	// Only the winner of the CAS reaches here, so the channel is closed and the
-	// lifetime hook is scheduled exactly once.
 	close(a.chDie)
-	scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
-
 	metrics.ServerClosedConnections.Inc()
 	metrics.AgentClose.Inc()
-	return a.conn.Close()
+	metrics.ConnectionClosed.WithLabelValues(closeReasonName(code)).Inc()
+	err := a.conn.Close()
+	dispatchSessionClose(a.session)
+	return err
+}
+
+// dispatchSessionClose must never delay transport teardown. A saturated single
+// scheduler can be executing the close itself; in that case run the callback
+// independently rather than enqueueing behind the blocked task.
+func dispatchSessionClose(s *session.Session) {
+	task := func() { session.Lifetime.Close(s) }
+	if err := scheduler.TryPushTask(task); err != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Println(fmt.Sprintf("Session close callback panic: %v", r))
+				}
+			}()
+			task()
+		}()
+	}
+}
+
+func (a *agent) terminalCloseReason() string {
+	return closeReasonName(atomic.LoadInt32(&a.terminal))
+}
+
+func closeReasonCode(reason string) int32 {
+	switch reason {
+	case metrics.ConnectionCloseClientClose:
+		return 1
+	case metrics.ConnectionCloseClientEOF:
+		return 2
+	case metrics.ConnectionCloseHeartbeatTimeout:
+		return 3
+	case metrics.ConnectionCloseWriteTimeout:
+		return 4
+	case metrics.ConnectionCloseProtocolError:
+		return 5
+	case metrics.ConnectionCloseHandshakeRejected:
+		return 6
+	case metrics.ConnectionCloseConnectionLimit:
+		return 7
+	case metrics.ConnectionCloseServerShutdown:
+		return 8
+	case metrics.ConnectionCloseApplication:
+		return 9
+	default:
+		return 10
+	}
+}
+
+func closeReasonName(code int32) string {
+	switch code {
+	case 1:
+		return metrics.ConnectionCloseClientClose
+	case 2:
+		return metrics.ConnectionCloseClientEOF
+	case 3:
+		return metrics.ConnectionCloseHeartbeatTimeout
+	case 4:
+		return metrics.ConnectionCloseWriteTimeout
+	case 5:
+		return metrics.ConnectionCloseProtocolError
+	case 6:
+		return metrics.ConnectionCloseHandshakeRejected
+	case 7:
+		return metrics.ConnectionCloseConnectionLimit
+	case 8:
+		return metrics.ConnectionCloseServerShutdown
+	case 9:
+		return metrics.ConnectionCloseApplication
+	default:
+		return metrics.ConnectionCloseUnknown
+	}
 }
 
 // RemoteAddr implementation for session.NetworkEntity interface
@@ -397,46 +469,31 @@ func (a *agent) transitionHandshakeToWorking() bool {
 }
 
 // touch records the most recent activity timestamp. Every write to lastAt must
-// go through here because the heartbeat-timeout loop reads it with
-// atomic.LoadInt64; a plain assignment would race those reads.
+// go through here because the heartbeat-timeout loop reads it atomically.
 func (a *agent) touch() {
-	atomic.StoreInt64(&a.lastAt, time.Now().Unix())
+	atomic.StoreInt64(&a.lastAt, time.Now().UnixNano())
 }
 
 func (a *agent) write() {
-	ticker := time.NewTicker(env.Heartbeat)
-	// clean func
-	defer func() {
-		ticker.Stop()
-		close(a.chSend)
-		a.Close()
-		if env.Debug {
-			log.Println(fmt.Sprintf("Session write goroutine exit, SessionID=%d, UID=%d", a.session.ID(), a.session.UID()))
-		}
-	}()
+	ticker := time.NewTicker(a.heartbeat)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			deadline := time.Now().Add(-2 * env.Heartbeat).Unix()
+			timeout := a.heartbeatTimeout
+			deadline := time.Now().Add(-timeout).UnixNano()
 			if atomic.LoadInt64(&a.lastAt) < deadline {
 				log.Println(
 					fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline),
 				)
+				_ = a.closeWithReason(metrics.ConnectionCloseHeartbeatTimeout)
 				return
 			}
-			// Write the heartbeat straight to the connection. The previous
-			// implementation funnelled every frame through an intermediate
-			// chWrite channel that this same goroutine both fed and drained,
-			// which self-deadlocked once that buffer filled.
-			// Bound the blocking write so a stalled/slow peer cannot pin this
-			// goroutine (and its FD) indefinitely outside the heartbeat path
-			// (H11). The window matches the heartbeat-timeout policy.
-			if env.Heartbeat > 0 {
-				_ = a.conn.SetWriteDeadline(time.Now().Add(2 * env.Heartbeat))
-			}
+			_ = a.conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := a.conn.Write(hbd); err != nil {
 				log.Println(err.Error())
+				_ = a.closeWithReason(closeReasonForWriteError(err))
 				return
 			}
 
@@ -448,16 +505,10 @@ func (a *agent) write() {
 					log.Println(fmt.Sprintf("Push: %s error: %s", data.route, err.Error()))
 				case message.Response:
 					log.Println(fmt.Sprintf("Response message(id: %d) error: %s", data.mid, err.Error()))
-				default:
-					// expect
 				}
-				break
+				continue
 			}
 
-			// Response/Notify-style frames legitimately carry no route, so the
-			// previous unconditional "empty route" log fired on every response.
-
-			// construct message and encode
 			m := &message.Message{
 				Type:  data.typ,
 				Data:  payload,
@@ -469,42 +520,45 @@ func (a *agent) write() {
 				err := pipe.Outbound().Process(a.session, m)
 				if err != nil {
 					log.Println("broken pipeline", err.Error())
-					break
+					continue
 				}
 			}
 
 			em, err := m.Encode()
 			if err != nil {
 				log.Println(err.Error())
-				break
+				continue
 			}
 
-			// packet encode
 			p, err := codec.Encode(packet.Data, em)
 			if err != nil {
 				log.Println(err)
-				break
+				continue
 			}
 
-			// Write the encoded packet directly to the connection rather than
-			// queueing it on a self-fed channel.
-			// Bound the blocking write so a stalled/slow peer cannot pin this
-			// goroutine (and its FD) indefinitely (H11).
-			if env.Heartbeat > 0 {
-				_ = a.conn.SetWriteDeadline(time.Now().Add(2 * env.Heartbeat))
-			}
+			_ = a.conn.SetWriteDeadline(time.Now().Add(a.heartbeatTimeout))
 			if _, err := a.conn.Write(p); err != nil {
 				log.Println(err.Error())
+				_ = a.closeWithReason(closeReasonForWriteError(err))
 				return
 			}
 
-		case <-a.chDie: // agent closed signal
+		case <-a.chDie:
 			return
 
-		case <-env.Die: // application quit
+		case <-env.Die:
+			_ = a.closeWithReason(metrics.ConnectionCloseServerShutdown)
 			return
 		}
 	}
+}
+
+func closeReasonForWriteError(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return metrics.ConnectionCloseWriteTimeout
+	}
+	return metrics.ConnectionCloseUnknown
 }
 
 // OriginalSid get original session id

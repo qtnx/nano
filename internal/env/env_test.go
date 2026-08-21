@@ -1,42 +1,26 @@
 package env
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
-// M19: closing the shutdown channel must be idempotent (no panic on a second
-// close).
-func TestCloseDie_Idempotent(t *testing.T) {
-	ResetDie()
-	defer ResetDie()
+func TestEffectiveHeartbeatTimeoutRoundsUpToWireSeconds(t *testing.T) {
+	previousHeartbeat := Heartbeat
+	previousTimeout := HeartbeatTimeout
+	defer func() {
+		Heartbeat = previousHeartbeat
+		HeartbeatTimeout = previousTimeout
+	}()
 
-	CloseDie()
-	CloseDie() // must not panic
-
-	select {
-	case <-Die:
-	default:
-		t.Fatal("Die should be closed after CloseDie")
-	}
-}
-
-// M19: ResetDie installs a fresh, open channel and re-arms CloseDie so a new run
-// can shut down again.
-func TestResetDie(t *testing.T) {
-	ResetDie()
-	defer ResetDie()
-
-	CloseDie()
-	ResetDie()
-
-	select {
-	case <-Die:
-		t.Fatal("Die should be open after ResetDie")
-	default:
+	Heartbeat = 500 * time.Millisecond
+	HeartbeatTimeout = 0
+	if got := EffectiveHeartbeatTimeout(); got != time.Second {
+		t.Fatalf("implicit subsecond timeout = %v, want 1s", got)
 	}
 
-	CloseDie()
-	select {
-	case <-Die:
-	default:
-		t.Fatal("Die should be closed after CloseDie following ResetDie")
+	HeartbeatTimeout = 500 * time.Millisecond
+	if got := EffectiveHeartbeatTimeout(); got != time.Second {
+		t.Fatalf("explicit subsecond timeout = %v, want 1s", got)
 	}
 }

@@ -10,6 +10,21 @@ import (
 	"github.com/shirou/gopsutil/cpu"
 )
 
+// Terminal connection reasons are a fixed, bounded label set for
+// ConnectionClosed.
+const (
+	ConnectionCloseClientClose       = "client_close"
+	ConnectionCloseClientEOF         = "client_eof"
+	ConnectionCloseHeartbeatTimeout  = "heartbeat_timeout"
+	ConnectionCloseWriteTimeout      = "write_timeout"
+	ConnectionCloseProtocolError     = "protocol_error"
+	ConnectionCloseHandshakeRejected = "handshake_rejected"
+	ConnectionCloseConnectionLimit   = "connection_limit"
+	ConnectionCloseServerShutdown    = "server_shutdown"
+	ConnectionCloseApplication       = "application_close"
+	ConnectionCloseUnknown           = "unknown"
+)
+
 var (
 	TotalConnections = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -29,7 +44,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "connection_duration_seconds",
 			Help:    "Duration of connections in seconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 900, 1800, 3600, 7200, 14400, 28800},
 		},
 	)
 
@@ -89,6 +104,14 @@ var (
 			Name: "pre_ack_data_rejected_total",
 			Help: "Total number of pre-ACK Data packets rejected before HandshakeAck",
 		},
+	)
+
+	ConnectionClosed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "connection_closed_total",
+			Help: "Total number of terminal connection closures by reason",
+		},
+		[]string{"reason"},
 	)
 
 	SchedulePendingTasks = prometheus.NewGauge(
@@ -163,6 +186,7 @@ func init() {
 	prometheus.MustRegister(PreAckDataBuffered)
 	prometheus.MustRegister(PreAckDataDrained)
 	prometheus.MustRegister(PreAckDataRejected)
+	prometheus.MustRegister(ConnectionClosed)
 	prometheus.MustRegister(SchedulePendingTasks)
 	prometheus.MustRegister(ConcurrentSchedulePendingTasks)
 	prometheus.MustRegister(ConcurrentScheduleRunningTasks)

@@ -23,16 +23,8 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
-	"net"
-	"reflect"
-	"sort"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
 	"github.com/fasthttp/websocket"
 	"github.com/lonng/nano/cluster/clusterpb"
 	"github.com/lonng/nano/component"
@@ -46,6 +38,15 @@ import (
 	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/serialize"
 	"github.com/lonng/nano/session"
+	"io"
+	"math/rand"
+	"net"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var (
@@ -74,43 +75,34 @@ const remoteRPCTimeout = 10 * time.Second
 type CustomerRemoteServiceRoute func(service string, session *session.Session, members []*clusterpb.MemberInfo) *clusterpb.MemberInfo
 
 func cache() {
-	hrdata := map[string]interface{}{
-		"code": 200,
-		"sys": map[string]interface{}{
-			"heartbeat":  env.Heartbeat.Seconds(),
-			"servertime": time.Now().UTC().Unix(),
-		},
-	}
-	if dict, ok := message.GetDictionary(); ok {
-		hrdata = map[string]interface{}{
-			"code": 200,
-			"sys": map[string]interface{}{
-				"heartbeat":  env.Heartbeat.Seconds(),
-				"servertime": time.Now().UTC().Unix(),
-				"dict":       dict,
-			},
-		}
-	}
-	// data, err := json.Marshal(map[string]interface{}{
-	// 	"code": 200,
-	// 	"sys": map[string]float64{
-	// 		"heartbeat": env.Heartbeat.Seconds(),
-	// 	},
-	// })
-	data, err := json.Marshal(hrdata)
+	var err error
+	hrd, err = handshakeResponsePacket(env.Heartbeat, env.EffectiveHeartbeatTimeout())
 	if err != nil {
 		panic(err)
 	}
-
-	hrd, err = codec.Encode(packet.Handshake, data)
-	if err != nil {
-		panic(err)
-	}
-
 	hbd, err = codec.Encode(packet.Heartbeat, nil)
 	if err != nil {
 		panic(err)
 	}
+}
+
+func handshakeResponsePacket(heartbeat, heartbeatTimeout time.Duration) ([]byte, error) {
+	hrdata := map[string]interface{}{
+		"code": 200,
+		"sys": map[string]interface{}{
+			"heartbeat":         heartbeat.Seconds(),
+			"heartbeat_timeout": int64(heartbeatTimeout / time.Second),
+			"servertime":        time.Now().UTC().Unix(),
+		},
+	}
+	if dict, ok := message.GetDictionary(); ok {
+		hrdata["sys"].(map[string]interface{})["dict"] = dict
+	}
+	data, err := json.Marshal(hrdata)
+	if err != nil {
+		return nil, err
+	}
+	return codec.Encode(packet.Handshake, data)
 }
 
 func encodeSessionId(sessionId int64) []byte {
@@ -326,6 +318,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	// entry nor the upgraded connection (M18).
 	if err := h.currentNode.increaseConnection(remoteAddr); err != nil {
 		log.Errorf("handle: increaseConnection error: %v", err)
+		metrics.ConnectionClosed.WithLabelValues(metrics.ConnectionCloseConnectionLimit).Inc()
 		_ = conn.Close()
 		return
 	}
@@ -339,6 +332,7 @@ func (h *LocalHandler) handle(conn net.Conn) {
 			atomic.AddInt64(&h.currentNode.acceptedConns, -1)
 			h.currentNode.decreaseConnection(remoteAddr)
 			metrics.ServerClosedConnections.Inc()
+			metrics.ConnectionClosed.WithLabelValues(metrics.ConnectionCloseConnectionLimit).Inc()
 			log.Warn(fmt.Sprintf("handle: global connection cap %d reached, rejecting %s", env.MaxConnections, remoteAddr))
 			_ = conn.Close()
 			return
@@ -361,6 +355,8 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	startTime := time.Now()
 	metrics.CurrentConnections.Inc()
 
+	closeReason := metrics.ConnectionCloseUnknown
+
 	// guarantee agent related resource be destroyed
 	defer func() {
 		log.Debug("Closing session")
@@ -376,14 +372,14 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		// close fan-out (H6). The per-session SessionClosed notifications are
 		// then issued asynchronously, each bounded by a timeout (H5).
 		h.currentNode.deleteSession(sid)
-		agent.Close()
+		_ = agent.closeWithReason(closeReason)
 		if env.Debug {
 			log.Println(
 				fmt.Sprintf("Session read goroutine exit, SessionID=%d, UID=%d", sid, uid),
 			)
 		}
 
-		// Observe the connection duration
+		// Observe the connection duration exactly once on the accepted path.
 		duration := time.Since(startTime).Seconds()
 		metrics.ConnectionDuration.Observe(duration)
 		metrics.CurrentConnections.Dec()
@@ -398,13 +394,13 @@ func (h *LocalHandler) handle(conn net.Conn) {
 	for {
 		// Refresh the read deadline so a connection that opens then stalls
 		// (slowloris) is closed instead of pinning a goroutine/FD outside the
-		// heartbeat path (H11). The window matches the write goroutine's
-		// heartbeat-timeout policy (2x the interval).
-		if env.Heartbeat > 0 {
-			_ = conn.SetReadDeadline(time.Now().Add(2 * env.Heartbeat))
+		// heartbeat path.
+		if agent.heartbeat > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(agent.heartbeatTimeout))
 		}
 		n, err := conn.Read(buf)
 		if err != nil {
+			closeReason = closeReasonForReadError(err)
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
 			}
@@ -414,11 +410,13 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		// TODO(warning): decoder use slice for performance, packet data should be copy before next Decode
 		packets, err := agent.decoder.Decode(buf[:n])
 		if err != nil {
+			closeReason = metrics.ConnectionCloseProtocolError
 			log.Println(err.Error())
 
 			// process packets decoded
 			for _, p := range packets {
 				if err := h.processPacket(agent, p); err != nil {
+					closeReason = closeReasonForPacketError(p, err)
 					log.Println(err.Error())
 					return
 				}
@@ -429,59 +427,37 @@ func (h *LocalHandler) handle(conn net.Conn) {
 		// process all packets
 		for _, p := range packets {
 			if err := h.processPacket(agent, p); err != nil {
+				closeReason = closeReasonForPacketError(p, err)
 				log.Println(err.Error())
 				return
 			}
 		}
 	}
-	//
-	//packetChan := make(chan *packet.Packet, 100) // Buffered channel để xử lý gói tin
-	//errChan := make(chan error, 1)
-	//
-	//go func() {
-	//	buf := make([]byte, 2048)
-	//	for {
-	//		n, err := conn.Read(buf)
-	//		if err != nil {
-	//			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-	//				log.Warn(fmt.Sprintf("Read message error: %s, session will be closed immediately", err.Error()))
-	//			}
-	//			errChan <- err
-	//			return
-	//		}
-	//
-	//		if n > len(buf) {
-	//			log.Warn("Read more data than buffer size, truncating")
-	//			n = len(buf)
-	//		}
-	//
-	//		dataCopy := make([]byte, n)
-	//		copy(dataCopy, buf[:n])
-	//
-	//		packets, err := agent.decoder.Decode(dataCopy)
-	//		if err != nil {
-	//			log.Println("Decode error:", err.Error())
-	//			continue
-	//		}
-	//
-	//		for _, p := range packets {
-	//			packetChan <- p
-	//		}
-	//	}
-	//}()
-	//
-	//for {
-	//	select {
-	//	case p := <-packetChan:
-	//		if err := h.processPacket(agent, p); err != nil {
-	//			log.Println("Process packet error:", err.Error())
-	//			return
-	//		}
-	//	case err := <-errChan:
-	//		log.Println("Connection error:", err.Error())
-	//		return
-	//	}
-	//}
+}
+
+func closeReasonForReadError(err error) string {
+	if errors.Is(err, io.EOF) {
+		return metrics.ConnectionCloseClientEOF
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return metrics.ConnectionCloseHeartbeatTimeout
+	}
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+		return metrics.ConnectionCloseClientClose
+	}
+	return metrics.ConnectionCloseUnknown
+}
+
+func closeReasonForPacketError(p *packet.Packet, err error) string {
+	var rejected *handshakeRejectedError
+	if errors.As(err, &rejected) {
+		return metrics.ConnectionCloseHandshakeRejected
+	}
+	if p != nil && p.Type == packet.Handshake {
+		return closeReasonForWriteError(err)
+	}
+	return metrics.ConnectionCloseProtocolError
 }
 
 // notifySessionClosed informs every remote member that the given session has
@@ -509,6 +485,11 @@ func (h *LocalHandler) notifySessionClosed(sid int64, members []string) {
 	}
 }
 
+type handshakeRejectedError struct{ err error }
+
+func (e *handshakeRejectedError) Error() string { return e.err.Error() }
+func (e *handshakeRejectedError) Unwrap() error { return e.err }
+
 func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error) {
 	// A single malformed packet must never crash the read goroutine. Recover
 	// and surface a normal error so the caller closes only this connection.
@@ -524,7 +505,7 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 
 		agent.setLastMid(1)
 		if err := env.HandshakeValidator(agent.session, p.Data); err != nil {
-			return err
+			return &handshakeRejectedError{err: err}
 		}
 
 		if _, err := agent.conn.Write(hrd); err != nil {
