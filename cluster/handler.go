@@ -531,21 +531,28 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 			return err
 		}
 
-		agent.setStatus(statusHandshake)
+		if !agent.transitionStartToHandshake() {
+			return fmt.Errorf("receive Handshake after connection left start state, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
+		}
 		if env.Debug {
 			log.Println(fmt.Sprintf("Session handshake Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
 		}
 
 	case packet.HandshakeAck:
 		// Only a connection that completed a validated Handshake may transition
-		// to working. Accepting HandshakeAck from any other state lets a client
-		// reach statusWorking (and send Data) without ever passing
-		// env.HandshakeValidator (H26).
-		if agent.status() != statusHandshake {
+		// to working. The CAS also ensures Close winning this transition cannot
+		// be overwritten by a late HandshakeAck.
+		if !agent.transitionHandshakeToWorking() {
 			return fmt.Errorf("receive HandshakeAck before a validated handshake, session will be closed immediately, remote=%s",
 				agent.conn.RemoteAddr().String())
 		}
-		agent.setStatus(statusWorking)
+		if pending, ok := agent.takePreAckData(); ok {
+			if err := h.processData(agent, pending); err != nil {
+				return err
+			}
+			metrics.PreAckDataDrained.Inc()
+		}
 		if env.Debug {
 			log.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
 		}
@@ -557,22 +564,44 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 		}()
 
 	case packet.Data:
-		if agent.status() < statusWorking {
+		switch agent.status() {
+		case statusHandshake:
+			if err := agent.bufferPreAckData(p.Data); err != nil {
+				metrics.PreAckDataRejected.Inc()
+				return fmt.Errorf("receive invalid pre-ACK Data, session will be closed immediately, remote=%s: %w",
+					agent.conn.RemoteAddr().String(), err)
+			}
+			metrics.PreAckDataBuffered.Inc()
+			return nil
+		case statusWorking:
+			if err := h.processData(agent, p.Data); err != nil {
+				return err
+			}
+		case statusStart:
+			metrics.PreAckDataRejected.Inc()
 			return fmt.Errorf("receive data on socket which not yet ACK, session will be closed immediately, remote=%s",
 				agent.conn.RemoteAddr().String())
+		default:
+			return fmt.Errorf("receive data on closed socket, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
 		}
-
-		msg, err := message.Decode(p.Data)
-		if err != nil {
-			return err
-		}
-		h.processMessage(agent, msg)
-
 	case packet.Heartbeat:
 		// expected
 	}
 
 	agent.touch()
+	return nil
+}
+
+// processData decodes and dispatches Data packets after the connection reaches
+// statusWorking. A pre-ACK packet reaches this path only after HandshakeAck
+// clears it from the agent's per-connection buffer.
+func (h *LocalHandler) processData(agent *agent, data []byte) error {
+	msg, err := message.Decode(data)
+	if err != nil {
+		return err
+	}
+	h.processMessage(agent, msg)
 	return nil
 }
 
