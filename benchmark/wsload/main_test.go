@@ -68,7 +68,7 @@ func TestRunInvalidEndpointCountsFailure(t *testing.T) {
 }
 
 func TestRunServerDisconnectCountedOnce(t *testing.T) {
-	url, stop := startProtocolServer(t, true, nil)
+	url, stop := startProtocolServer(t, true, nil, nil)
 	defer stop()
 
 	result := Run(context.Background(), Config{
@@ -81,7 +81,8 @@ func TestRunServerDisconnectCountedOnce(t *testing.T) {
 
 func TestRunCancellationClosesEveryClient(t *testing.T) {
 	connected := make(chan struct{}, 4)
-	url, stop := startProtocolServer(t, false, connected)
+	closeCodes := make(chan int, 2)
+	url, stop := startProtocolServer(t, false, connected, closeCodes)
 	defer stop()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,6 +108,16 @@ func TestRunCancellationClosesEveryClient(t *testing.T) {
 		case <-connected:
 		case <-time.After(time.Second):
 			t.Fatal("server did not observe client close")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case code := <-closeCodes:
+			if code != websocket.CloseNormalClosure {
+				t.Fatalf("planned close code = %d, want %d", code, websocket.CloseNormalClosure)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("server did not observe a WebSocket close control frame")
 		}
 	}
 }
@@ -191,7 +202,7 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
-func startProtocolServer(t *testing.T, disconnect bool, connected chan<- struct{}) (string, func()) {
+func startProtocolServer(t *testing.T, disconnect bool, connected chan<- struct{}, closeCodes chan<- int) (string, func()) {
 	t.Helper()
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +210,12 @@ func startProtocolServer(t *testing.T, disconnect bool, connected chan<- struct{
 		if err != nil {
 			return
 		}
+		conn.SetCloseHandler(func(code int, _ string) error {
+			if closeCodes != nil {
+				closeCodes <- code
+			}
+			return nil
+		})
 	handshaken := false
 	defer func() {
 		_ = conn.Close()

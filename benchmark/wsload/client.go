@@ -14,6 +14,8 @@ import (
 	"github.com/lonng/nano/internal/packet"
 )
 
+const plannedCloseDeadline = 250 * time.Millisecond
+
 var (
 	handshakeFrame    = mustPacket(packet.Handshake, nil)
 	handshakeAckFrame = mustPacket(packet.HandshakeAck, nil)
@@ -193,7 +195,14 @@ func (c *loadClient) write(frame []byte) error {
 func (c *loadClient) closePlanned() {
 	c.closeOnce.Do(func() {
 		c.planned.Store(true)
+		c.writeMu.Lock()
+		_ = c.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "load test complete"),
+			time.Now().Add(plannedCloseDeadline),
+		)
 		_ = c.conn.Close()
+		c.writeMu.Unlock()
 	})
 }
 
