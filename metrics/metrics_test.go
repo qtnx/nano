@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -112,6 +113,20 @@ func TestConnectionsPerIPDecWithoutInc(t *testing.T) {
 
 	if got := testutil.CollectAndCount(ConnectionsPerIP); got != 0 {
 		t.Fatalf("stray Dec created series: got %d, want 0", got)
+	}
+}
+
+// TestPreAckDataCountersHaveNoLabels ensures connection identities cannot
+// create a metric series for every client.
+func TestPreAckDataCountersHaveNoLabels(t *testing.T) {
+	for name, collector := range map[string]prometheus.Collector{
+		"buffered": PreAckDataBuffered,
+		"drained":  PreAckDataDrained,
+		"rejected": PreAckDataRejected,
+	} {
+		if got := testutil.CollectAndCount(collector); got != 1 {
+			t.Fatalf("%s pre-ACK counter has %d series, want one unlabeled series", name, got)
+		}
 	}
 }
 

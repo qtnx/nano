@@ -41,7 +41,8 @@ import (
 )
 
 const (
-	agentWriteBacklog = 16
+	agentWriteBacklog  = 16
+	maxPreAckDataBytes = 64 * 1024
 )
 
 var (
@@ -64,12 +65,14 @@ type (
 		chSend                  chan pendingMessage // push message queue
 		lastAt                  int64               // last heartbeat unix time stamp
 		decoder                 *codec.Decoder      // binary decoder
+		preAckDataMu            sync.Mutex          // serializes pre-ACK Data with Close
+		pendingPreAckData       []byte              // copied, one-packet buffer until HandshakeAck
+		hasPendingPreAckData    bool
 		pipeline                pipeline.Pipeline
 		reqMids                 sync.Map // goroutine id -> in-flight request mid
 		strictRequestMidBinding atomic.Bool
-
-		rpcHandler rpcHandler
-		srv        reflect.Value // cached session reflect.Value
+		rpcHandler              rpcHandler
+		srv                     reflect.Value // cached session reflect.Value
 	}
 
 	pendingMessage struct {
@@ -265,6 +268,8 @@ func (a *agent) Close() error {
 		}
 	}
 
+	a.clearPreAckData()
+
 	if env.Debug {
 		log.Println(fmt.Sprintf("Session closed, ID=%d, UID=%d, IP=%s",
 			a.session.ID(), a.session.UID(), a.conn.RemoteAddr()))
@@ -310,6 +315,48 @@ func (a *agent) RemoteAddrWithoutPortStr() string {
 		return addr
 	}
 	return host
+}
+
+// bufferPreAckData retains exactly one Data payload received after a validated
+// Handshake but before HandshakeAck. Decoder-owned bytes are copied because the
+// next Decode call may overwrite them.
+func (a *agent) bufferPreAckData(data []byte) error {
+	if len(data) > maxPreAckDataBytes {
+		return fmt.Errorf("pre-ACK Data exceeds %d byte limit", maxPreAckDataBytes)
+	}
+
+	a.preAckDataMu.Lock()
+	defer a.preAckDataMu.Unlock()
+	if a.hasPendingPreAckData {
+		return errors.New("pre-ACK Data already buffered")
+	}
+
+	a.pendingPreAckData = make([]byte, len(data))
+	copy(a.pendingPreAckData, data)
+	a.hasPendingPreAckData = true
+	return nil
+}
+
+// takePreAckData returns and clears the one packet retained during the
+// Handshake state. It is called only by the connection read goroutine after a
+// valid HandshakeAck; Close may race it only to discard undrained data.
+func (a *agent) takePreAckData() ([]byte, bool) {
+	a.preAckDataMu.Lock()
+	defer a.preAckDataMu.Unlock()
+	if !a.hasPendingPreAckData {
+		return nil, false
+	}
+	data := a.pendingPreAckData
+	a.pendingPreAckData = nil
+	a.hasPendingPreAckData = false
+	return data, true
+}
+
+func (a *agent) clearPreAckData() {
+	a.preAckDataMu.Lock()
+	a.pendingPreAckData = nil
+	a.hasPendingPreAckData = false
+	a.preAckDataMu.Unlock()
 }
 
 // String, implementation for Stringer interface

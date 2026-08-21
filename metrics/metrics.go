@@ -70,6 +70,27 @@ var (
 		},
 	)
 
+	PreAckDataBuffered = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pre_ack_data_buffered_total",
+			Help: "Total number of Data packets buffered between Handshake and HandshakeAck",
+		},
+	)
+
+	PreAckDataDrained = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pre_ack_data_drained_total",
+			Help: "Total number of buffered pre-ACK Data packets dispatched after HandshakeAck",
+		},
+	)
+
+	PreAckDataRejected = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pre_ack_data_rejected_total",
+			Help: "Total number of pre-ACK Data packets rejected before HandshakeAck",
+		},
+	)
+
 	SchedulePendingTasks = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "schedule_pending_tasks",
@@ -139,6 +160,9 @@ func init() {
 	prometheus.MustRegister(AgentClose)
 	prometheus.MustRegister(ClientClosedConnections)
 	prometheus.MustRegister(ServerClosedConnections)
+	prometheus.MustRegister(PreAckDataBuffered)
+	prometheus.MustRegister(PreAckDataDrained)
+	prometheus.MustRegister(PreAckDataRejected)
 	prometheus.MustRegister(SchedulePendingTasks)
 	prometheus.MustRegister(ConcurrentSchedulePendingTasks)
 	prometheus.MustRegister(ConcurrentScheduleRunningTasks)
