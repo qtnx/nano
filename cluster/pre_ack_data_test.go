@@ -74,6 +74,37 @@ func requireProbeCall(t *testing.T, probe *PreAckProbeComponent, want []byte) {
 	}
 }
 
+func TestHandshakeAckBeforeHandshakeRejectsData(t *testing.T) {
+	h, a, probe := newPreAckTestHandler(t)
+
+	if err := h.processPacket(a, &packet.Packet{Type: packet.HandshakeAck}); err == nil {
+		t.Fatal("HandshakeAck before Handshake was accepted")
+	}
+	if got := a.status(); got == statusWorking {
+		t.Fatalf("agent status = %d after invalid HandshakeAck, must not be working", got)
+	}
+	if err := h.processPacket(a, preAckDataPacket(t, []byte("must-not-dispatch"))); err == nil {
+		t.Fatal("Data after invalid HandshakeAck was accepted")
+	}
+	if got := probe.calls.Load(); got != 0 {
+		t.Fatalf("handler calls after invalid HandshakeAck = %d, want 0", got)
+	}
+}
+
+func TestHandshakeCannotResurrectClosedAgent(t *testing.T) {
+	h, a, _ := newPreAckTestHandler(t)
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := h.processPacket(a, &packet.Packet{Type: packet.Handshake}); err == nil {
+		t.Fatal("Handshake after Close was accepted")
+	}
+	if got := a.status(); got != statusClosed {
+		t.Fatalf("agent status after Handshake race = %d, want statusClosed", got)
+	}
+}
+
 func TestPreAckDataRejectsBeforeHandshake(t *testing.T) {
 	h, a, _ := newPreAckTestHandler(t)
 	rejectedBefore := testutil.ToFloat64(metrics.PreAckDataRejected)
@@ -151,7 +182,29 @@ func TestPreAckDataClearsOnClose(t *testing.T) {
 	}
 }
 
+func TestPreAckDataRejectsAfterCloseWithoutRetention(t *testing.T) {
+	h, a, probe := newPreAckTestHandler(t)
+	handshakePacket(t, h, a)
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := h.processPacket(a, preAckDataPacket(t, []byte("closed"))); err == nil {
+		t.Fatal("Data after Close was accepted")
+	}
+	if err := a.bufferPreAckData([]byte("closed")); err == nil {
+		t.Fatal("closed agent buffered pre-ACK Data")
+	}
+	if _, ok := a.takePreAckData(); ok {
+		t.Fatal("closed agent retained pre-ACK Data")
+	}
+	if got := probe.calls.Load(); got != 0 {
+		t.Fatalf("handler calls after Close = %d, want 0", got)
+	}
+}
+
 func TestPreAckDataMalformedPacketFailsOnlyWhenDrained(t *testing.T) {
+	drainedBefore := testutil.ToFloat64(metrics.PreAckDataDrained)
 	h, a, probe := newPreAckTestHandler(t)
 	handshakePacket(t, h, a)
 
@@ -166,6 +219,9 @@ func TestPreAckDataMalformedPacketFailsOnlyWhenDrained(t *testing.T) {
 	}
 	if got := probe.calls.Load(); got != 0 {
 		t.Fatalf("handler calls after malformed drain = %d, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.PreAckDataDrained); got != drainedBefore {
+		t.Fatalf("pre-ACK drained counter = %v after malformed packet, want %v", got, drainedBefore)
 	}
 	if _, ok := a.takePreAckData(); ok {
 		t.Fatal("malformed pending Data was retained after drain")

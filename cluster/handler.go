@@ -531,7 +531,10 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 			return err
 		}
 
-		agent.setStatus(statusHandshake)
+		if !agent.transitionStartToHandshake() {
+			return fmt.Errorf("receive Handshake after connection left start state, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
+		}
 		if env.Debug {
 			log.Println(fmt.Sprintf("Session handshake Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
 		}
@@ -545,10 +548,10 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 				agent.conn.RemoteAddr().String())
 		}
 		if pending, ok := agent.takePreAckData(); ok {
-			metrics.PreAckDataDrained.Inc()
 			if err := h.processData(agent, pending); err != nil {
 				return err
 			}
+			metrics.PreAckDataDrained.Inc()
 		}
 		if env.Debug {
 			log.Println(fmt.Sprintf("Receive handshake ACK Id=%d, Remote=%s", agent.session.ID(), agent.conn.RemoteAddr()))
@@ -570,16 +573,18 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 			}
 			metrics.PreAckDataBuffered.Inc()
 			return nil
+		case statusWorking:
+			if err := h.processData(agent, p.Data); err != nil {
+				return err
+			}
 		case statusStart:
 			metrics.PreAckDataRejected.Inc()
 			return fmt.Errorf("receive data on socket which not yet ACK, session will be closed immediately, remote=%s",
 				agent.conn.RemoteAddr().String())
+		default:
+			return fmt.Errorf("receive data on closed socket, session will be closed immediately, remote=%s",
+				agent.conn.RemoteAddr().String())
 		}
-
-		if err := h.processData(agent, p.Data); err != nil {
-			return err
-		}
-
 	case packet.Heartbeat:
 		// expected
 	}

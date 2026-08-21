@@ -327,6 +327,9 @@ func (a *agent) bufferPreAckData(data []byte) error {
 
 	a.preAckDataMu.Lock()
 	defer a.preAckDataMu.Unlock()
+	if a.status() != statusHandshake {
+		return errors.New("pre-ACK Data received outside handshake state")
+	}
 	if a.hasPendingPreAckData {
 		return errors.New("pre-ACK Data already buffered")
 	}
@@ -378,6 +381,12 @@ func (a *agent) status() int32 {
 
 func (a *agent) setStatus(state int32) {
 	atomic.StoreInt32(&a.state, state)
+}
+
+// transitionStartToHandshake records a successful validated handshake without
+// allowing Close to be overwritten by a late store.
+func (a *agent) transitionStartToHandshake() bool {
+	return atomic.CompareAndSwapInt32(&a.state, statusStart, statusHandshake)
 }
 
 // transitionHandshakeToWorking completes the only legal client handshake
