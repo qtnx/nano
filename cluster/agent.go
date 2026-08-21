@@ -380,6 +380,13 @@ func (a *agent) setStatus(state int32) {
 	atomic.StoreInt32(&a.state, state)
 }
 
+// transitionHandshakeToWorking completes the only legal client handshake
+// transition. Compare-and-swap prevents Close from being overwritten by a
+// concurrently processed HandshakeAck.
+func (a *agent) transitionHandshakeToWorking() bool {
+	return atomic.CompareAndSwapInt32(&a.state, statusHandshake, statusWorking)
+}
+
 // touch records the most recent activity timestamp. Every write to lastAt must
 // go through here because the heartbeat-timeout loop reads it with
 // atomic.LoadInt64; a plain assignment would race those reads.

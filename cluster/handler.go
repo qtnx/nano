@@ -538,14 +538,12 @@ func (h *LocalHandler) processPacket(agent *agent, p *packet.Packet) (err error)
 
 	case packet.HandshakeAck:
 		// Only a connection that completed a validated Handshake may transition
-		// to working. Accepting HandshakeAck from any other state lets a client
-		// reach statusWorking (and send Data) without ever passing
-		// env.HandshakeValidator (H26).
-		if agent.status() != statusHandshake {
+		// to working. The CAS also ensures Close winning this transition cannot
+		// be overwritten by a late HandshakeAck.
+		if !agent.transitionHandshakeToWorking() {
 			return fmt.Errorf("receive HandshakeAck before a validated handshake, session will be closed immediately, remote=%s",
 				agent.conn.RemoteAddr().String())
 		}
-		agent.setStatus(statusWorking)
 		if pending, ok := agent.takePreAckData(); ok {
 			metrics.PreAckDataDrained.Inc()
 			if err := h.processData(agent, pending); err != nil {

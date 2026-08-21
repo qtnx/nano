@@ -151,6 +151,41 @@ func TestPreAckDataClearsOnClose(t *testing.T) {
 	}
 }
 
+func TestPreAckDataMalformedPacketFailsOnlyWhenDrained(t *testing.T) {
+	h, a, probe := newPreAckTestHandler(t)
+	handshakePacket(t, h, a)
+
+	if err := h.processPacket(a, &packet.Packet{Type: packet.Data, Data: []byte{0}}); err != nil {
+		t.Fatalf("malformed Data was decoded before HandshakeAck: %v", err)
+	}
+	if got := probe.calls.Load(); got != 0 {
+		t.Fatalf("handler calls before HandshakeAck = %d, want 0", got)
+	}
+	if err := h.processPacket(a, &packet.Packet{Type: packet.HandshakeAck}); err == nil {
+		t.Fatal("HandshakeAck accepted a malformed buffered Data packet")
+	}
+	if got := probe.calls.Load(); got != 0 {
+		t.Fatalf("handler calls after malformed drain = %d, want 0", got)
+	}
+	if _, ok := a.takePreAckData(); ok {
+		t.Fatal("malformed pending Data was retained after drain")
+	}
+}
+
+func TestClosedAgentCannotTransitionToWorking(t *testing.T) {
+	_, a, _ := newPreAckTestHandler(t)
+	a.setStatus(statusHandshake)
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if a.transitionHandshakeToWorking() {
+		t.Fatal("closed agent transitioned to working")
+	}
+	if got := a.status(); got != statusClosed {
+		t.Fatalf("closed agent status = %d, want statusClosed", got)
+	}
+}
+
 func TestPreAckDataCopiesDecoderOwnedBytes(t *testing.T) {
 	h, a, probe := newPreAckTestHandler(t)
 	handshakePacket(t, h, a)
