@@ -74,6 +74,11 @@ const remoteRPCTimeout = 10 * time.Second
 // CustomerRemoteServiceRoute customer remote service route
 type CustomerRemoteServiceRoute func(service string, session *session.Session, members []*clusterpb.MemberInfo) *clusterpb.MemberInfo
 
+// RemoteRouteMissHandler is invoked on the accepting node when forwarding a
+// client Request to a remote member fails synchronously. See
+// Options.RemoteRouteMissHandler.
+type RemoteRouteMissHandler func(session *session.Session, msg *message.Message, err error)
+
 func cache() {
 	var err error
 	hrd, err = handshakeResponsePacket(env.Heartbeat, env.EffectiveHeartbeatTimeout())
@@ -761,6 +766,13 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 	if !found {
 		if err := h.remoteProcess(agent.session, msg, false); err != nil {
 			log.Errorf("nano/handler: remote process route %s failed: %v", msg.Route, err)
+			// Surface the synchronous forward failure to the embedding
+			// application. Without this, a client Request whose route misses on
+			// the owning member (or whose forward fails) is silently dropped
+			// and the caller waits out the full request timeout.
+			if cb := h.currentNode.Options.RemoteRouteMissHandler; cb != nil && msg.Type == message.Request {
+				cb(agent.session, msg, err)
+			}
 		}
 	} else {
 		h.localProcessWithPipeline(handler, lastMid, agent.session, msg, nil, false)

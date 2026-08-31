@@ -98,6 +98,15 @@ type Options struct {
 	OpenPrometheus     bool
 	PrometheusAddr     string
 
+	// RemoteRouteMissHandler, when non-nil, is invoked on the node that
+	// accepted a client Request after forwarding it to a remote member failed
+	// synchronously — the owning member rejected the route (unknown method on
+	// a live service), no member hosts the service, or the forward RPC itself
+	// failed. The handler runs on the client read goroutine and is expected to
+	// answer the session (e.g. session.ResponseMID) so the caller does not
+	// wait out the request timeout. Notify messages never invoke it.
+	RemoteRouteMissHandler RemoteRouteMissHandler
+
 	ConcurrentRoutes           []string
 	ConcurrentAllRequests      bool
 	ConcurrentRouteConcurrency int

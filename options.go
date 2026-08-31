@@ -321,3 +321,14 @@ func WithInsecureCluster() Option {
 		env.InsecureCluster = true
 	}
 }
+
+// WithRemoteRouteMissHandler registers a callback fired on the accepting node
+// when forwarding a client Request to a remote member fails synchronously —
+// the owning member rejects an unknown method on a live service, no member
+// hosts the service, or the forward RPC fails. The callback should answer the
+// session immediately so the client does not wait out the request timeout.
+func WithRemoteRouteMissHandler(fn cluster.RemoteRouteMissHandler) Option {
+	return func(opt *cluster.Options) {
+		opt.RemoteRouteMissHandler = fn
+	}
+}
