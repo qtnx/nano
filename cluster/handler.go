@@ -76,8 +76,9 @@ type CustomerRemoteServiceRoute func(service string, session *session.Session, m
 
 // RemoteRouteMissHandler is invoked on the accepting node when forwarding a
 // client Request to a remote member fails synchronously. See
-// Options.RemoteRouteMissHandler.
-type RemoteRouteMissHandler func(session *session.Session, msg *message.Message, err error)
+// Options.RemoteRouteMissHandler. The signature uses only exported types so
+// embedding applications outside this module can implement it.
+type RemoteRouteMissHandler func(session *session.Session, mid uint64, route string, err error)
 
 func cache() {
 	var err error
@@ -771,7 +772,7 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 			// the owning member (or whose forward fails) is silently dropped
 			// and the caller waits out the full request timeout.
 			if cb := h.currentNode.Options.RemoteRouteMissHandler; cb != nil && msg.Type == message.Request {
-				cb(agent.session, msg, err)
+				cb(agent.session, msg.ID, msg.Route, err)
 			}
 		}
 	} else {

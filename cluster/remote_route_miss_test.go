@@ -13,19 +13,21 @@ import (
 // A Notify has no reply channel and must never invoke it.
 func TestProcessMessageRemoteForwardFailureInvokesMissHandler(t *testing.T) {
 	var gotRoute string
+	var gotMid uint64
 	var gotErr error
 	calls := 0
-	node := &Node{Options: Options{RemoteRouteMissHandler: func(s *session.Session, msg *message.Message, err error) {
+	node := &Node{Options: Options{RemoteRouteMissHandler: func(s *session.Session, mid uint64, route string, err error) {
 		calls++
-		gotRoute = msg.Route
+		gotMid = mid
+		gotRoute = route
 		gotErr = err
 	}}}
 	h := NewHandler(node, nil)
 	a := newAgent(newCountConn(), nil, nil)
 
 	h.processMessage(a, &message.Message{Type: message.Request, ID: 7, Route: "MapService.RemoveShield"})
-	if calls != 1 || gotRoute != "MapService.RemoveShield" || gotErr == nil {
-		t.Fatalf("request miss: calls=%d route=%q err=%v, want exactly one callback with the failed route", calls, gotRoute, gotErr)
+	if calls != 1 || gotMid != 7 || gotRoute != "MapService.RemoveShield" || gotErr == nil {
+		t.Fatalf("request miss: calls=%d mid=%d route=%q err=%v, want exactly one callback with the failed route", calls, gotMid, gotRoute, gotErr)
 	}
 
 	h.processMessage(a, &message.Message{Type: message.Notify, Route: "MapService.RemoveShield"})
