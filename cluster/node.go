@@ -49,6 +49,7 @@ import (
 	"github.com/lonng/nano/metrics"
 	"github.com/lonng/nano/pipeline"
 	"github.com/lonng/nano/scheduler"
+	"github.com/lonng/nano/serialize"
 	nanojson "github.com/lonng/nano/serialize/json"
 	"github.com/lonng/nano/session"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -1233,10 +1234,16 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Route: req.Route,
 		Data:  req.Data,
 	}
+	var serializer serialize.Serializer
 	if req.JsonPayload {
-		n.handler.localProcess(handler, req.Id, s, msg, httpJSONSerializer)
-	} else {
-		n.handler.localProcess(handler, req.Id, s, msg, nil)
+		serializer = httpJSONSerializer
+	}
+	// A decode failure never reaches the handler, so nothing on this member
+	// will answer the Request. Return it as the gRPC status so the accepting
+	// node's RemoteRouteMissHandler can answer the client immediately instead
+	// of letting it burn the full request timeout.
+	if err := n.handler.localProcess(handler, req.Id, s, msg, serializer); err != nil {
+		return nil, err
 	}
 	if env.Debug {
 		log.Debug("[Node] End handle HandleRequest", req.String())

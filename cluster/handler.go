@@ -74,11 +74,26 @@ const remoteRPCTimeout = 10 * time.Second
 // CustomerRemoteServiceRoute customer remote service route
 type CustomerRemoteServiceRoute func(service string, session *session.Session, members []*clusterpb.MemberInfo) *clusterpb.MemberInfo
 
-// RemoteRouteMissHandler is invoked on the accepting node when forwarding a
-// client Request to a remote member fails synchronously. See
-// Options.RemoteRouteMissHandler. The signature uses only exported types so
-// embedding applications outside this module can implement it.
+// RemoteRouteMissHandler is invoked on the accepting node when a client
+// Request cannot be dispatched synchronously: forwarding it to a remote member
+// failed, or the request payload could not be decoded into the handler's
+// argument type (see ErrRequestDecode). See Options.RemoteRouteMissHandler.
+// The signature uses only exported types so embedding applications outside
+// this module can implement it.
 type RemoteRouteMissHandler func(session *session.Session, mid uint64, route string, err error)
+
+// ErrRequestDecode wraps a payload deserialization failure for a Request. It
+// reaches the accepting node either directly (local handler) or through the
+// member's gRPC HandleRequest error, so the accepting node can answer the
+// client instead of letting it burn the full request timeout. Detect it with
+// errors.Is on the accepting node or by the ErrRequestDecodeMarker text after
+// it has crossed the gRPC status boundary.
+var ErrRequestDecode = errors.New(ErrRequestDecodeMarker)
+
+// ErrRequestDecodeMarker is the stable text carried inside ErrRequestDecode
+// so a gateway can recognize the failure class in a remote member's gRPC
+// status message.
+const ErrRequestDecodeMarker = "request payload decode failed"
 
 func cache() {
 	var err error
@@ -771,12 +786,25 @@ func (h *LocalHandler) processMessage(agent *agent, msg *message.Message) {
 			// application. Without this, a client Request whose route misses on
 			// the owning member (or whose forward fails) is silently dropped
 			// and the caller waits out the full request timeout.
-			if cb := h.currentNode.Options.RemoteRouteMissHandler; cb != nil && msg.Type == message.Request {
-				cb(agent.session, msg.ID, msg.Route, err)
-			}
+			h.notifyRequestDispatchFailure(agent.session, msg, err)
 		}
-	} else {
-		h.localProcessWithPipeline(handler, lastMid, agent.session, msg, nil, false)
+	} else if err := h.localProcessWithPipeline(handler, lastMid, agent.session, msg, nil, false); err != nil {
+		// Same contract for a locally hosted route: a payload the handler
+		// cannot decode never reaches the handler, so nothing would ever
+		// answer the Request.
+		h.notifyRequestDispatchFailure(agent.session, msg, err)
+	}
+}
+
+// notifyRequestDispatchFailure hands a Request that will never be answered by
+// a handler to the embedding application's RemoteRouteMissHandler. Notify
+// messages have no reply channel and are never surfaced.
+func (h *LocalHandler) notifyRequestDispatchFailure(s *session.Session, msg *message.Message, err error) {
+	if msg.Type != message.Request {
+		return
+	}
+	if cb := h.currentNode.Options.RemoteRouteMissHandler; cb != nil {
+		cb(s, msg.ID, msg.Route, err)
 	}
 }
 
@@ -793,14 +821,19 @@ func (h *LocalHandler) handleWS(conn *websocket.Conn) {
 	h.handle(c)
 }
 
+// localProcess dispatches msg to a locally registered handler. It returns
+// ErrRequestDecode (wrapped) when the payload cannot be deserialized into the
+// handler argument, so the caller can answer the client; every other outcome
+// (including handler errors, which the handler is expected to answer itself)
+// returns nil.
 func (h *LocalHandler) localProcess(
 	handler *component.Handler,
 	lastMid uint64,
 	session *session.Session,
 	msg *message.Message,
 	serializer serialize.Serializer,
-) {
-	h.localProcessWithPipeline(handler, lastMid, session, msg, serializer, true)
+) error {
+	return h.localProcessWithPipeline(handler, lastMid, session, msg, serializer, true)
 }
 
 func (h *LocalHandler) localProcessWithPipeline(
@@ -810,7 +843,7 @@ func (h *LocalHandler) localProcessWithPipeline(
 	msg *message.Message,
 	serializer serialize.Serializer,
 	processInbound bool,
-) {
+) error {
 	// HTTP requests carry a JSON body while the cluster-wide env.Serializer may
 	// be binary (protobuf). Callers pass an explicit serializer for the inbound
 	// payload; nil falls back to the global serializer (M35).
@@ -823,7 +856,7 @@ func (h *LocalHandler) localProcessWithPipeline(
 			err := pipe.Inbound().Process(session, msg)
 			if err != nil {
 				log.Println("Pipeline process failed: " + err.Error())
-				return
+				return nil
 			}
 		}
 	}
@@ -845,7 +878,7 @@ func (h *LocalHandler) localProcessWithPipeline(
 		data = reflect.New(handler.Type.Elem()).Interface()
 		if err := serializer.Unmarshal(payload, data); err != nil {
 			log.Println(fmt.Sprintf("Deserialize to %T failed: %+v (%v)", data, err, payload))
-			return
+			return fmt.Errorf("%w: route %s into %T: %v", ErrRequestDecode, msg.Route, data, err)
 		}
 	}
 
@@ -900,7 +933,7 @@ func (h *LocalHandler) localProcessWithPipeline(
 	index := strings.LastIndex(msg.Route, ".")
 	if index < 0 {
 		log.Println(fmt.Sprintf("nano/handler: invalid route %s", msg.Route))
-		return
+		return nil
 	}
 
 	// Dispatch the message to the appropriate scheduler
@@ -909,16 +942,16 @@ func (h *LocalHandler) localProcessWithPipeline(
 		sched := session.Value(s.SchedName)
 		if sched == nil {
 			log.Println(fmt.Sprintf("nano/handler: cannot find `scheduler.LocalScheduler` by %s", s.SchedName))
-			return
+			return nil
 		}
 
 		local, ok := sched.(scheduler.LocalScheduler)
 		if !ok {
 			log.Println(fmt.Sprintf("nano/handler: Type %T does not implement the `scheduler.LocalScheduler` interface", sched))
-			return
+			return nil
 		}
 		local.Schedule(task)
-		return
+		return nil
 	}
 
 	if msg.Type == message.Request && h.canRunRequestConcurrently(msg.Route) {
@@ -927,7 +960,7 @@ func (h *LocalHandler) localProcessWithPipeline(
 			log.Errorf("nano/handler: concurrent route scheduler failed, route=%s: %v", msg.Route, err)
 		}
 		if accepted {
-			return
+			return nil
 		}
 	}
 
@@ -949,4 +982,5 @@ func (h *LocalHandler) localProcessWithPipeline(
 	} else {
 		scheduler.PushTask(task)
 	}
+	return nil
 }
