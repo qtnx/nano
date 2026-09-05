@@ -532,7 +532,7 @@ func (a *agent) write() {
 
 			p, err := codec.Encode(packet.Data, em)
 			if err != nil {
-				log.Println(err)
+				log.Println(fmt.Sprintf("drop outbound frame route=%s mid=%d size=%d: %s", data.route, data.mid, len(em), err.Error()))
 				continue
 			}
 

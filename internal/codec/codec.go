@@ -30,9 +30,15 @@ import (
 // Codec constants.
 const (
 	HeadLength = 4
-	// 512KB leaves headroom for large response payloads while staying well below
-	// the protocol's 3-byte length ceiling (0xFFFFFF, roughly 16MB).
+	// MaxPacketSize caps INBOUND (client -> server) frames. Client requests are
+	// small; 512KB is generous and bounds per-connection buffering.
 	MaxPacketSize = 512 * 1024
+	// MaxEncodePacketSize caps OUTBOUND frames built by Encode. Server responses
+	// carry whole mail pages (a battle-report inbox page can exceed 600KB), so
+	// this must be much larger than the inbound cap while staying below the
+	// protocol's 3-byte length ceiling (0xFFFFFF, roughly 16MB). Prod 2026-09-05:
+	// ~3k responses/day were dropped at 512KB and players saw an empty inbox.
+	MaxEncodePacketSize = 4 * 1024 * 1024
 )
 
 // ErrPacketSizeExcced is the error used for encode/decode.
@@ -206,9 +212,9 @@ func Encode(typ packet.Type, data []byte) ([]byte, error) {
 	}
 
 	// Reject oversized payloads before allocating: the 3-byte length field would
-	// otherwise wrap for payloads > 0xFFFFFF, and large frames must be capped
-	// consistently with the decoder's MaxPacketSize check (see M1).
-	if len(data) > MaxPacketSize {
+	// otherwise wrap for payloads > 0xFFFFFF. Outbound frames get a larger cap
+	// than the inbound decoder check (see MaxEncodePacketSize).
+	if len(data) > MaxEncodePacketSize {
 		return nil, ErrPacketSizeExcced
 	}
 	p := &packet.Packet{Type: typ, Length: len(data)}

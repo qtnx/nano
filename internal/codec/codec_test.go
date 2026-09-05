@@ -153,23 +153,34 @@ func TestDecodeMalformedPacketsReturnExpectedErrors(t *testing.T) {
 }
 
 // TestEncodeMaxPacketSize covers M1: Encode must reject payloads larger than
-// MaxPacketSize instead of silently allocating and wrapping the 3-byte length.
+// MaxEncodePacketSize instead of silently allocating and wrapping the 3-byte length.
 func TestEncodeMaxPacketSize(t *testing.T) {
-	if _, err := Encode(Data, make([]byte, MaxPacketSize+1)); err != ErrPacketSizeExcced {
+	if _, err := Encode(Data, make([]byte, MaxEncodePacketSize+1)); err != ErrPacketSizeExcced {
 		t.Fatalf("expected ErrPacketSizeExcced for oversized payload, got %v", err)
 	}
 
-	// A payload at exactly MaxPacketSize must still encode (boundary is inclusive,
-	// matching the decoder's `size > MaxPacketSize` check).
-	if _, err := Encode(Data, make([]byte, MaxPacketSize)); err != nil {
-		t.Fatalf("encode at MaxPacketSize boundary should succeed, got %v", err)
+	// A payload at exactly MaxEncodePacketSize must still encode (boundary is inclusive).
+	if _, err := Encode(Data, make([]byte, MaxEncodePacketSize)); err != nil {
+		t.Fatalf("encode at MaxEncodePacketSize boundary should succeed, got %v", err)
+	}
+}
+
+// TestEncodeAllowsResponsesAboveInboundCap pins the prod regression of
+// 2026-09-05: a 600KB mail-inbox response must be encodable even though the
+// inbound decoder cap stays at 512KB.
+func TestEncodeAllowsResponsesAboveInboundCap(t *testing.T) {
+	if MaxPacketSize != 512*1024 {
+		t.Fatalf("MaxPacketSize = %d, want 512KB inbound cap", MaxPacketSize)
+	}
+	if MaxEncodePacketSize <= MaxPacketSize {
+		t.Fatalf("MaxEncodePacketSize = %d must exceed inbound cap %d", MaxEncodePacketSize, MaxPacketSize)
+	}
+	if _, err := Encode(Data, make([]byte, 600*1024)); err != nil {
+		t.Fatalf("Encode 600KB response payload error = %v, want nil", err)
 	}
 }
 
 func TestEncodeDecodeAllowsLargeResponsePayload(t *testing.T) {
-	if MaxPacketSize != 512*1024 {
-		t.Fatalf("MaxPacketSize = %d, want 512KB cap for large responses", MaxPacketSize)
-	}
 
 	payload := make([]byte, 88*1024)
 	for i := range payload {
